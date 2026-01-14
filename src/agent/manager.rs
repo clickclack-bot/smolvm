@@ -1,0 +1,475 @@
+//! Agent VM lifecycle management.
+//!
+//! The AgentManager is responsible for starting and stopping the agent VM,
+//! which runs the smolvm-agent for OCI image management and command execution.
+
+use crate::error::{Error, Result};
+use crate::process::{self, ChildProcess};
+use crate::storage::StorageDisk;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use super::launcher::{launch_agent_vm, HostMount};
+
+/// State of the agent VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentState {
+    /// Agent is not running.
+    Stopped,
+    /// Agent is starting up.
+    Starting,
+    /// Agent is running and ready.
+    Running,
+    /// Agent is shutting down.
+    Stopping,
+}
+
+/// Internal state shared between threads.
+struct AgentInner {
+    state: AgentState,
+    /// Child process (if running).
+    child: Option<ChildProcess>,
+    /// Currently configured mounts.
+    mounts: Vec<HostMount>,
+}
+
+/// Agent VM manager.
+///
+/// Manages the lifecycle of the agent VM which handles OCI image operations
+/// and command execution.
+pub struct AgentManager {
+    /// Path to the agent rootfs.
+    rootfs_path: PathBuf,
+    /// Storage disk for OCI layers.
+    storage_disk: StorageDisk,
+    /// vsock socket path for control channel.
+    vsock_socket: PathBuf,
+    /// Console log path (optional).
+    console_log: Option<PathBuf>,
+    /// Internal state.
+    inner: Arc<Mutex<AgentInner>>,
+}
+
+impl AgentManager {
+    /// Create a new agent manager.
+    ///
+    /// # Arguments
+    ///
+    /// * `rootfs_path` - Path to the agent VM rootfs
+    /// * `storage_disk` - Storage disk for OCI layers
+    pub fn new(rootfs_path: impl Into<PathBuf>, storage_disk: StorageDisk) -> Result<Self> {
+        let rootfs_path = rootfs_path.into();
+
+        // Create runtime directory for sockets
+        let runtime_dir = dirs::runtime_dir()
+            .or_else(|| dirs::cache_dir())
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+
+        let smolvm_runtime = runtime_dir.join("smolvm");
+        std::fs::create_dir_all(&smolvm_runtime)?;
+
+        let vsock_socket = smolvm_runtime.join("agent.sock");
+
+        // Console log path
+        let console_log = Some(smolvm_runtime.join("agent-console.log"));
+
+        Ok(Self {
+            rootfs_path,
+            storage_disk,
+            vsock_socket,
+            console_log,
+            inner: Arc::new(Mutex::new(AgentInner {
+                state: AgentState::Stopped,
+                child: None,
+                mounts: Vec::new(),
+            })),
+        })
+    }
+
+    /// Get the default agent manager.
+    ///
+    /// Uses default paths for rootfs and storage.
+    pub fn default() -> Result<Self> {
+        let rootfs_path = Self::default_rootfs_path()?;
+        let storage_disk = StorageDisk::open_or_create()?;
+
+        Self::new(rootfs_path, storage_disk)
+    }
+
+    /// Get the default path for the agent rootfs.
+    pub fn default_rootfs_path() -> Result<PathBuf> {
+        let data_dir = dirs::data_local_dir()
+            .or_else(dirs::data_dir)
+            .ok_or_else(|| Error::Storage("could not determine data directory".into()))?;
+
+        Ok(data_dir.join("smolvm").join("agent-rootfs"))
+    }
+
+    /// Get the current state of the agent.
+    pub fn state(&self) -> AgentState {
+        self.inner.lock().unwrap().state
+    }
+
+    /// Check if the agent is running.
+    pub fn is_running(&self) -> bool {
+        self.state() == AgentState::Running
+    }
+
+    /// Get the vsock socket path.
+    pub fn vsock_socket(&self) -> &Path {
+        &self.vsock_socket
+    }
+
+    /// Get the console log path.
+    pub fn console_log(&self) -> Option<&Path> {
+        self.console_log.as_deref()
+    }
+
+    /// Check if an agent is already running (socket exists + responds to ping).
+    ///
+    /// Returns Some(()) if agent is running and reachable, None otherwise.
+    /// This also updates the internal state to Running if successful.
+    pub fn try_connect_existing(&self) -> Option<()> {
+        if !self.vsock_socket.exists() {
+            return None;
+        }
+
+        // Try to ping the agent
+        if let Ok(mut client) = super::AgentClient::connect(&self.vsock_socket) {
+            if client.ping().is_ok() {
+                // Update internal state to reflect running
+                let mut inner = self.inner.lock().unwrap();
+                inner.state = AgentState::Running;
+                // Note: we don't know the PID but that's ok for status checks
+                return Some(());
+            }
+        }
+
+        None
+    }
+
+    /// Get the child PID if known.
+    pub fn child_pid(&self) -> Option<i32> {
+        self.inner.lock().unwrap().child.as_ref().map(|c| c.pid())
+    }
+
+    /// Get the currently configured mounts.
+    pub fn mounts(&self) -> Vec<HostMount> {
+        self.inner.lock().unwrap().mounts.clone()
+    }
+
+    /// Check if the given mounts match the currently running agent's mounts.
+    pub fn mounts_match(&self, mounts: &[HostMount]) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.mounts == mounts
+    }
+
+    /// Ensure the agent is running with the specified mounts.
+    ///
+    /// If the agent is running with different mounts, it will be restarted.
+    pub fn ensure_running_with_mounts(&self, mounts: Vec<HostMount>) -> Result<()> {
+        // Check if agent is already running with the same mounts
+        if self.try_connect_existing().is_some() && self.mounts_match(&mounts) {
+            return Ok(());
+        }
+
+        // If running with different mounts, we need to restart
+        let needs_restart = {
+            let inner = self.inner.lock().unwrap();
+            inner.state == AgentState::Running && inner.mounts != mounts
+        };
+
+        if needs_restart {
+            tracing::info!("restarting agent VM due to mount configuration change");
+            self.stop()?;
+        }
+
+        // Start with new mounts
+        self.start_with_mounts(mounts)
+    }
+
+    /// Ensure the agent is running.
+    ///
+    /// If the agent is not running, this starts it.
+    /// If the agent is already running, this is a no-op.
+    pub fn ensure_running(&self) -> Result<()> {
+        // First, check if an agent is already running (from a previous invocation)
+        if self.try_connect_existing().is_some() {
+            return Ok(());
+        }
+
+        // Otherwise, check internal state
+        let state = self.state();
+
+        match state {
+            AgentState::Running => Ok(()),
+            AgentState::Starting => self.wait_for_ready(),
+            AgentState::Stopped => self.start(),
+            AgentState::Stopping => {
+                self.wait_for_stop()?;
+                self.start()
+            }
+        }
+    }
+
+    /// Start the agent VM.
+    pub fn start(&self) -> Result<()> {
+        self.start_with_mounts(Vec::new())
+    }
+
+    /// Start the agent VM with specified mounts.
+    pub fn start_with_mounts(&self, mounts: Vec<HostMount>) -> Result<()> {
+        // Check and update state
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.state != AgentState::Stopped {
+                return Err(Error::AgentError(
+                    "agent already starting or running".into(),
+                ));
+            }
+            inner.state = AgentState::Starting;
+            inner.mounts = mounts.clone();
+        }
+
+        tracing::info!(
+            rootfs = %self.rootfs_path.display(),
+            storage = %self.storage_disk.path().display(),
+            socket = %self.vsock_socket.display(),
+            mount_count = mounts.len(),
+            "starting agent VM"
+        );
+
+        // Validate rootfs exists
+        if !self.rootfs_path.exists() {
+            let mut inner = self.inner.lock().unwrap();
+            inner.state = AgentState::Stopped;
+            return Err(Error::AgentError(format!(
+                "agent rootfs not found: {}",
+                self.rootfs_path.display()
+            )));
+        }
+
+        // Clean up old socket
+        let _ = std::fs::remove_file(&self.vsock_socket);
+
+        // Clone paths for the child process (owned copies)
+        let rootfs_path = self.rootfs_path.clone();
+        let storage_disk_path = self.storage_disk.path().to_path_buf();
+        let vsock_socket = self.vsock_socket.clone();
+        let console_log = self.console_log.clone();
+
+        // Fork child process
+        let pid = unsafe { libc::fork() };
+
+        match pid {
+            -1 => {
+                // Fork failed
+                let err = std::io::Error::last_os_error();
+                let mut inner = self.inner.lock().unwrap();
+                inner.state = AgentState::Stopped;
+                Err(Error::AgentError(format!("fork failed: {}", err)))
+            }
+            0 => {
+                // Child process - launch the VM
+                // All libkrun setup happens here in the child, same as the regular run path.
+                // This ensures DYLD_LIBRARY_PATH is still available (inherited from parent).
+
+                // Re-create StorageDisk in child (we only have the path)
+                let storage_disk = match crate::storage::StorageDisk::open_or_create_at(
+                    &storage_disk_path,
+                    crate::storage::DEFAULT_STORAGE_SIZE_GB,
+                ) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("failed to open storage disk: {}", e);
+                        unsafe { libc::_exit(1); }
+                    }
+                };
+
+                // Launch the agent VM (never returns on success)
+                let result = launch_agent_vm(
+                    &rootfs_path,
+                    &storage_disk,
+                    &vsock_socket,
+                    console_log.as_deref(),
+                    &mounts,
+                );
+
+                // If we get here, something went wrong
+                if let Err(e) = result {
+                    eprintln!("agent VM failed to start: {}", e);
+                }
+
+                unsafe { libc::_exit(1); }
+            }
+            child_pid => {
+                // Parent process
+                tracing::debug!(pid = child_pid, "forked agent VM process");
+
+                // Store child process
+                {
+                    let mut inner = self.inner.lock().unwrap();
+                    inner.child = Some(ChildProcess::new(child_pid));
+                }
+
+                // Wait for the agent to be ready
+                match self.wait_for_ready() {
+                    Ok(_) => {
+                        let mut inner = self.inner.lock().unwrap();
+                        inner.state = AgentState::Running;
+                        tracing::info!(pid = child_pid, "agent VM is ready");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // Kill child if startup failed
+                        process::terminate(child_pid);
+                        let mut inner = self.inner.lock().unwrap();
+                        inner.state = AgentState::Stopped;
+                        inner.child = None;
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stop the agent VM.
+    pub fn stop(&self) -> Result<()> {
+        let state = {
+            let inner = self.inner.lock().unwrap();
+            inner.state
+        };
+
+        if state == AgentState::Stopped {
+            return Ok(());
+        }
+
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.state = AgentState::Stopping;
+        }
+
+        tracing::info!("stopping agent VM");
+
+        // Try graceful shutdown via vsock first
+        if let Ok(mut client) = super::AgentClient::connect(&self.vsock_socket) {
+            let _ = client.shutdown();
+            // Give it a moment to shut down
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
+        // Stop the child process using shared utilities
+        let child_pid = {
+            let inner = self.inner.lock().unwrap();
+            inner.child.as_ref().map(|c| c.pid())
+        };
+
+        if let Some(pid) = child_pid {
+            // Use shared process utilities for stop with timeout + force kill
+            let _ = process::stop_process(pid, Duration::from_secs(5), true);
+        }
+
+        // Clean up
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.state = AgentState::Stopped;
+            inner.child = None;
+        }
+
+        // Remove socket
+        let _ = std::fs::remove_file(&self.vsock_socket);
+
+        Ok(())
+    }
+
+    /// Wait for the agent to be ready.
+    fn wait_for_ready(&self) -> Result<()> {
+        let timeout = Duration::from_secs(30);
+        let start = Instant::now();
+        let poll_interval = Duration::from_millis(100);
+
+        tracing::debug!("waiting for agent to be ready");
+
+        while start.elapsed() < timeout {
+            // Check if child process is still alive
+            {
+                let mut inner = self.inner.lock().unwrap();
+                if let Some(ref mut child) = inner.child {
+                    if !child.is_running() {
+                        // Child exited
+                        return Err(Error::AgentError(
+                            "agent process exited during startup".into(),
+                        ));
+                    }
+                }
+            }
+
+            // Try to connect to vsock socket
+            if self.vsock_socket.exists() {
+                match UnixStream::connect(&self.vsock_socket) {
+                    Ok(stream) => {
+                        drop(stream);
+
+                        // Try to ping
+                        match super::AgentClient::connect(&self.vsock_socket) {
+                            Ok(mut client) => {
+                                if client.ping().is_ok() {
+                                    tracing::debug!("agent ping successful");
+                                    return Ok(());
+                                }
+                            }
+                            Err(e) => {
+                                tracing::trace!("ping failed: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::trace!("connect failed: {}", e);
+                    }
+                }
+            }
+
+            std::thread::sleep(poll_interval);
+        }
+
+        Err(Error::AgentError(format!(
+            "agent did not become ready within {} seconds",
+            timeout.as_secs()
+        )))
+    }
+
+    /// Wait for the agent to stop.
+    fn wait_for_stop(&self) -> Result<()> {
+        let timeout = Duration::from_secs(10);
+        let start = Instant::now();
+
+        while start.elapsed() < timeout {
+            if self.state() == AgentState::Stopped {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        Err(Error::AgentError("timeout waiting for agent to stop".into()))
+    }
+
+    /// Check if agent process is still running.
+    pub fn check_alive(&self) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+
+        if let Some(ref mut child) = inner.child {
+            child.is_running()
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for AgentManager {
+    fn drop(&mut self) {
+        // Best-effort cleanup
+        let _ = self.stop();
+    }
+}

@@ -37,6 +37,13 @@ enum Commands {
     /// Delete a VM.
     #[command(alias = "rm")]
     Delete(cli::delete::DeleteCmd),
+
+    /// Manage the agent VM.
+    #[command(subcommand)]
+    Agent(cli::agent::AgentCmd),
+
+    /// Execute a command in a container via the agent VM.
+    Exec(cli::exec::ExecCmd),
 }
 
 fn main() {
@@ -64,6 +71,8 @@ fn main() {
         Commands::Stop(cmd) => cmd.run(&mut config),
         Commands::List(cmd) => cmd.run(&config),
         Commands::Delete(cmd) => cmd.run(&mut config),
+        Commands::Agent(cmd) => cmd.run(),
+        Commands::Exec(cmd) => cmd.run(),
     };
 
     // Handle errors

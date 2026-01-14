@@ -1,7 +1,8 @@
-//! Helper VM launcher.
+//! Agent VM launcher.
 //!
-//! This module provides the low-level VM launching functionality
-//! that runs in the forked child process.
+//! This module provides the low-level VM launching functionality.
+//! All setup is done in the child process after fork, where
+//! DYLD_LIBRARY_PATH is still available for dlopen.
 
 use crate::error::{Error, Result};
 use crate::protocol::ports;
@@ -9,9 +10,9 @@ use crate::storage::StorageDisk;
 use std::ffi::CString;
 use std::path::Path;
 
-use super::{HELPER_CPUS, HELPER_MEMORY_MIB};
+use super::{AGENT_CPUS, AGENT_MEMORY_MIB};
 
-// FFI bindings to libkrun (duplicated here to avoid circular deps)
+// FFI bindings to libkrun
 extern "C" {
     fn krun_set_log_level(level: u32) -> i32;
     fn krun_create_ctx() -> i32;
@@ -40,23 +41,38 @@ extern "C" {
     ) -> i32;
     fn krun_set_console_output(ctx: u32, filepath: *const libc::c_char) -> i32;
     fn krun_set_port_map(ctx: u32, port_map: *const *const libc::c_char) -> i32;
+    fn krun_add_virtiofs(
+        ctx: u32,
+        tag: *const libc::c_char,
+        path: *const libc::c_char,
+    ) -> i32;
     fn krun_start_enter(ctx: u32) -> i32;
 }
 
-/// Launch the helper VM.
+/// A host mount to be exposed to the guest via virtiofs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostMount {
+    /// Path on the host filesystem
+    pub host_path: std::path::PathBuf,
+    /// Mount path inside the guest
+    pub guest_path: std::path::PathBuf,
+    /// Whether the mount is read-only
+    pub read_only: bool,
+}
+
+/// Launch the agent VM (call in the forked child process).
 ///
-/// This function is called in the forked child process.
-/// It configures and starts the VM using libkrun, which replaces the process.
+/// This function sets up and starts the VM in a single call.
+/// It should be called in the child process after fork, where
+/// DYLD_LIBRARY_PATH is still available for dlopen to find libkrunfw.
 ///
-/// # Safety
-///
-/// This function should only be called after fork() in the child process.
-/// It will never return on success (krun_start_enter replaces the process).
-pub fn launch_helper_vm(
+/// This function never returns on success.
+pub fn launch_agent_vm(
     rootfs_path: &Path,
     storage_disk: &StorageDisk,
     vsock_socket: &Path,
     console_log: Option<&Path>,
+    mounts: &[HostMount],
 ) -> Result<()> {
     // Raise file descriptor limits
     raise_fd_limits();
@@ -68,28 +84,28 @@ pub fn launch_helper_vm(
         // Create VM context
         let ctx = krun_create_ctx();
         if ctx < 0 {
-            return Err(Error::HelperError("failed to create libkrun context".into()));
+            return Err(Error::AgentError("failed to create libkrun context".into()));
         }
         let ctx = ctx as u32;
 
         // Set VM config
-        if krun_set_vm_config(ctx, HELPER_CPUS, HELPER_MEMORY_MIB) < 0 {
+        if krun_set_vm_config(ctx, AGENT_CPUS, AGENT_MEMORY_MIB) < 0 {
             krun_free_ctx(ctx);
-            return Err(Error::HelperError("failed to set VM config".into()));
+            return Err(Error::AgentError("failed to set VM config".into()));
         }
 
         // Set root filesystem
         let root = path_to_cstring(rootfs_path)?;
         if krun_set_root(ctx, root.as_ptr()) < 0 {
             krun_free_ctx(ctx);
-            return Err(Error::HelperError("failed to set root filesystem".into()));
+            return Err(Error::AgentError("failed to set root filesystem".into()));
         }
 
         // Set empty port map (required by libkrun)
         let empty_ports: Vec<*const libc::c_char> = vec![std::ptr::null()];
         if krun_set_port_map(ctx, empty_ports.as_ptr()) < 0 {
             krun_free_ctx(ctx);
-            return Err(Error::HelperError("failed to set port map".into()));
+            return Err(Error::AgentError("failed to set port map".into()));
         }
 
         // Add storage disk
@@ -101,7 +117,7 @@ pub fn launch_helper_vm(
 
         // Add vsock port for control channel (host listens)
         let socket_path = path_to_cstring(vsock_socket)?;
-        if krun_add_vsock_port2(ctx, ports::HELPER_CONTROL, socket_path.as_ptr(), true) < 0 {
+        if krun_add_vsock_port2(ctx, ports::AGENT_CONTROL, socket_path.as_ptr(), true) < 0 {
             tracing::warn!("failed to add vsock port");
         }
 
@@ -113,16 +129,64 @@ pub fn launch_helper_vm(
             }
         }
 
+        // Add virtiofs mounts
+        // Each mount gets a tag like "smolvm0", "smolvm1", etc.
+        // The guest must mount these manually (or via the agent)
+        for (i, mount) in mounts.iter().enumerate() {
+            let tag = CString::new(format!("smolvm{}", i))
+                .map_err(|_| Error::AgentError("invalid mount tag".into()))?;
+            let host_path = path_to_cstring(&mount.host_path)?;
+
+            tracing::debug!(
+                tag = %format!("smolvm{}", i),
+                host = %mount.host_path.display(),
+                guest = %mount.guest_path.display(),
+                read_only = mount.read_only,
+                "adding virtiofs mount"
+            );
+
+            if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
+                tracing::warn!(
+                    host = %mount.host_path.display(),
+                    "failed to add virtiofs mount"
+                );
+            }
+        }
+
         // Set working directory
         let workdir = CString::new("/").unwrap();
         krun_set_workdir(ctx, workdir.as_ptr());
 
         // Build environment
-        let env_strings = vec![
+        let mut env_strings = vec![
             CString::new("HOME=/root").unwrap(),
             CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin").unwrap(),
             CString::new("TERM=xterm-256color").unwrap(),
         ];
+
+        // Pass mount info to the agent via environment
+        // Format: SMOLVM_MOUNT_0=tag:guest_path:ro
+        for (i, mount) in mounts.iter().enumerate() {
+            let ro_flag = if mount.read_only { "ro" } else { "rw" };
+            let env_val = format!(
+                "SMOLVM_MOUNT_{}=smolvm{}:{}:{}",
+                i,
+                i,
+                mount.guest_path.display(),
+                ro_flag
+            );
+            if let Ok(cstr) = CString::new(env_val) {
+                env_strings.push(cstr);
+            }
+        }
+
+        // Pass mount count
+        if !mounts.is_empty() {
+            if let Ok(cstr) = CString::new(format!("SMOLVM_MOUNT_COUNT={}", mounts.len())) {
+                env_strings.push(cstr);
+            }
+        }
+
         let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();
         envp.push(std::ptr::null());
 
@@ -134,15 +198,15 @@ pub fn launch_helper_vm(
 
         if krun_set_exec(ctx, exec_path.as_ptr(), argv.as_ptr(), envp.as_ptr()) < 0 {
             krun_free_ctx(ctx);
-            return Err(Error::HelperError("failed to set exec command".into()));
+            return Err(Error::AgentError("failed to set exec command".into()));
         }
 
         // Start VM (this replaces the process on success)
-        tracing::info!("starting helper VM");
+        tracing::info!("starting agent VM");
         let ret = krun_start_enter(ctx);
 
         // If we get here, something went wrong
-        Err(Error::HelperError(format!(
+        Err(Error::AgentError(format!(
             "krun_start_enter returned: {}",
             ret
         )))
@@ -152,7 +216,7 @@ pub fn launch_helper_vm(
 /// Convert a Path to a CString.
 fn path_to_cstring(path: &Path) -> Result<CString> {
     CString::new(path.to_string_lossy().as_bytes())
-        .map_err(|_| Error::HelperError("path contains null byte".into()))
+        .map_err(|_| Error::AgentError("path contains null byte".into()))
 }
 
 /// Raise file descriptor limits (required by libkrun).

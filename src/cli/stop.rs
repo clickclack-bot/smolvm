@@ -2,7 +2,8 @@
 
 use clap::Args;
 use smolvm::config::{RecordState, SmolvmConfig};
-use std::time::{Duration, Instant};
+use smolvm::process;
+use std::time::Duration;
 
 /// Stop a running VM.
 #[derive(Args, Debug)]
@@ -43,48 +44,32 @@ impl StopCmd {
 
         println!("Stopping VM {} (PID: {})...", self.name, pid);
 
-        // Send SIGTERM
-        let term_result = unsafe { libc::kill(pid, libc::SIGTERM) };
-        if term_result != 0 {
-            // Process already dead
+        // Check if already dead
+        if !process::is_alive(pid) {
             self.cleanup_state(config)?;
             println!("VM {} already stopped", self.name);
             return Ok(());
         }
 
-        // Wait for exit with timeout
+        // Use shared process utilities to stop with timeout
         let timeout = Duration::from_secs(if self.force { 1 } else { self.timeout });
-        let start = Instant::now();
-
-        loop {
-            // Check if process is still alive
-            let alive = unsafe { libc::kill(pid, 0) == 0 };
-            if !alive {
-                // Process exited
-                break;
+        match process::stop_process(pid, timeout, self.force) {
+            Ok(_) => {
+                self.cleanup_state(config)?;
+                println!("Stopped VM: {}", self.name);
+                Ok(())
             }
-
-            if start.elapsed() > timeout {
-                if self.force {
-                    println!("Sending SIGKILL...");
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
-                    // Wait a bit for SIGKILL to take effect
-                    std::thread::sleep(Duration::from_millis(500));
+            Err(e) => {
+                // If force wasn't requested, provide helpful error
+                if !self.force {
+                    Err(smolvm::Error::vm_creation(
+                        "timeout waiting for VM to stop (use --force to kill)",
+                    ))
                 } else {
-                    return Err(smolvm::Error::vm_creation(format!(
-                        "timeout waiting for VM to stop (use --force to kill)"
-                    )));
+                    Err(e)
                 }
-                break;
             }
-
-            std::thread::sleep(Duration::from_millis(100));
         }
-
-        self.cleanup_state(config)?;
-
-        println!("Stopped VM: {}", self.name);
-        Ok(())
     }
 
     fn cleanup_state(&self, config: &mut SmolvmConfig) -> smolvm::Result<()> {

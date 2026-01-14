@@ -65,20 +65,22 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+pub mod agent;
 pub mod config;
 pub mod error;
-pub mod helper;
 pub mod mount;
 pub mod network;
+pub mod process;
 pub mod protocol;
 pub mod rootfs;
 pub mod storage;
 pub mod vm;
 
 // Re-export main types for convenience
+pub use agent::{AgentClient, AgentManager};
 pub use config::{RecordState, SmolvmConfig, VmRecord};
 pub use error::{Error, Result};
-pub use helper::{HelperClient, HelperManager};
+pub use process::ChildProcess;
 pub use vm::config::{HostMount, NetworkPolicy, Resources, RootfsSource, Timeouts, VmConfig, VmId};
 pub use vm::state::{ExitReason, VmState};
 pub use vm::{default_backend, VmBackend, VmHandle};

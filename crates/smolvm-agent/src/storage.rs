@@ -113,19 +113,51 @@ pub fn status() -> Result<StorageStatus> {
 
 /// Pull an OCI image using crane.
 pub fn pull_image(image: &str, platform: Option<&str>) -> Result<ImageInfo> {
+    // Check if already cached - skip network call entirely
+    if let Ok(Some(info)) = query_image(image) {
+        debug!(image = %image, "image already cached, skipping pull");
+        return Ok(info);
+    }
+
     let root = Path::new(STORAGE_ROOT);
 
-    // Get manifest
-    info!(image = %image, "fetching manifest");
+    // Determine platform - default to current architecture
+    let platform = platform.or_else(|| {
+        #[cfg(target_arch = "aarch64")]
+        { Some("linux/arm64") }
+        #[cfg(target_arch = "x86_64")]
+        { Some("linux/amd64") }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        { None }
+    });
+
+    // Get manifest with platform specified
+    info!(image = %image, platform = ?platform, "fetching manifest");
     let manifest = crane_manifest(image, platform)?;
 
     // Parse manifest to get config and layers
     let manifest_json: serde_json::Value =
         serde_json::from_str(&manifest).map_err(|e| StorageError(e.to_string()))?;
 
-    let config_digest = manifest_json["config"]["digest"]
-        .as_str()
-        .ok_or_else(|| StorageError("missing config digest".into()))?;
+    // Handle manifest list (multi-arch) - this shouldn't happen with --platform but just in case
+    let config_digest = if manifest_json.get("config").is_some() {
+        manifest_json["config"]["digest"]
+            .as_str()
+            .ok_or_else(|| StorageError("missing config digest".into()))?
+    } else if manifest_json.get("manifests").is_some() {
+        // This is a manifest list, need to fetch platform-specific manifest
+        return Err(StorageError(format!(
+            "got manifest list instead of image manifest - platform may not be available. \
+             manifests: {:?}",
+            manifest_json["manifests"]
+                .as_array()
+                .map(|arr| arr.iter()
+                    .filter_map(|m| m["platform"]["architecture"].as_str())
+                    .collect::<Vec<_>>())
+        )));
+    } else {
+        return Err(StorageError("unknown manifest format".into()));
+    };
 
     let layers: Vec<String> = manifest_json["layers"]
         .as_array()
@@ -439,6 +471,198 @@ pub fn cleanup_overlay(workload_id: &str) -> Result<()> {
 
     info!(workload_id = %workload_id, "overlay cleaned up");
     Ok(())
+}
+
+/// Result of running a command.
+pub struct RunResult {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Run a command in an image's overlay rootfs.
+/// Uses a persistent overlay per image for fast repeated execution.
+pub fn run_command(
+    image: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    mounts: &[(String, String, bool)],
+) -> Result<RunResult> {
+    // Use consistent workload ID per image for overlay reuse
+    let workload_id = format!("persistent-{}", sanitize_image_name(image));
+
+    // Check if overlay is already mounted
+    let overlay = get_or_create_overlay(image, &workload_id)?;
+    debug!(rootfs = %overlay.rootfs_path, "using overlay for command execution");
+
+    // Setup volume mounts if any
+    let _mounted_paths = setup_volume_mounts(&overlay.rootfs_path, mounts)?;
+
+    // Run the command
+    let result = run_in_chroot(&overlay.rootfs_path, command, env, workdir);
+
+    // Note: We don't unmount the virtiofs mounts here since they may be reused
+    // The mounts will be cleaned up when the overlay is cleaned up or the VM shuts down
+
+    result
+}
+
+/// Directory where virtiofs mounts are mounted in the guest.
+const VIRTIOFS_MOUNT_ROOT: &str = "/mnt/virtiofs";
+
+/// Setup volume mounts by mounting virtiofs and bind-mounting into the rootfs.
+fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Result<Vec<PathBuf>> {
+    let mut mounted_paths = Vec::new();
+
+    for (tag, container_path, read_only) in mounts {
+        debug!(tag = %tag, container_path = %container_path, read_only = %read_only, "setting up volume mount");
+
+        // First, mount the virtiofs device at a staging location
+        let virtiofs_mount = Path::new(VIRTIOFS_MOUNT_ROOT).join(tag);
+        std::fs::create_dir_all(&virtiofs_mount)?;
+
+        // Check if already mounted
+        if !is_mountpoint(&virtiofs_mount) {
+            info!(tag = %tag, mount_point = %virtiofs_mount.display(), "mounting virtiofs");
+
+            let status = Command::new("mount")
+                .args(["-t", "virtiofs", tag])
+                .arg(&virtiofs_mount)
+                .status()?;
+
+            if !status.success() {
+                warn!(tag = %tag, "failed to mount virtiofs device");
+                continue;
+            }
+        }
+
+        // Now bind-mount into the container rootfs
+        let target_path = format!("{}{}", rootfs, container_path);
+        std::fs::create_dir_all(&target_path)?;
+
+        // Check if already bind-mounted
+        if !is_mountpoint(Path::new(&target_path)) {
+            info!(
+                source = %virtiofs_mount.display(),
+                target = %target_path,
+                read_only = %read_only,
+                "bind-mounting into container"
+            );
+
+            let args = [
+                "--bind",
+                &virtiofs_mount.to_string_lossy(),
+                &target_path,
+            ];
+
+            let status = Command::new("mount")
+                .args(args)
+                .status()?;
+
+            if !status.success() {
+                warn!(target = %target_path, "failed to bind-mount");
+                continue;
+            }
+
+            // Remount read-only if requested
+            if *read_only {
+                let _ = Command::new("mount")
+                    .args(["-o", "remount,ro,bind", &target_path])
+                    .status();
+            }
+        }
+
+        mounted_paths.push(PathBuf::from(target_path));
+    }
+
+    Ok(mounted_paths)
+}
+
+/// Get existing overlay or create new one.
+fn get_or_create_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
+    let root = Path::new(STORAGE_ROOT);
+    let overlay_root = root.join(OVERLAYS_DIR).join(workload_id);
+    let merged_path = overlay_root.join("merged");
+
+    // Check if already mounted
+    if merged_path.exists() && is_mountpoint(&merged_path) {
+        debug!(workload_id = %workload_id, "reusing existing overlay");
+        return Ok(OverlayInfo {
+            rootfs_path: merged_path.display().to_string(),
+            upper_path: overlay_root.join("upper").display().to_string(),
+            work_path: overlay_root.join("work").display().to_string(),
+        });
+    }
+
+    // Create new overlay
+    prepare_overlay(image, workload_id)
+}
+
+/// Check if a path is a mountpoint.
+fn is_mountpoint(path: &Path) -> bool {
+    // Read /proc/mounts to check if path is mounted
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        let path_str = path.to_string_lossy();
+        for line in mounts.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 && parts[1] == path_str {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Run a command inside a chroot.
+fn run_in_chroot(
+    rootfs: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+) -> Result<RunResult> {
+    if command.is_empty() {
+        return Err(StorageError("empty command".into()));
+    }
+
+    // Build chroot command
+    let mut cmd = Command::new("chroot");
+    cmd.arg(rootfs);
+
+    // Add the actual command
+    for arg in command {
+        cmd.arg(arg);
+    }
+
+    // Set environment
+    cmd.env_clear();
+    cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    cmd.env("HOME", "/root");
+    cmd.env("TERM", "xterm-256color");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+
+    // Set working directory
+    if let Some(wd) = workdir {
+        cmd.current_dir(format!("{}{}", rootfs, wd));
+    }
+
+    info!(command = ?command, "executing command in chroot");
+
+    let output = cmd.output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    info!(exit_code = exit_code, "command completed");
+
+    Ok(RunResult {
+        exit_code,
+        stdout,
+        stderr,
+    })
 }
 
 // ============================================================================

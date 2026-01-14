@@ -1,7 +1,7 @@
 //! Protocol types for smolvm host-guest communication.
 //!
 //! This crate defines the wire protocol for vsock communication between
-//! the smolvm host and guest VMs (helper daemon and workload VMs).
+//! the smolvm host and the guest agent (smolvm-agent).
 //!
 //! # Protocol Overview
 //!
@@ -30,8 +30,11 @@ pub mod ports {
     pub const WORKLOAD_CONTROL: u32 = 5000;
     /// Log streaming from workload VMs.
     pub const WORKLOAD_LOGS: u32 = 5001;
-    /// Helper daemon control port.
-    pub const HELPER_CONTROL: u32 = 6000;
+    /// Agent control port (for OCI operations and management).
+    pub const AGENT_CONTROL: u32 = 6000;
+    /// Legacy alias for AGENT_CONTROL (deprecated, use AGENT_CONTROL).
+    #[deprecated(note = "use AGENT_CONTROL instead")]
+    pub const HELPER_CONTROL: u32 = AGENT_CONTROL;
 }
 
 /// vsock CID constants.
@@ -45,14 +48,14 @@ pub mod cid {
 }
 
 // ============================================================================
-// Helper Daemon Protocol
+// Agent Protocol (OCI Operations)
 // ============================================================================
 
-/// Helper daemon request types (for image management).
+/// Agent request types (for image management and OCI operations).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
-pub enum HelperRequest {
-    /// Ping to check if helper is alive.
+pub enum AgentRequest {
+    /// Ping to check if agent is alive.
     Ping,
 
     /// Pull an OCI image and extract layers.
@@ -98,14 +101,34 @@ pub enum HelperRequest {
     /// Get storage disk status.
     StorageStatus,
 
-    /// Shutdown the helper daemon.
+    /// Shutdown the agent.
     Shutdown,
+
+    /// Run a command in an image's rootfs.
+    ///
+    /// This prepares an overlay, chroots into it, and executes the command.
+    /// Returns stdout, stderr, and exit code when the command completes.
+    Run {
+        /// Image reference (must be pulled first).
+        image: String,
+        /// Command and arguments.
+        command: Vec<String>,
+        /// Environment variables.
+        #[serde(default)]
+        env: Vec<(String, String)>,
+        /// Working directory inside the rootfs.
+        workdir: Option<String>,
+        /// Volume mounts to bind into the container.
+        /// Each tuple is (virtiofs_tag, container_path, read_only).
+        #[serde(default)]
+        mounts: Vec<(String, String, bool)>,
+    },
 }
 
-/// Helper daemon response types.
+/// Agent response types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub enum HelperResponse {
+pub enum AgentResponse {
     /// Operation completed successfully.
     Ok {
         /// Response data (varies by request type).
@@ -139,7 +162,26 @@ pub enum HelperResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         code: Option<String>,
     },
+
+    /// Command execution completed.
+    Completed {
+        /// Exit code from the command.
+        exit_code: i32,
+        /// Standard output (may be truncated).
+        stdout: String,
+        /// Standard error (may be truncated).
+        stderr: String,
+    },
 }
+
+// Legacy type aliases for backward compatibility
+/// Legacy alias for AgentRequest.
+#[deprecated(note = "use AgentRequest instead")]
+pub type HelperRequest = AgentRequest;
+
+/// Legacy alias for AgentResponse.
+#[deprecated(note = "use AgentResponse instead")]
+pub type HelperResponse = AgentResponse;
 
 /// Image information returned by Query/ListImages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,7 +231,7 @@ pub struct StorageStatus {
 }
 
 // ============================================================================
-// Workload VM Protocol
+// Workload VM Protocol (Command Execution)
 // ============================================================================
 
 /// Messages from host to workload VM.
@@ -376,16 +418,16 @@ mod tests {
 
     #[test]
     fn test_encode_decode_roundtrip() {
-        let req = HelperRequest::Pull {
+        let req = AgentRequest::Pull {
             image: "alpine:latest".to_string(),
             platform: Some("linux/arm64".to_string()),
         };
 
         let encoded = encode_message(&req).unwrap();
-        let decoded: HelperRequest = decode_message(&encoded).unwrap();
+        let decoded: AgentRequest = decode_message(&encoded).unwrap();
 
         match decoded {
-            HelperRequest::Pull { image, platform } => {
+            AgentRequest::Pull { image, platform } => {
                 assert_eq!(image, "alpine:latest");
                 assert_eq!(platform, Some("linux/arm64".to_string()));
             }
@@ -396,7 +438,7 @@ mod tests {
     #[test]
     fn test_decode_too_short() {
         let data = [0u8; 2];
-        let result: Result<HelperRequest, _> = decode_message(&data);
+        let result: Result<AgentRequest, _> = decode_message(&data);
         assert!(matches!(result, Err(DecodeError::TooShort)));
     }
 
@@ -404,17 +446,17 @@ mod tests {
     fn test_decode_incomplete() {
         let mut data = vec![0, 0, 0, 100]; // claims 100 bytes
         data.extend_from_slice(b"{}"); // only 2 bytes of payload
-        let result: Result<HelperRequest, _> = decode_message(&data);
+        let result: Result<AgentRequest, _> = decode_message(&data);
         assert!(matches!(result, Err(DecodeError::Incomplete { .. })));
     }
 
     #[test]
-    fn test_helper_request_serialization() {
-        let req = HelperRequest::Ping;
+    fn test_agent_request_serialization() {
+        let req = AgentRequest::Ping;
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("ping"));
 
-        let req = HelperRequest::PrepareOverlay {
+        let req = AgentRequest::PrepareOverlay {
             image: "ubuntu:22.04".to_string(),
             workload_id: "wl-123".to_string(),
         };
@@ -423,14 +465,14 @@ mod tests {
     }
 
     #[test]
-    fn test_helper_response_serialization() {
-        let resp = HelperResponse::Pong {
+    fn test_agent_response_serialization() {
+        let resp = AgentResponse::Pong {
             version: PROTOCOL_VERSION,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("pong"));
 
-        let resp = HelperResponse::Progress {
+        let resp = AgentResponse::Progress {
             message: "Pulling layer 1/3".to_string(),
             percent: Some(33),
             layer: Some("sha256:abc123".to_string()),
@@ -443,7 +485,7 @@ mod tests {
     fn test_ports_constants() {
         assert_eq!(ports::WORKLOAD_CONTROL, 5000);
         assert_eq!(ports::WORKLOAD_LOGS, 5001);
-        assert_eq!(ports::HELPER_CONTROL, 6000);
+        assert_eq!(ports::AGENT_CONTROL, 6000);
     }
 
     #[test]

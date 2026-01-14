@@ -98,10 +98,10 @@ pub enum Error {
         message: String,
     },
 
-    // Helper VM errors
-    /// Helper daemon error.
-    #[error("helper error: {0}")]
-    HelperError(String),
+    // Agent VM errors
+    /// Agent error.
+    #[error("agent error: {0}")]
+    AgentError(String),
 
     // IO errors
     /// IO error wrapper.

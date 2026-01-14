@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/smolvm-helper", "crates/smolvm-protocol"]
+members = [".", "crates/smolvm-agent", "crates/smolvm-protocol"]
 resolver = "2"
 
 [package]

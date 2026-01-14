@@ -136,6 +136,8 @@ pub struct LibkrunVm {
     exit_reason: Option<ExitReason>,
     /// Container ID if using buildah (for cleanup).
     container_id: Option<String>,
+    /// Child process running the VM.
+    child: Option<crate::process::ChildProcess>,
 }
 
 impl LibkrunVm {
@@ -159,6 +161,7 @@ impl LibkrunVm {
             state: VmState::Created,
             exit_reason: None,
             container_id,
+            child: None,
         };
 
         // Execute VM (this blocks until VM exits)
@@ -365,22 +368,13 @@ impl LibkrunVm {
                 // If we get here, something went wrong
                 libc::_exit(1);
             } else {
-                // Parent process: wait for child
-                let mut status: libc::c_int = 0;
-                let wait_result = libc::waitpid(pid, &mut status, 0);
+                // Parent process: store child process and wait
+                self.child = Some(crate::process::ChildProcess::new(pid));
 
-                if wait_result < 0 {
-                    return Err(Error::vm_creation("waitpid failed"));
-                }
+                let exit_code = self.child.as_mut().unwrap().wait();
 
-                // Extract exit code
-                let exit_code = if libc::WIFEXITED(status) {
-                    libc::WEXITSTATUS(status)
-                } else if libc::WIFSIGNALED(status) {
-                    128 + libc::WTERMSIG(status)
-                } else {
-                    -1
-                };
+                // Clear child reference after exit
+                self.child = None;
 
                 Ok(exit_code)
             }
@@ -420,15 +414,24 @@ impl VmHandle for LibkrunVm {
     }
 
     fn stop(&mut self) -> Result<()> {
-        // libkrun doesn't support graceful stop without vsock
-        // Phase 1 will add vsock-based shutdown
-        tracing::warn!("graceful stop not supported in Phase 0");
+        if let Some(ref mut child) = self.child {
+            if child.is_running() {
+                tracing::info!(pid = child.pid(), "stopping VM with SIGTERM");
+                child.stop(crate::process::DEFAULT_STOP_TIMEOUT, true)?;
+                self.state = VmState::Stopped;
+            }
+        }
         Ok(())
     }
 
     fn kill(&mut self) -> Result<()> {
-        // libkrun doesn't expose kill without vsock
-        tracing::warn!("kill not supported in Phase 0");
+        if let Some(ref child) = self.child {
+            if crate::process::is_alive(child.pid()) {
+                tracing::info!(pid = child.pid(), "killing VM with SIGKILL");
+                crate::process::kill(child.pid());
+            }
+        }
+        self.state = VmState::Stopped;
         Ok(())
     }
 }

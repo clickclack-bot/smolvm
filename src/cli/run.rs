@@ -1,6 +1,7 @@
 //! Run command implementation.
 
 use clap::Args;
+use smolvm::agent::{AgentClient, AgentManager};
 use smolvm::config::SmolvmConfig;
 use smolvm::mount::{parse_mount_spec, validate_mount};
 use smolvm::rootfs::buildah;
@@ -74,11 +75,23 @@ pub struct RunCmd {
     /// Write console output to file (for debugging).
     #[arg(long)]
     pub console_log: Option<String>,
+
+    /// Use the smolvm-agent for image pulling and execution (experimental).
+    ///
+    /// When enabled, bypasses buildah and runs commands directly inside
+    /// the agent VM. This eliminates the buildah dependency.
+    #[arg(long)]
+    pub use_agent: bool,
 }
 
 impl RunCmd {
     /// Execute the run command.
     pub fn run(self, config: &mut SmolvmConfig) -> smolvm::Result<()> {
+        // If using agent mode, delegate to agent
+        if self.use_agent {
+            return self.run_via_agent(config);
+        }
+
         // Determine rootfs source
         let (rootfs, container_id) = if std::path::Path::new(&self.source).exists() {
             tracing::info!(path = %self.source, "using path as rootfs");
@@ -195,6 +208,76 @@ impl RunCmd {
                 return Err(e);
             }
         }
+    }
+
+    /// Run via the smolvm-agent (experimental).
+    ///
+    /// This mode uses the agent VM to pull images and execute commands,
+    /// bypassing buildah entirely.
+    fn run_via_agent(self, _config: &mut SmolvmConfig) -> smolvm::Result<()> {
+        use smolvm::Error;
+
+        // Start or connect to agent
+        println!("Starting agent VM...");
+        let manager = AgentManager::default().map_err(|e| {
+            Error::AgentError(format!("failed to create agent manager: {}", e))
+        })?;
+
+        manager.ensure_running().map_err(|e| {
+            Error::AgentError(format!("failed to start agent: {}", e))
+        })?;
+
+        // Connect to agent
+        let mut client = AgentClient::connect(manager.vsock_socket())?;
+
+        // Pull image if not a local path
+        if !std::path::Path::new(&self.source).exists() {
+            println!("Pulling image {}...", self.source);
+            client.pull(&self.source, None)?;
+        }
+
+        // Build command
+        let command = if self.command.is_empty() {
+            vec!["/bin/sh".to_string()]
+        } else {
+            self.command.clone()
+        };
+
+        // Parse environment variables
+        let env: Vec<(String, String)> = self
+            .env
+            .iter()
+            .filter_map(|e| parse_env_spec(e))
+            .collect();
+
+        // Run command
+        println!("Running command: {:?}", command);
+        let (exit_code, stdout, stderr) = client.run(
+            &self.source,
+            command,
+            env,
+            self.workdir.clone(),
+        )?;
+
+        // Print output
+        if !stdout.is_empty() {
+            print!("{}", stdout);
+        }
+        if !stderr.is_empty() {
+            eprint!("{}", stderr);
+        }
+
+        // Flush output before cleanup
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+
+        // Stop the agent VM (sends SIGTERM, waits, then SIGKILL if needed)
+        if let Err(e) = manager.stop() {
+            tracing::warn!(error = %e, "failed to stop agent");
+        }
+
+        std::process::exit(exit_code);
     }
 
     /// Run the VM and return exit code. Separated to allow cleanup on all paths.
