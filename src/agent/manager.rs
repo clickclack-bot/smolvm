@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::launcher::{launch_agent_vm, HostMount};
+use super::VmResources;
 
 /// State of the agent VM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,13 +34,21 @@ struct AgentInner {
     child: Option<ChildProcess>,
     /// Currently configured mounts.
     mounts: Vec<HostMount>,
+    /// Currently configured VM resources.
+    resources: VmResources,
 }
 
 /// Agent VM manager.
 ///
 /// Manages the lifecycle of the agent VM which handles OCI image operations
 /// and command execution.
+///
+/// Each named VM gets its own agent with isolated paths:
+/// - Anonymous: `~/.cache/smolvm/agent.sock`
+/// - Named "foo": `~/.cache/smolvm/vms/foo/agent.sock`
 pub struct AgentManager {
+    /// Optional VM name (None for anonymous/default agent).
+    name: Option<String>,
     /// Path to the agent rootfs.
     rootfs_path: PathBuf,
     /// Storage disk for OCI layers.
@@ -53,29 +62,51 @@ pub struct AgentManager {
 }
 
 impl AgentManager {
-    /// Create a new agent manager.
+    /// Create a new agent manager for an anonymous (default) agent.
     ///
     /// # Arguments
     ///
     /// * `rootfs_path` - Path to the agent VM rootfs
     /// * `storage_disk` - Storage disk for OCI layers
     pub fn new(rootfs_path: impl Into<PathBuf>, storage_disk: StorageDisk) -> Result<Self> {
-        let rootfs_path = rootfs_path.into();
+        Self::new_internal(None, rootfs_path.into(), storage_disk)
+    }
 
+    /// Create a new agent manager for a named VM.
+    ///
+    /// Each named VM gets isolated paths for socket, storage, and logs.
+    pub fn new_named(
+        name: impl Into<String>,
+        rootfs_path: impl Into<PathBuf>,
+        storage_disk: StorageDisk,
+    ) -> Result<Self> {
+        Self::new_internal(Some(name.into()), rootfs_path.into(), storage_disk)
+    }
+
+    /// Internal constructor.
+    fn new_internal(
+        name: Option<String>,
+        rootfs_path: PathBuf,
+        storage_disk: StorageDisk,
+    ) -> Result<Self> {
         // Create runtime directory for sockets
         let runtime_dir = dirs::runtime_dir()
             .or_else(|| dirs::cache_dir())
             .unwrap_or_else(|| PathBuf::from("/tmp"));
 
-        let smolvm_runtime = runtime_dir.join("smolvm");
+        // Named VMs get their own subdirectory
+        let smolvm_runtime = if let Some(ref vm_name) = name {
+            runtime_dir.join("smolvm").join("vms").join(vm_name)
+        } else {
+            runtime_dir.join("smolvm")
+        };
         std::fs::create_dir_all(&smolvm_runtime)?;
 
         let vsock_socket = smolvm_runtime.join("agent.sock");
-
-        // Console log path
         let console_log = Some(smolvm_runtime.join("agent-console.log"));
 
         Ok(Self {
+            name,
             rootfs_path,
             storage_disk,
             vsock_socket,
@@ -84,11 +115,12 @@ impl AgentManager {
                 state: AgentState::Stopped,
                 child: None,
                 mounts: Vec::new(),
+                resources: VmResources::default(),
             })),
         })
     }
 
-    /// Get the default agent manager.
+    /// Get the default (anonymous) agent manager.
     ///
     /// Uses default paths for rootfs and storage.
     pub fn default() -> Result<Self> {
@@ -96,6 +128,36 @@ impl AgentManager {
         let storage_disk = StorageDisk::open_or_create()?;
 
         Self::new(rootfs_path, storage_disk)
+    }
+
+    /// Get an agent manager for a named VM.
+    ///
+    /// Each named VM gets its own isolated storage and socket.
+    pub fn for_vm(name: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        let rootfs_path = Self::default_rootfs_path()?;
+
+        // Named VMs get their own storage disk
+        let storage_dir = dirs::cache_dir()
+            .or_else(|| dirs::data_local_dir())
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("smolvm")
+            .join("vms")
+            .join(&name);
+        std::fs::create_dir_all(&storage_dir)?;
+
+        let storage_path = storage_dir.join("storage.img");
+        let storage_disk = StorageDisk::open_or_create_at(
+            &storage_path,
+            crate::storage::DEFAULT_STORAGE_SIZE_GB,
+        )?;
+
+        Self::new_named(name, rootfs_path, storage_disk)
+    }
+
+    /// Get the VM name if this is a named agent.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 
     /// Get the default path for the agent rootfs.
@@ -166,28 +228,45 @@ impl AgentManager {
         inner.mounts == mounts
     }
 
+    /// Check if the given resources match the currently running agent's resources.
+    pub fn resources_match(&self, resources: VmResources) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.resources == resources
+    }
+
     /// Ensure the agent is running with the specified mounts.
     ///
     /// If the agent is running with different mounts, it will be restarted.
     pub fn ensure_running_with_mounts(&self, mounts: Vec<HostMount>) -> Result<()> {
-        // Check if agent is already running with the same mounts
-        if self.try_connect_existing().is_some() && self.mounts_match(&mounts) {
+        self.ensure_running_with_config(mounts, VmResources::default())
+    }
+
+    /// Ensure the agent is running with the specified mounts and resources.
+    ///
+    /// If the agent is running with different mounts or resources, it will be restarted.
+    pub fn ensure_running_with_config(&self, mounts: Vec<HostMount>, resources: VmResources) -> Result<()> {
+        // Check if agent is already running with the same configuration
+        if self.try_connect_existing().is_some()
+            && self.mounts_match(&mounts)
+            && self.resources_match(resources)
+        {
             return Ok(());
         }
 
-        // If running with different mounts, we need to restart
+        // If running with different config, we need to restart
         let needs_restart = {
             let inner = self.inner.lock().unwrap();
-            inner.state == AgentState::Running && inner.mounts != mounts
+            inner.state == AgentState::Running
+                && (inner.mounts != mounts || inner.resources != resources)
         };
 
         if needs_restart {
-            tracing::info!("restarting agent VM due to mount configuration change");
+            tracing::info!("restarting agent VM due to configuration change");
             self.stop()?;
         }
 
-        // Start with new mounts
-        self.start_with_mounts(mounts)
+        // Start with new config
+        self.start_with_config(mounts, resources)
     }
 
     /// Ensure the agent is running.
@@ -216,11 +295,16 @@ impl AgentManager {
 
     /// Start the agent VM.
     pub fn start(&self) -> Result<()> {
-        self.start_with_mounts(Vec::new())
+        self.start_with_config(Vec::new(), VmResources::default())
     }
 
     /// Start the agent VM with specified mounts.
     pub fn start_with_mounts(&self, mounts: Vec<HostMount>) -> Result<()> {
+        self.start_with_config(mounts, VmResources::default())
+    }
+
+    /// Start the agent VM with specified mounts and resources.
+    pub fn start_with_config(&self, mounts: Vec<HostMount>, resources: VmResources) -> Result<()> {
         // Check and update state
         {
             let mut inner = self.inner.lock().unwrap();
@@ -231,6 +315,7 @@ impl AgentManager {
             }
             inner.state = AgentState::Starting;
             inner.mounts = mounts.clone();
+            inner.resources = resources;
         }
 
         tracing::info!(
@@ -295,6 +380,7 @@ impl AgentManager {
                     &vsock_socket,
                     console_log.as_deref(),
                     &mounts,
+                    resources,
                 );
 
                 // If we get here, something went wrong

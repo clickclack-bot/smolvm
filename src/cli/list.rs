@@ -37,11 +37,14 @@ impl ListCmd {
                     serde_json::json!({
                         "name": name,
                         "state": actual_state.to_string(),
+                        "image": record.image,
                         "cpus": record.cpus,
                         "memory_mib": record.mem,
                         "pid": record.pid,
-                        "rootfs": record.rootfs_source,
-                        "container_id": record.container_id,
+                        "command": record.command,
+                        "workdir": record.workdir,
+                        "env": record.env,
+                        "mounts": record.mounts.len(),
                         "created_at": record.created_at,
                     })
                 })
@@ -50,39 +53,37 @@ impl ListCmd {
         } else {
             // Table output
             println!(
-                "{:<20} {:<10} {:<6} {:<10} {:<8} {:<20}",
-                "NAME", "STATE", "CPUS", "MEMORY", "PID", "ROOTFS"
+                "{:<20} {:<10} {:<5} {:<8} {:<25} {:<6}",
+                "NAME", "STATE", "CPUS", "MEMORY", "IMAGE", "MOUNTS"
             );
-            println!("{}", "-".repeat(80));
+            println!("{}", "-".repeat(78));
 
             for (name, record) in vms {
                 let actual_state = record.actual_state();
-                let rootfs_display = if record.rootfs_source.len() > 18 {
-                    format!("{}...", &record.rootfs_source[..15])
-                } else {
-                    record.rootfs_source.clone()
-                };
-                let pid_display = record
-                    .pid
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "-".to_string());
 
                 println!(
-                    "{:<20} {:<10} {:<6} {:<10} {:<8} {:<20}",
+                    "{:<20} {:<10} {:<5} {:<8} {:<25} {:<6}",
                     truncate(name, 18),
                     actual_state,
                     record.cpus,
                     format!("{} MiB", record.mem),
-                    pid_display,
-                    rootfs_display,
+                    truncate(&record.image, 23),
+                    record.mounts.len(),
                 );
 
                 if self.verbose {
-                    if let Some(cid) = &record.container_id {
-                        println!("  Container: {}", cid);
+                    if let Some(cmd) = &record.command {
+                        println!("  Command: {:?}", cmd);
                     }
-                    if let Some(pf) = &record.pid_file {
-                        println!("  PID file: {}", pf);
+                    if let Some(wd) = &record.workdir {
+                        println!("  Workdir: {}", wd);
+                    }
+                    if !record.env.is_empty() {
+                        println!("  Env: {} variable(s)", record.env.len());
+                    }
+                    for (host, guest, ro) in &record.mounts {
+                        let ro_str = if *ro { " (ro)" } else { "" };
+                        println!("  Mount: {} -> {}{}", host, guest, ro_str);
                     }
                     println!("  Created: {}", record.created_at);
                     println!();

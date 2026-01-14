@@ -89,12 +89,6 @@ impl SmolvmConfig {
         confy::store(APP_NAME, None, self).map_err(|e| Error::ConfigSave(e.to_string()))
     }
 
-    /// Add a VM to the registry.
-    pub fn add_vm(&mut self, config: &VmConfig) {
-        let record = VmRecord::from_config(config);
-        self.vms.insert(config.id.0.clone(), record);
-    }
-
     /// Remove a VM from the registry.
     pub fn remove_vm(&mut self, id: &str) -> Option<VmRecord> {
         self.vms.remove(id)
@@ -130,17 +124,8 @@ pub struct VmRecord {
     /// VM name/ID.
     pub name: String,
 
-    /// Number of vCPUs.
-    pub cpus: u8,
-
-    /// Memory in MiB.
-    pub mem: u32,
-
-    /// Buildah container ID (if using buildah rootfs).
-    pub container_id: Option<String>,
-
-    /// Original rootfs source description.
-    pub rootfs_source: String,
+    /// OCI image reference.
+    pub image: String,
 
     /// Creation timestamp.
     pub created_at: String,
@@ -153,9 +138,13 @@ pub struct VmRecord {
     #[serde(default)]
     pub pid: Option<i32>,
 
-    /// Path to PID file.
-    #[serde(default)]
-    pub pid_file: Option<String>,
+    /// Number of vCPUs.
+    #[serde(default = "default_cpus")]
+    pub cpus: u8,
+
+    /// Memory in MiB.
+    #[serde(default = "default_mem")]
+    pub mem: u32,
 
     /// Command to execute.
     #[serde(default)]
@@ -169,55 +158,50 @@ pub struct VmRecord {
     #[serde(default)]
     pub env: Vec<(String, String)>,
 
-    /// Network enabled.
+    /// Volume mounts (host_path, guest_path, read_only).
     #[serde(default)]
-    pub net_enabled: bool,
+    pub mounts: Vec<(String, String, bool)>,
+}
 
-    /// DNS server.
-    #[serde(default)]
-    pub dns: Option<String>,
+fn default_cpus() -> u8 {
+    1
+}
+
+fn default_mem() -> u32 {
+    256
 }
 
 impl VmRecord {
-    /// Create a record from a VM configuration.
-    pub fn from_config(config: &VmConfig) -> Self {
-        use crate::vm::config::{NetworkPolicy, RootfsSource};
-
-        let (container_id, rootfs_source) = match &config.rootfs {
-            RootfsSource::Path { path } => (None, path.display().to_string()),
-            RootfsSource::Buildah { container_id } => {
-                (Some(container_id.clone()), format!("buildah:{}", container_id))
-            }
-        };
-
-        let (net_enabled, dns) = match &config.network {
-            NetworkPolicy::None => (false, None),
-            NetworkPolicy::Egress { dns } => (true, dns.map(|ip| ip.to_string())),
-        };
-
+    /// Create a new VM record.
+    pub fn new(
+        name: String,
+        image: String,
+        cpus: u8,
+        mem: u32,
+        command: Option<Vec<String>>,
+        workdir: Option<String>,
+        env: Vec<(String, String)>,
+        mounts: Vec<(String, String, bool)>,
+    ) -> Self {
         Self {
-            name: config.id.0.clone(),
-            cpus: config.resources.cpus,
-            mem: config.resources.memory_mib,
-            container_id,
-            rootfs_source,
+            name,
+            image,
             created_at: chrono_lite_now(),
             state: RecordState::Created,
             pid: None,
-            pid_file: None,
-            command: config.command.clone(),
-            workdir: config.workdir.as_ref().map(|p| p.to_string_lossy().to_string()),
-            env: config.env.clone(),
-            net_enabled,
-            dns,
+            cpus,
+            mem,
+            command,
+            workdir,
+            env,
+            mounts,
         }
     }
 
     /// Check if the VM process is still alive.
     pub fn is_process_alive(&self) -> bool {
         if let Some(pid) = self.pid {
-            // Check if process exists by sending signal 0
-            unsafe { libc::kill(pid, 0) == 0 }
+            crate::process::is_alive(pid)
         } else {
             false
         }
@@ -252,57 +236,45 @@ fn chrono_lite_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::config::{Resources, RootfsSource, VmId};
 
     #[test]
     fn test_add_and_get_vm() {
         let mut config = SmolvmConfig::default();
 
-        let vm_config = VmConfig {
-            id: VmId::new("test-vm"),
-            rootfs: RootfsSource::path("/some/path"),
-            resources: Resources::new(1024, 2),
-            timeouts: Default::default(),
-            network: Default::default(),
-            mounts: vec![],
-            disks: vec![],
-            vsock_ports: vec![],
-            console_log: None,
-            rosetta: false,
-            command: None,
-            workdir: None,
-            env: vec![],
-        };
+        let record = VmRecord::new(
+            "test-vm".to_string(),
+            "alpine:latest".to_string(),
+            1,
+            256,
+            Some(vec!["/bin/sh".to_string()]),
+            None,
+            vec![],
+            vec![],
+        );
 
-        config.add_vm(&vm_config);
+        config.vms.insert("test-vm".to_string(), record);
 
         let record = config.get_vm("test-vm").expect("VM should exist");
         assert_eq!(record.name, "test-vm");
-        assert_eq!(record.cpus, 2);
-        assert_eq!(record.mem, 1024);
+        assert_eq!(record.image, "alpine:latest");
     }
 
     #[test]
     fn test_remove_vm() {
         let mut config = SmolvmConfig::default();
 
-        let vm_config = VmConfig {
-            id: VmId::new("test-vm"),
-            rootfs: RootfsSource::path("/some/path"),
-            resources: Resources::default(),
-            timeouts: Default::default(),
-            network: Default::default(),
-            mounts: vec![],
-            disks: vec![],
-            vsock_ports: vec![],
-            console_log: None,
-            rosetta: false,
-            command: None,
-            workdir: None,
-            env: vec![],
-        };
+        let record = VmRecord::new(
+            "test-vm".to_string(),
+            "alpine:latest".to_string(),
+            1,
+            256,
+            None,
+            None,
+            vec![],
+            vec![],
+        );
 
-        config.add_vm(&vm_config);
+        config.vms.insert("test-vm".to_string(), record);
         assert!(config.get_vm("test-vm").is_some());
 
         let removed = config.remove_vm("test-vm");
@@ -315,22 +287,17 @@ mod tests {
         let mut config = SmolvmConfig::default();
 
         for i in 0..3 {
-            let vm_config = VmConfig {
-                id: VmId::new(format!("vm-{}", i)),
-                rootfs: RootfsSource::path("/some/path"),
-                resources: Resources::default(),
-                timeouts: Default::default(),
-                network: Default::default(),
-                mounts: vec![],
-                disks: vec![],
-                vsock_ports: vec![],
-                console_log: None,
-                rosetta: false,
-                command: None,
-                workdir: None,
-                env: vec![],
-            };
-            config.add_vm(&vm_config);
+            let record = VmRecord::new(
+                format!("vm-{}", i),
+                "alpine:latest".to_string(),
+                1,
+                256,
+                None,
+                None,
+                vec![],
+                vec![],
+            );
+            config.vms.insert(format!("vm-{}", i), record);
         }
 
         let vms: Vec<_> = config.list_vms().collect();
@@ -339,39 +306,29 @@ mod tests {
 
     #[test]
     fn test_vm_record_serialization() {
-        let record = VmRecord {
-            name: "test".to_string(),
-            cpus: 2,
-            mem: 1024,
-            container_id: Some("abc123".to_string()),
-            rootfs_source: "buildah:abc123".to_string(),
-            created_at: "1234567890".to_string(),
-            state: RecordState::Created,
-            pid: None,
-            pid_file: None,
-            command: Some(vec!["/bin/echo".to_string(), "hello".to_string()]),
-            workdir: Some("/app".to_string()),
-            env: vec![("FOO".to_string(), "bar".to_string())],
-            net_enabled: true,
-            dns: Some("8.8.8.8".to_string()),
-        };
+        let record = VmRecord::new(
+            "test".to_string(),
+            "alpine:latest".to_string(),
+            2,
+            512,
+            Some(vec!["/bin/echo".to_string(), "hello".to_string()]),
+            Some("/app".to_string()),
+            vec![("FOO".to_string(), "bar".to_string())],
+            vec![("/host".to_string(), "/guest".to_string(), false)],
+        );
 
         let json = serde_json::to_string(&record).unwrap();
         let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
 
         assert_eq!(deserialized.name, record.name);
-        assert_eq!(deserialized.cpus, record.cpus);
-        assert_eq!(deserialized.container_id, record.container_id);
+        assert_eq!(deserialized.image, record.image);
         assert_eq!(deserialized.command, record.command);
         assert_eq!(deserialized.env, record.env);
-        assert_eq!(deserialized.net_enabled, record.net_enabled);
+        assert_eq!(deserialized.mounts, record.mounts);
     }
-
-    // === Config Migration / Backwards Compatibility ===
 
     #[test]
     fn test_config_v1_backwards_compat() {
-        // Ensure we can deserialize a v1 config format
         let v1_json = r#"{
             "version": 1,
             "default_cpus": 2,
@@ -388,37 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn test_config_with_existing_vms() {
-        // Ensure we can deserialize config with VM records
-        let json = r#"{
-            "version": 1,
-            "default_cpus": 1,
-            "default_mem": 512,
-            "default_dns": "1.1.1.1",
-            "vms": {
-                "my-vm": {
-                    "name": "my-vm",
-                    "cpus": 4,
-                    "mem": 2048,
-                    "container_id": "abc123",
-                    "rootfs_source": "alpine:latest",
-                    "created_at": "1234567890"
-                }
-            }
-        }"#;
-
-        let config: SmolvmConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.vms.len(), 1);
-
-        let vm = config.get_vm("my-vm").unwrap();
-        assert_eq!(vm.cpus, 4);
-        assert_eq!(vm.mem, 2048);
-        assert_eq!(vm.container_id, Some("abc123".to_string()));
-    }
-
-    #[test]
     fn test_config_missing_optional_fields() {
-        // Config should handle missing optional fields via defaults
         let minimal_json = r#"{
             "version": 1,
             "default_cpus": 1,
@@ -427,23 +354,6 @@ mod tests {
         }"#;
 
         let config: SmolvmConfig = serde_json::from_str(minimal_json).unwrap();
-        assert!(config.vms.is_empty()); // vms has #[serde(default)]
-    }
-
-    #[test]
-    fn test_vm_record_without_container_id() {
-        // VM record with null container_id (path-based rootfs)
-        let json = r#"{
-            "name": "local-vm",
-            "cpus": 1,
-            "mem": 512,
-            "container_id": null,
-            "rootfs_source": "/path/to/rootfs",
-            "created_at": "1234567890"
-        }"#;
-
-        let record: VmRecord = serde_json::from_str(json).unwrap();
-        assert!(record.container_id.is_none());
-        assert_eq!(record.rootfs_source, "/path/to/rootfs");
+        assert!(config.vms.is_empty());
     }
 }

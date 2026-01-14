@@ -9,7 +9,7 @@ OCI-native microVM runtime. Run containers in lightweight VMs using [libkrun](ht
 ### Prerequisites (macOS)
 
 ```bash
-brew install libkrun@1.15.1 libkrunfw buildah
+brew install libkrun@1.15.1 libkrunfw
 ```
 
 ### Build
@@ -53,27 +53,30 @@ mkdir -p /tmp/test && echo "hello" > /tmp/test/file.txt
 
 ## Usage
 
-### Ephemeral Run
+### run vs exec
+
+| Command | Agent Lifecycle | Use Case |
+|---------|-----------------|----------|
+| `run` | Starts → runs → **stops** | One-off commands |
+| `exec` | Starts → runs → **keeps running** | Repeated commands |
+
+### Run (Ephemeral)
 
 ```bash
 smolvm run [OPTIONS] <IMAGE> [COMMAND]
 
-# Examples
-smolvm run alpine:latest                           # Interactive shell
-smolvm run --memory 1024 --cpus 2 ubuntu:22.04     # Custom resources
-smolvm run --net alpine:latest ping -c1 google.com # With network
+smolvm run alpine:latest echo "Hello"              # Stops agent after
 smolvm run -e FOO=bar alpine:latest env            # Environment vars
 smolvm run -v /host/path:/guest/path alpine:latest # Volume mount
 ```
 
-### Agent Mode (Persistent VM)
+### Exec (Persistent Agent)
 
 ```bash
 smolvm exec [OPTIONS] <IMAGE> [COMMAND]
 
-# First call starts agent VM (~2s), subsequent calls are fast (~50ms)
-smolvm exec alpine:latest echo "First"   # Starts agent
-smolvm exec alpine:latest echo "Second"  # Reuses agent
+smolvm exec alpine:latest echo "First"   # Starts agent (~2s)
+smolvm exec alpine:latest echo "Second"  # Reuses agent (~50ms)
 smolvm exec -v ~/project:/workspace node:latest npm test
 
 # Manage agent
@@ -81,24 +84,49 @@ smolvm agent status
 smolvm agent stop
 ```
 
-### Persistent VMs
+### Named VMs (Isolated Agents)
+
+Each named VM gets its own isolated agent, storage, and configuration:
 
 ```bash
-smolvm create --name myvm alpine:latest /bin/sh
-smolvm start myvm
+# Create VM configurations
+smolvm create --name web --cpus 2 --mem 512 node:20 npm start
+smolvm create --name db --cpus 2 --mem 1024 postgres:16
+
+# Run them simultaneously (each in separate terminal)
+smolvm start web   # Runs in its own agent VM
+smolvm start db    # Runs in its own agent VM (parallel!)
+
+# Exec into a running named VM
+smolvm exec --name web node:20 npm test
+
+# Check status of specific VM's agent
+smolvm agent status --name web
+smolvm agent status --name db
+
+# Stop specific VM's agent
+smolvm agent stop --name web
+
+# List saved VMs
 smolvm list
-smolvm stop myvm
+smolvm list -v  # verbose
+
+# Remove saved configuration
 smolvm delete myvm
+smolvm delete myvm -f  # skip confirmation
 ```
+
+**Isolation:**
+- Each named VM has its own agent process
+- Separate storage disk per VM (`~/.cache/smolvm/vms/{name}/`)
+- Can run multiple VMs simultaneously
 
 ## Options
 
 | Flag | Description |
 |------|-------------|
-| `--memory <MiB>` | Memory (default: 512) |
-| `--cpus <N>` | vCPUs (default: 1) |
-| `--net` | Enable network egress |
-| `--dns <IP>` | Custom DNS server |
+| `--cpus N` | Number of vCPUs (default: 1) |
+| `--mem N` | Memory in MiB (default: 256) |
 | `-e KEY=VAL` | Environment variable |
 | `-v host:guest[:ro]` | Volume mount (directories only) |
 | `-w /path` | Working directory |

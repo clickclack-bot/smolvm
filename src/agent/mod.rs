@@ -12,10 +12,28 @@ pub use launcher::HostMount;
 pub use manager::{AgentManager, AgentState};
 
 /// Default agent VM memory in MiB.
-pub const AGENT_MEMORY_MIB: u32 = 256;
+pub const DEFAULT_MEMORY_MIB: u32 = 256;
 
 /// Default agent VM CPU count.
-pub const AGENT_CPUS: u8 = 1;
+pub const DEFAULT_CPUS: u8 = 1;
 
 /// Agent VM name.
 pub const AGENT_VM_NAME: &str = "smolvm-agent";
+
+/// VM configuration for the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmResources {
+    /// Number of vCPUs.
+    pub cpus: u8,
+    /// Memory in MiB.
+    pub mem: u32,
+}
+
+impl Default for VmResources {
+    fn default() -> Self {
+        Self {
+            cpus: DEFAULT_CPUS,
+            mem: DEFAULT_MEMORY_MIB,
+        }
+    }
+}

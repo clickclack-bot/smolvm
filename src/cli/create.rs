@@ -1,10 +1,8 @@
 //! Create command implementation.
 
 use clap::Args;
-use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
-use smolvm::mount::{parse_mount_spec, validate_mount};
-use smolvm::rootfs::buildah;
-use smolvm::{HostMount, NetworkPolicy, RootfsSource, VmConfig, VmId};
+use smolvm::config::{SmolvmConfig, VmRecord};
+use std::path::PathBuf;
 
 /// Parse an environment variable specification (KEY=VALUE).
 fn parse_env_spec(spec: &str) -> Option<(String, String)> {
@@ -16,28 +14,30 @@ fn parse_env_spec(spec: &str) -> Option<(String, String)> {
 }
 
 /// Create a VM without starting it.
+///
+/// Saves the VM configuration for later use with `start`.
 #[derive(Args, Debug)]
 pub struct CreateCmd {
-    /// Rootfs path or OCI image reference.
-    pub source: String,
+    /// OCI image reference.
+    pub image: String,
 
     /// Command to execute when the VM starts.
     #[arg(trailing_var_arg = true)]
     pub command: Vec<String>,
 
-    /// VM name (required for create).
+    /// VM name (required).
     #[arg(long)]
     pub name: String,
-
-    /// Memory in MiB.
-    #[arg(long, default_value = "512")]
-    pub memory: u32,
 
     /// Number of vCPUs.
     #[arg(long, default_value = "1")]
     pub cpus: u8,
 
-    /// Working directory inside the VM.
+    /// Memory in MiB.
+    #[arg(long, default_value = "256")]
+    pub mem: u32,
+
+    /// Working directory inside the container.
     #[arg(short = 'w', long)]
     pub workdir: Option<String>,
 
@@ -48,14 +48,6 @@ pub struct CreateCmd {
     /// Volume mount (host:guest[:ro]).
     #[arg(short = 'v', long = "volume")]
     pub volume: Vec<String>,
-
-    /// Enable network egress.
-    #[arg(long)]
-    pub net: bool,
-
-    /// Custom DNS server (requires --net).
-    #[arg(long)]
-    pub dns: Option<String>,
 }
 
 impl CreateCmd {
@@ -69,21 +61,6 @@ impl CreateCmd {
             )));
         }
 
-        // Determine rootfs source
-        let (rootfs, container_id) = if std::path::Path::new(&self.source).exists() {
-            tracing::info!(path = %self.source, "using path as rootfs");
-            (RootfsSource::path(&self.source), None)
-        } else {
-            // Treat as OCI image, use buildah
-            tracing::info!(image = %self.source, "pulling image via buildah");
-            println!("Pulling image {}...", self.source);
-
-            let cid = buildah::create_container(&self.source)?;
-            tracing::debug!(container_id = %cid, "created buildah container");
-
-            (RootfsSource::buildah(&cid), Some(cid))
-        };
-
         // Parse environment variables
         let env: Vec<(String, String)> = self
             .env
@@ -91,75 +68,89 @@ impl CreateCmd {
             .filter_map(|e| parse_env_spec(e))
             .collect();
 
-        // Parse volume mounts
-        let mounts: Vec<HostMount> = self
-            .volume
-            .iter()
-            .filter_map(|v| match parse_mount_spec(v) {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    tracing::warn!(spec = %v, error = %e, "invalid mount spec, skipping");
-                    eprintln!("Warning: invalid mount spec '{}': {}", v, e);
-                    None
-                }
-            })
-            .collect();
+        // Parse and validate volume mounts
+        let mounts = self.parse_mounts()?;
 
-        // Validate each mount
-        for mount in &mounts {
-            validate_mount(mount)?;
-        }
-
-        // Build network policy
-        let network = if self.net {
-            let dns = self.dns.as_ref().and_then(|d| d.parse().ok());
-            NetworkPolicy::Egress { dns }
+        // Build command
+        let command = if self.command.is_empty() {
+            None
         } else {
-            NetworkPolicy::None
+            Some(self.command.clone())
         };
 
-        // Build VM config
-        let mut builder = VmConfig::builder(rootfs)
-            .id(VmId::new(&self.name))
-            .memory(self.memory)
-            .cpus(self.cpus)
-            .network(network);
-
-        // Set command
-        if !self.command.is_empty() {
-            builder = builder.command(self.command.clone());
-        }
-
-        // Set working directory
-        if let Some(wd) = &self.workdir {
-            builder = builder.workdir(wd);
-        }
-
-        // Add environment variables
-        for (k, v) in env {
-            builder = builder.env(k, v);
-        }
-
-        // Add mounts
-        for m in mounts {
-            builder = builder.mount(m);
-        }
-
-        let vm_config = builder.build();
-
-        // Create record with Created state
-        let mut record = VmRecord::from_config(&vm_config);
-        record.state = RecordState::Created;
+        // Create record
+        let record = VmRecord::new(
+            self.name.clone(),
+            self.image.clone(),
+            self.cpus,
+            self.mem,
+            command,
+            self.workdir.clone(),
+            env,
+            mounts,
+        );
 
         // Store in config
         config.vms.insert(self.name.clone(), record);
         config.save()?;
 
         println!("Created VM: {}", self.name);
-        if let Some(cid) = container_id {
-            tracing::debug!(container_id = %cid, "buildah container preserved");
+        println!("  Image: {}", self.image);
+        println!("  CPUs: {}, Memory: {} MiB", self.cpus, self.mem);
+        if !self.volume.is_empty() {
+            println!("  Mounts: {}", self.volume.len());
         }
+        println!("\nUse 'smolvm start {}' to start the VM", self.name);
 
         Ok(())
+    }
+
+    /// Parse volume mount specifications.
+    fn parse_mounts(&self) -> smolvm::Result<Vec<(String, String, bool)>> {
+        use smolvm::Error;
+
+        let mut mounts = Vec::new();
+
+        for spec in &self.volume {
+            let parts: Vec<&str> = spec.split(':').collect();
+            if parts.len() < 2 {
+                return Err(Error::Mount(format!(
+                    "invalid volume specification '{}': expected host:container[:ro]",
+                    spec
+                )));
+            }
+
+            let host_path = PathBuf::from(parts[0]);
+            let guest_path = parts[1].to_string();
+            let read_only = parts.get(2).map(|&s| s == "ro").unwrap_or(false);
+
+            // Validate host path exists
+            if !host_path.exists() {
+                return Err(Error::Mount(format!(
+                    "host path does not exist: {}",
+                    host_path.display()
+                )));
+            }
+
+            // Must be a directory
+            if !host_path.is_dir() {
+                return Err(Error::Mount(format!(
+                    "host path must be a directory: {}",
+                    host_path.display()
+                )));
+            }
+
+            // Canonicalize host path
+            let host_path = host_path.canonicalize().map_err(|e| {
+                Error::Mount(format!(
+                    "failed to resolve host path '{}': {}",
+                    parts[0], e
+                ))
+            })?;
+
+            mounts.push((host_path.to_string_lossy().to_string(), guest_path, read_only));
+        }
+
+        Ok(mounts)
     }
 }

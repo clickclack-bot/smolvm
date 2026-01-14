@@ -10,7 +10,7 @@ use crate::storage::StorageDisk;
 use std::ffi::CString;
 use std::path::Path;
 
-use super::{AGENT_CPUS, AGENT_MEMORY_MIB};
+use super::VmResources;
 
 // FFI bindings to libkrun
 extern "C" {
@@ -73,6 +73,7 @@ pub fn launch_agent_vm(
     vsock_socket: &Path,
     console_log: Option<&Path>,
     mounts: &[HostMount],
+    resources: VmResources,
 ) -> Result<()> {
     // Raise file descriptor limits
     raise_fd_limits();
@@ -89,7 +90,7 @@ pub fn launch_agent_vm(
         let ctx = ctx as u32;
 
         // Set VM config
-        if krun_set_vm_config(ctx, AGENT_CPUS, AGENT_MEMORY_MIB) < 0 {
+        if krun_set_vm_config(ctx, resources.cpus, resources.mem) < 0 {
             krun_free_ctx(ctx);
             return Err(Error::AgentError("failed to set VM config".into()));
         }

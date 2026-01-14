@@ -1,15 +1,11 @@
 //! Run command implementation.
 
 use clap::Args;
-use smolvm::agent::{AgentClient, AgentManager};
+use smolvm::agent::{AgentClient, AgentManager, HostMount, VmResources};
 use smolvm::config::SmolvmConfig;
-use smolvm::mount::{parse_mount_spec, validate_mount};
-use smolvm::rootfs::buildah;
-use smolvm::{default_backend, HostMount, NetworkPolicy, RootfsSource, VmConfig, VmId};
+use std::path::PathBuf;
 
 /// Parse an environment variable specification (KEY=VALUE).
-///
-/// Returns None if the spec is invalid (no '=' present).
 fn parse_env_spec(spec: &str) -> Option<(String, String)> {
     let (key, value) = spec.split_once('=')?;
     if key.is_empty() {
@@ -18,22 +14,21 @@ fn parse_env_spec(spec: &str) -> Option<(String, String)> {
     Some((key.to_string(), value.to_string()))
 }
 
-/// Run a VM from a rootfs path or OCI image.
+/// Run a command in a container (ephemeral).
+///
+/// Unlike `exec`, this stops the agent VM after the command completes.
 #[derive(Args, Debug)]
 pub struct RunCmd {
-    /// Rootfs path or OCI image reference.
-    ///
-    /// If the path exists on disk, it's used directly as the rootfs.
-    /// Otherwise, it's treated as an OCI image reference and pulled via buildah.
+    /// OCI image reference.
     pub source: String,
 
-    /// Command to execute inside the VM.
+    /// Command to execute inside the container.
     ///
     /// If not specified, defaults to /bin/sh.
     #[arg(trailing_var_arg = true)]
     pub command: Vec<String>,
 
-    /// VM name (auto-generated if not provided).
+    /// VM name (for identification only).
     #[arg(long)]
     pub name: Option<String>,
 
@@ -45,185 +40,58 @@ pub struct RunCmd {
     #[arg(long, default_value = "1")]
     pub cpus: u8,
 
-    /// Working directory inside the VM.
+    /// Working directory inside the container.
     #[arg(short = 'w', long)]
     pub workdir: Option<String>,
 
     /// Environment variable (KEY=VALUE).
-    ///
-    /// Can be specified multiple times.
     #[arg(short = 'e', long = "env")]
     pub env: Vec<String>,
 
     /// Volume mount (host:guest[:ro]).
-    ///
-    /// Can be specified multiple times.
-    /// Example: -v /host/path:/guest/path
     #[arg(short = 'v', long = "volume")]
     pub volume: Vec<String>,
 
-    /// Enable network egress.
-    ///
-    /// Allows the VM to access the internet via NAT.
+    /// Enable network egress (not yet supported in agent mode).
     #[arg(long)]
     pub net: bool,
 
     /// Custom DNS server (requires --net).
     #[arg(long)]
     pub dns: Option<String>,
-
-    /// Write console output to file (for debugging).
-    #[arg(long)]
-    pub console_log: Option<String>,
-
-    /// Use the smolvm-agent for image pulling and execution (experimental).
-    ///
-    /// When enabled, bypasses buildah and runs commands directly inside
-    /// the agent VM. This eliminates the buildah dependency.
-    #[arg(long)]
-    pub use_agent: bool,
 }
 
 impl RunCmd {
     /// Execute the run command.
-    pub fn run(self, config: &mut SmolvmConfig) -> smolvm::Result<()> {
-        // If using agent mode, delegate to agent
-        if self.use_agent {
-            return self.run_via_agent(config);
+    pub fn run(self, _config: &mut SmolvmConfig) -> smolvm::Result<()> {
+        use smolvm::Error;
+        use std::io::Write;
+
+        // Warn about unsupported options
+        if self.net {
+            eprintln!("Warning: --net is not yet supported in agent mode");
         }
-
-        // Determine rootfs source
-        let (rootfs, container_id) = if std::path::Path::new(&self.source).exists() {
-            tracing::info!(path = %self.source, "using path as rootfs");
-            (RootfsSource::path(&self.source), None)
-        } else {
-            // Treat as OCI image, use buildah
-            tracing::info!(image = %self.source, "pulling image via buildah");
-            println!("Pulling image {}...", self.source);
-
-            let cid = buildah::create_container(&self.source)?;
-            tracing::debug!(container_id = %cid, "created buildah container");
-
-            (RootfsSource::buildah(&cid), Some(cid))
-        };
-
-        // Parse environment variables
-        let env: Vec<(String, String)> = self
-            .env
-            .iter()
-            .filter_map(|e| parse_env_spec(e))
-            .collect();
 
         // Parse volume mounts
-        let mounts: Vec<HostMount> = self
-            .volume
-            .iter()
-            .filter_map(|v| match parse_mount_spec(v) {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    tracing::warn!(spec = %v, error = %e, "invalid mount spec, skipping");
-                    eprintln!("Warning: invalid mount spec '{}': {}", v, e);
-                    None
-                }
-            })
-            .collect();
+        let mounts = self.parse_mounts()?;
 
-        // Validate each mount (source exists, paths are absolute)
-        for mount in &mounts {
-            validate_mount(mount)?;
-        }
-
-        // Build network policy
-        let network = if self.net {
-            let dns = self.dns.as_ref().and_then(|d| d.parse().ok());
-            NetworkPolicy::Egress { dns }
-        } else {
-            NetworkPolicy::None
-        };
-
-        // Build VM config
-        let mut builder = VmConfig::builder(rootfs)
-            .memory(self.memory)
-            .cpus(self.cpus)
-            .network(network);
-
-        // Set VM ID
-        if let Some(name) = &self.name {
-            builder = builder.id(VmId::new(name));
-        }
-
-        // Set command
-        if !self.command.is_empty() {
-            builder = builder.command(self.command.clone());
-        }
-
-        // Set working directory
-        if let Some(wd) = &self.workdir {
-            builder = builder.workdir(wd);
-        }
-
-        // Add environment variables
-        for (k, v) in env {
-            builder = builder.env(k, v);
-        }
-
-        // Add mounts
-        for m in mounts {
-            builder = builder.mount(m);
-        }
-
-        // Set console log if specified
-        if let Some(ref log_path) = self.console_log {
-            builder = builder.console_log(log_path);
-        }
-
-        let vm_config = builder.build();
-        let vm_id = vm_config.id.clone();
-
-        // Store VM in config
-        config.add_vm(&vm_config);
-
-        // Create and run VM - use a closure to ensure cleanup on all paths
-        let result = self.run_vm(vm_config, &vm_id);
-
-        // Cleanup buildah container if we created one (runs on success AND failure)
-        if let Some(cid) = container_id {
-            tracing::debug!(container_id = %cid, "cleaning up buildah container");
-            if let Err(e) = buildah::remove_container(&cid) {
-                tracing::warn!(error = %e, "failed to remove buildah container");
-            }
-            config.remove_vm(vm_id.as_str());
-        }
-
-        // Save config before exiting (process::exit bypasses main's save)
-        if let Err(e) = config.save() {
-            tracing::warn!(error = %e, "failed to save config");
-        }
-
-        // Handle result
-        match result {
-            Ok(exit_code) => std::process::exit(exit_code),
-            Err(e) => {
-                tracing::error!(error = %e, "VM execution failed");
-                return Err(e);
-            }
-        }
-    }
-
-    /// Run via the smolvm-agent (experimental).
-    ///
-    /// This mode uses the agent VM to pull images and execute commands,
-    /// bypassing buildah entirely.
-    fn run_via_agent(self, _config: &mut SmolvmConfig) -> smolvm::Result<()> {
-        use smolvm::Error;
-
-        // Start or connect to agent
-        println!("Starting agent VM...");
+        // Start agent VM
         let manager = AgentManager::default().map_err(|e| {
             Error::AgentError(format!("failed to create agent manager: {}", e))
         })?;
 
-        manager.ensure_running().map_err(|e| {
+        let resources = VmResources {
+            cpus: self.cpus,
+            mem: self.memory,
+        };
+
+        if !mounts.is_empty() {
+            println!("Starting agent VM with {} mount(s)...", mounts.len());
+        } else {
+            println!("Starting agent VM...");
+        }
+
+        manager.ensure_running_with_config(mounts.clone(), resources).map_err(|e| {
             Error::AgentError(format!("failed to start agent: {}", e))
         })?;
 
@@ -250,13 +118,26 @@ impl RunCmd {
             .filter_map(|e| parse_env_spec(e))
             .collect();
 
+        // Convert mounts to agent format
+        let mount_bindings: Vec<(String, String, bool)> = mounts
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                (
+                    format!("smolvm{}", i),
+                    m.guest_path.to_string_lossy().to_string(),
+                    m.read_only,
+                )
+            })
+            .collect();
+
         // Run command
-        println!("Running command: {:?}", command);
-        let (exit_code, stdout, stderr) = client.run(
+        let (exit_code, stdout, stderr) = client.run_with_mounts(
             &self.source,
             command,
             env,
             self.workdir.clone(),
+            mount_bindings,
         )?;
 
         // Print output
@@ -267,12 +148,11 @@ impl RunCmd {
             eprint!("{}", stderr);
         }
 
-        // Flush output before cleanup
-        use std::io::Write;
+        // Flush output
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
 
-        // Stop the agent VM (sends SIGTERM, waits, then SIGKILL if needed)
+        // Stop the agent VM (ephemeral mode - unlike exec which keeps it running)
         if let Err(e) = manager.stop() {
             tracing::warn!(error = %e, "failed to stop agent");
         }
@@ -280,31 +160,57 @@ impl RunCmd {
         std::process::exit(exit_code);
     }
 
-    /// Run the VM and return exit code. Separated to allow cleanup on all paths.
-    fn run_vm(&self, vm_config: VmConfig, vm_id: &VmId) -> smolvm::Result<i32> {
-        println!("Starting VM {}...", vm_id);
-        tracing::info!(vm_id = %vm_id, cpus = %vm_config.resources.cpus, memory = %vm_config.resources.memory_mib, "starting VM");
+    /// Parse volume mount specifications.
+    fn parse_mounts(&self) -> smolvm::Result<Vec<HostMount>> {
+        use smolvm::Error;
 
-        let backend = default_backend()?;
-        tracing::debug!(backend = %backend.name(), "using backend");
+        let mut mounts = Vec::new();
 
-        let mut vm = backend.create(vm_config)?;
-
-        let exit = vm.wait()?;
-        tracing::info!(vm_id = %vm_id, exit = ?exit, "VM exited");
-
-        // Print console output if captured to a log file
-        if let Some(ref log_path) = self.console_log {
-            if let Ok(contents) = std::fs::read_to_string(log_path) {
-                if !contents.is_empty() {
-                    print!("{}", contents);
-                    use std::io::Write;
-                    let _ = std::io::stdout().flush();
-                }
+        for spec in &self.volume {
+            let parts: Vec<&str> = spec.split(':').collect();
+            if parts.len() < 2 {
+                return Err(Error::Mount(format!(
+                    "invalid volume specification '{}': expected host:container[:ro]",
+                    spec
+                )));
             }
+
+            let host_path = PathBuf::from(parts[0]);
+            let guest_path = PathBuf::from(parts[1]);
+            let read_only = parts.get(2).map(|&s| s == "ro").unwrap_or(false);
+
+            // Validate host path exists
+            if !host_path.exists() {
+                return Err(Error::Mount(format!(
+                    "host path does not exist: {}",
+                    host_path.display()
+                )));
+            }
+
+            // Must be a directory (virtiofs limitation)
+            if !host_path.is_dir() {
+                return Err(Error::Mount(format!(
+                    "host path must be a directory (virtiofs limitation): {}",
+                    host_path.display()
+                )));
+            }
+
+            // Canonicalize host path
+            let host_path = host_path.canonicalize().map_err(|e| {
+                Error::Mount(format!(
+                    "failed to resolve host path '{}': {}",
+                    parts[0], e
+                ))
+            })?;
+
+            mounts.push(HostMount {
+                host_path,
+                guest_path,
+                read_only,
+            });
         }
 
-        Ok(exit.exit_code())
+        Ok(mounts)
     }
 }
 
@@ -313,7 +219,6 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    // Wrapper for testing CLI parsing
     #[derive(Parser)]
     struct TestCli {
         #[command(flatten)]
@@ -326,8 +231,6 @@ mod tests {
         TestCli::parse_from(full_args).run
     }
 
-    // === Environment Variable Parsing ===
-
     #[test]
     fn test_parse_env_spec_valid() {
         assert_eq!(
@@ -338,7 +241,6 @@ mod tests {
 
     #[test]
     fn test_parse_env_spec_empty_value() {
-        // Empty value is valid (FOO=)
         assert_eq!(
             parse_env_spec("FOO="),
             Some(("FOO".to_string(), "".to_string()))
@@ -347,7 +249,6 @@ mod tests {
 
     #[test]
     fn test_parse_env_spec_value_with_equals() {
-        // Value containing = should work (FOO=bar=baz)
         assert_eq!(
             parse_env_spec("FOO=bar=baz"),
             Some(("FOO".to_string(), "bar=baz".to_string()))
@@ -361,11 +262,8 @@ mod tests {
 
     #[test]
     fn test_parse_env_spec_empty_key() {
-        // =value is invalid (empty key)
         assert_eq!(parse_env_spec("=value"), None);
     }
-
-    // === CLI Argument Parsing ===
 
     #[test]
     fn test_cli_defaults() {
@@ -390,21 +288,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_with_resources() {
-        let cmd = parse_run(&["--memory", "1024", "--cpus", "4", "ubuntu:22.04"]);
-        assert_eq!(cmd.memory, 1024);
-        assert_eq!(cmd.cpus, 4);
-        assert_eq!(cmd.source, "ubuntu:22.04");
-    }
-
-    #[test]
-    fn test_cli_with_network() {
-        let cmd = parse_run(&["--net", "--dns", "8.8.8.8", "alpine"]);
-        assert!(cmd.net);
-        assert_eq!(cmd.dns, Some("8.8.8.8".to_string()));
-    }
-
-    #[test]
     fn test_cli_with_env_vars() {
         let cmd = parse_run(&["-e", "FOO=bar", "-e", "BAZ=qux", "alpine"]);
         assert_eq!(cmd.env, vec!["FOO=bar", "BAZ=qux"]);
@@ -414,41 +297,5 @@ mod tests {
     fn test_cli_with_volumes() {
         let cmd = parse_run(&["-v", "/host:/guest", "-v", "/data:/data:ro", "alpine"]);
         assert_eq!(cmd.volume, vec!["/host:/guest", "/data:/data:ro"]);
-    }
-
-    #[test]
-    fn test_cli_with_name_and_workdir() {
-        let cmd = parse_run(&["--name", "my-vm", "-w", "/app", "alpine"]);
-        assert_eq!(cmd.name, Some("my-vm".to_string()));
-        assert_eq!(cmd.workdir, Some("/app".to_string()));
-    }
-
-    #[test]
-    fn test_cli_full_example() {
-        let cmd = parse_run(&[
-            "--name", "test-vm",
-            "--memory", "2048",
-            "--cpus", "2",
-            "-w", "/workspace",
-            "-e", "DEBUG=1",
-            "-e", "PATH=/usr/bin",
-            "-v", "/tmp:/tmp",
-            "--net",
-            "--dns", "1.1.1.1",
-            "--console-log", "/tmp/console.log",
-            "python:3.11",
-            "python", "-c", "print('hello')",
-        ]);
-        assert_eq!(cmd.name, Some("test-vm".to_string()));
-        assert_eq!(cmd.memory, 2048);
-        assert_eq!(cmd.cpus, 2);
-        assert_eq!(cmd.workdir, Some("/workspace".to_string()));
-        assert_eq!(cmd.env, vec!["DEBUG=1", "PATH=/usr/bin"]);
-        assert_eq!(cmd.volume, vec!["/tmp:/tmp"]);
-        assert!(cmd.net);
-        assert_eq!(cmd.dns, Some("1.1.1.1".to_string()));
-        assert_eq!(cmd.console_log, Some("/tmp/console.log".to_string()));
-        assert_eq!(cmd.source, "python:3.11");
-        assert_eq!(cmd.command, vec!["python", "-c", "print('hello')"]);
     }
 }

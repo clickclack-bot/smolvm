@@ -1,7 +1,7 @@
 //! Exec command implementation.
 
 use clap::Args;
-use smolvm::agent::{AgentClient, AgentManager, HostMount};
+use smolvm::agent::{AgentClient, AgentManager, HostMount, VmResources};
 use std::path::PathBuf;
 
 /// Execute a command in the agent VM
@@ -13,6 +13,18 @@ pub struct ExecCmd {
     /// Command to execute
     #[arg(trailing_var_arg = true)]
     pub command: Vec<String>,
+
+    /// Named VM to exec into (uses isolated agent)
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Number of vCPUs
+    #[arg(long, default_value = "1")]
+    pub cpus: u8,
+
+    /// Memory in MiB
+    #[arg(long, default_value = "256")]
+    pub mem: u32,
 
     /// Working directory inside container
     #[arg(short = 'w', long)]
@@ -34,17 +46,29 @@ impl ExecCmd {
         // Parse volume mounts
         let mounts = self.parse_mounts()?;
 
-        // Ensure agent is running with the requested mounts
-        let manager = AgentManager::default()?;
+        let resources = VmResources {
+            cpus: self.cpus,
+            mem: self.mem,
+        };
 
-        let was_running = manager.try_connect_existing().is_some() && manager.mounts_match(&mounts);
+        // Get the appropriate agent manager (named or default)
+        let manager = if let Some(ref name) = self.name {
+            AgentManager::for_vm(name)?
+        } else {
+            AgentManager::default()?
+        };
+
+        let was_running = manager.try_connect_existing().is_some()
+            && manager.mounts_match(&mounts)
+            && manager.resources_match(resources);
         if !was_running {
+            let vm_label = self.name.as_deref().unwrap_or("default");
             if !mounts.is_empty() {
-                println!("Starting agent VM with {} mount(s)...", mounts.len());
+                println!("Starting agent VM '{}' with {} mount(s)...", vm_label, mounts.len());
             } else {
-                println!("Starting agent VM...");
+                println!("Starting agent VM '{}'...", vm_label);
             }
-            manager.ensure_running_with_mounts(mounts.clone())?;
+            manager.ensure_running_with_config(mounts.clone(), resources)?;
         }
 
         // Connect to agent
