@@ -103,22 +103,23 @@ pub fn launch_agent_vm(
             return Err(Error::AgentError("failed to set root filesystem".into()));
         }
 
-        // Set port map for TCP port forwarding
-        // Format: "host_port:guest_port" null-terminated strings
-        let port_cstrings: Vec<CString> = port_mappings
-            .iter()
-            .map(|p| CString::new(format!("{}:{}", p.host, p.guest)).unwrap())
-            .collect();
-        let mut port_ptrs: Vec<*const libc::c_char> =
-            port_cstrings.iter().map(|s| s.as_ptr()).collect();
-        port_ptrs.push(std::ptr::null()); // Null-terminate the array
-
-        if krun_set_port_map(ctx, port_ptrs.as_ptr()) < 0 {
-            krun_free_ctx(ctx);
-            return Err(Error::AgentError("failed to set port map".into()));
-        }
-
+        // Set port map for TCP port forwarding (only if there are mappings)
+        // Note: Only call krun_set_port_map if we have actual mappings.
+        // An empty port map might interfere with TSI networking.
         if !port_mappings.is_empty() {
+            let port_cstrings: Vec<CString> = port_mappings
+                .iter()
+                .map(|p| CString::new(format!("{}:{}", p.host, p.guest)).unwrap())
+                .collect();
+            let mut port_ptrs: Vec<*const libc::c_char> =
+                port_cstrings.iter().map(|s| s.as_ptr()).collect();
+            port_ptrs.push(std::ptr::null()); // Null-terminate the array
+
+            if krun_set_port_map(ctx, port_ptrs.as_ptr()) < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::AgentError("failed to set port map".into()));
+            }
+
             tracing::debug!(
                 port_count = port_mappings.len(),
                 "configured port forwarding"

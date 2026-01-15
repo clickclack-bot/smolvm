@@ -10,8 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use crate::rootfs;
-use crate::vm::config::{DiskFormat, NetworkPolicy, RootfsSource, VmConfig};
+use crate::vm::config::{NetworkPolicy, RootfsSource, VmConfig};
 use crate::vm::state::{ExitReason, VmState};
 use crate::vm::{VmBackend, VmHandle, VmId};
 
@@ -134,8 +133,6 @@ pub struct LibkrunVm {
     id: VmId,
     state: VmState,
     exit_reason: Option<ExitReason>,
-    /// Container ID if using buildah (for cleanup).
-    container_id: Option<String>,
     /// Child process running the VM.
     child: Option<crate::process::ChildProcess>,
 }
@@ -146,7 +143,7 @@ impl LibkrunVm {
         let id = config.id.clone();
 
         // Resolve rootfs to a path
-        let (rootfs_path, container_id) = resolve_rootfs(&config.rootfs)?;
+        let rootfs_path = resolve_rootfs(&config.rootfs)?;
 
         // Inject init.krun into rootfs (required by libkrunfw kernel)
         inject_init_krun(&rootfs_path)?;
@@ -160,7 +157,6 @@ impl LibkrunVm {
             id,
             state: VmState::Created,
             exit_reason: None,
-            container_id,
             child: None,
         };
 
@@ -179,11 +175,6 @@ impl LibkrunVm {
                 };
                 vm.exit_reason = Some(ExitReason::vm_crash(e.to_string()));
             }
-        }
-
-        // Cleanup buildah container if we created one
-        if let Some(ref cid) = vm.container_id {
-            let _ = rootfs::buildah::unmount_container(cid);
         }
 
         Ok(vm)
@@ -436,32 +427,18 @@ impl VmHandle for LibkrunVm {
     }
 }
 
-impl Drop for LibkrunVm {
-    fn drop(&mut self) {
-        // Cleanup buildah container if we created one
-        if let Some(ref cid) = self.container_id {
-            if let Err(e) = rootfs::buildah::unmount_container(cid) {
-                tracing::warn!("failed to unmount container {}: {}", cid, e);
-            }
-        }
-    }
-}
 
 // Helper functions
 
 /// Resolve a rootfs source to an actual path.
-fn resolve_rootfs(source: &RootfsSource) -> Result<(PathBuf, Option<String>)> {
+fn resolve_rootfs(source: &RootfsSource) -> Result<PathBuf> {
     match source {
         RootfsSource::Path { path } => {
             if path.exists() {
-                Ok((path.clone(), None))
+                Ok(path.clone())
             } else {
                 Err(Error::RootfsNotFound { path: path.clone() })
             }
-        }
-        RootfsSource::Buildah { container_id } => {
-            let path = rootfs::buildah::mount_container(container_id)?;
-            Ok((path, Some(container_id.clone())))
         }
     }
 }

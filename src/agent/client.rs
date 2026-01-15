@@ -210,6 +210,20 @@ impl AgentClient {
         }
     }
 
+    /// Test network connectivity directly from the agent (not via chroot).
+    /// Used to debug TSI networking.
+    pub fn network_test(&mut self, url: &str) -> Result<serde_json::Value> {
+        let resp = self.request(&AgentRequest::NetworkTest {
+            url: url.to_string(),
+        })?;
+
+        match resp {
+            AgentResponse::Ok { data: Some(data) } => Ok(data),
+            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
+            _ => Err(Error::AgentError("unexpected response".into())),
+        }
+    }
+
     /// Request agent shutdown.
     pub fn shutdown(&mut self) -> Result<()> {
         let resp = self.request(&AgentRequest::Shutdown)?;

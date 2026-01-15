@@ -17,6 +17,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::process::{Child, Command, Stdio};
 use tracing::{debug, error, info, warn};
 
+mod oci;
 mod storage;
 mod vsock;
 
@@ -152,6 +153,64 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
 
         AgentRequest::StorageStatus => handle_storage_status(),
 
+        AgentRequest::NetworkTest { url } => {
+            info!(url = %url, "testing network connectivity directly from agent");
+
+            // Test 1: Pure syscall TCP connect test (bypass C library)
+            let syscall_result = test_tcp_syscall();
+
+            // Test 2: Try wget (busybox/musl)
+            let wget_result = match std::process::Command::new("wget")
+                .args(["-q", "-O-", "-T", "10", &url])
+                .output()
+            {
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    serde_json::json!({
+                        "tool": "wget",
+                        "success": output.status.success(),
+                        "exit_code": output.status.code(),
+                        "stdout_len": output.stdout.len(),
+                        "stderr": stderr,
+                    })
+                }
+                Err(e) => serde_json::json!({
+                    "tool": "wget",
+                    "error": format!("{}", e),
+                }),
+            };
+
+            // Test 3: Try crane (Go static binary) - fetch manifest
+            let crane_result = match std::process::Command::new("crane")
+                .args(["manifest", "alpine:latest"])
+                .env("HOME", "/root")
+                .output()
+            {
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    serde_json::json!({
+                        "tool": "crane",
+                        "success": output.status.success(),
+                        "exit_code": output.status.code(),
+                        "stdout_len": output.stdout.len(),
+                        "stderr": stderr,
+                    })
+                }
+                Err(e) => serde_json::json!({
+                    "tool": "crane",
+                    "error": format!("{}", e),
+                }),
+            };
+
+            AgentResponse::Ok {
+                data: Some(serde_json::json!({
+                    "syscall_tcp": syscall_result,
+                    "wget": wget_result,
+                    "crane": crane_result,
+                })),
+            }
+        }
+
         AgentRequest::Shutdown => {
             info!("shutdown requested");
             AgentResponse::Ok {
@@ -226,7 +285,7 @@ fn handle_interactive_run(
         }
     };
 
-    // Setup volume mounts
+    // Setup virtiofs mounts at staging area (crun will bind-mount them via OCI spec)
     if let Err(e) = storage::setup_mounts(&rootfs, &mounts) {
         send_response(stream, &AgentResponse::Error {
             message: e.to_string(),
@@ -235,8 +294,8 @@ fn handle_interactive_run(
         return Ok(());
     }
 
-    // Spawn the command
-    let mut child = match spawn_interactive_command(&rootfs, &command, &env, workdir.as_deref(), tty) {
+    // Spawn the command with crun
+    let mut child = match spawn_interactive_command(&rootfs, &command, &env, workdir.as_deref(), &mounts, tty) {
         Ok(child) => child,
         Err(e) => {
             send_response(stream, &AgentResponse::Error {
@@ -259,50 +318,75 @@ fn handle_interactive_run(
     Ok(())
 }
 
-/// Spawn a command for interactive execution.
+/// Path to crun binary.
+const CRUN_PATH: &str = "/usr/bin/crun";
+
+/// Directory where virtiofs mounts are staged.
+const VIRTIOFS_MOUNT_ROOT: &str = "/mnt/virtiofs";
+
+/// Spawn a command for interactive execution using crun OCI runtime.
 fn spawn_interactive_command(
     rootfs: &str,
     command: &[String],
     env: &[(String, String)],
     workdir: Option<&str>,
+    mounts: &[(String, String, bool)],
     _tty: bool,
 ) -> Result<Child, Box<dyn std::error::Error>> {
+    use std::path::Path;
+
     if command.is_empty() {
         return Err("empty command".into());
     }
 
-    // Build chroot command
-    let mut cmd = Command::new("chroot");
-    cmd.arg(rootfs);
+    // Compute bundle path from rootfs path
+    // rootfs = /storage/overlays/{id}/merged
+    // bundle = /storage/overlays/{id}/bundle
+    let rootfs_path = Path::new(rootfs);
+    let overlay_root = rootfs_path
+        .parent()
+        .ok_or("invalid rootfs path: no parent")?;
+    let bundle_path = overlay_root.join("bundle");
 
-    // Add the actual command
-    for arg in command {
-        cmd.arg(arg);
+    if !bundle_path.exists() {
+        return Err(format!("bundle directory not found: {}", bundle_path.display()).into());
     }
 
-    // Set environment
-    cmd.env_clear();
-    cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-    cmd.env("HOME", "/root");
-    cmd.env("TERM", "xterm-256color");
-    for (k, v) in env {
-        cmd.env(k, v);
+    // Generate OCI spec for this command
+    let workdir_str = workdir.unwrap_or("/");
+    let mut spec = oci::OciSpec::new(command, env, workdir_str, false);
+
+    // Add virtiofs bind mounts to OCI spec
+    for (tag, container_path, read_only) in mounts {
+        let virtiofs_mount = Path::new(VIRTIOFS_MOUNT_ROOT).join(tag);
+        spec.add_bind_mount(&virtiofs_mount.to_string_lossy(), container_path, *read_only);
     }
 
-    // Set working directory
-    if let Some(wd) = workdir {
-        cmd.current_dir(format!("{}{}", rootfs, wd));
-    }
+    // Write config.json to bundle
+    spec.write_to(&bundle_path)
+        .map_err(|e| format!("failed to write OCI spec: {}", e))?;
+
+    // Generate unique container ID
+    let container_id = oci::generate_container_id();
+
+    // Build crun run command
+    let mut cmd = Command::new(CRUN_PATH);
+    cmd.args(["run", "--bundle", &bundle_path.to_string_lossy(), &container_id]);
 
     // Setup stdio for interactive mode
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    // TODO: For TTY mode, allocate a PTY instead of pipes
-    // This would use openpty() and connect the child to the PTY
+    // TODO: For TTY mode, use --console-socket to receive PTY master FD
 
-    info!(command = ?command, "spawning interactive command");
+    info!(
+        command = ?command,
+        container_id = %container_id,
+        bundle = %bundle_path.display(),
+        mounts = mounts.len(),
+        "spawning interactive container with crun"
+    );
     let child = cmd.spawn()?;
 
     Ok(child)
@@ -463,6 +547,186 @@ fn set_nonblocking(fd: i32) {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
+}
+
+/// Test TCP connection using pure syscalls (bypass C library).
+/// Connects to 1.1.1.1:80 and sends HTTP GET request.
+fn test_tcp_syscall() -> serde_json::Value {
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpStream, SocketAddr};
+    use std::time::Duration;
+
+    info!("testing TCP with pure Rust std::net");
+
+    // Test 1: Try to create a TCP connection to 1.1.1.1:80
+    let addr: SocketAddr = "1.1.1.1:80".parse().unwrap();
+
+    let connect_result = match TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
+        Ok(mut stream) => {
+            // Try to set timeouts
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+            // Send a simple HTTP request
+            let request = "GET / HTTP/1.0\r\nHost: 1.1.1.1\r\n\r\n";
+            match stream.write_all(request.as_bytes()) {
+                Ok(_) => {
+                    // Try to read the response
+                    let mut response = vec![0u8; 1024];
+                    match stream.read(&mut response) {
+                        Ok(n) => {
+                            let response_str = String::from_utf8_lossy(&response[..n.min(200)]).to_string();
+                            serde_json::json!({
+                                "success": true,
+                                "connected": true,
+                                "sent_request": true,
+                                "received_bytes": n,
+                                "response_preview": response_str,
+                            })
+                        }
+                        Err(e) => {
+                            serde_json::json!({
+                                "success": false,
+                                "connected": true,
+                                "sent_request": true,
+                                "read_error": format!("{}", e),
+                                "read_error_kind": format!("{:?}", e.kind()),
+                            })
+                        }
+                    }
+                }
+                Err(e) => {
+                    serde_json::json!({
+                        "success": false,
+                        "connected": true,
+                        "write_error": format!("{}", e),
+                    })
+                }
+            }
+        }
+        Err(e) => {
+            // Get more details about the error
+            let raw_os_error = e.raw_os_error();
+            serde_json::json!({
+                "success": false,
+                "connected": false,
+                "error": format!("{}", e),
+                "error_kind": format!("{:?}", e.kind()),
+                "raw_os_error": raw_os_error,
+            })
+        }
+    };
+
+    // Also test raw socket() syscall and lseek behavior
+    let socket_test = unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            serde_json::json!({
+                "socket_created": false,
+                "errno": err.raw_os_error().unwrap_or(-1),
+                "errno_str": err.to_string(),
+            })
+        } else {
+            // Get socket type info
+            let mut sock_type: libc::c_int = 0;
+            let mut sock_type_len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_TYPE,
+                &mut sock_type as *mut _ as *mut libc::c_void,
+                &mut sock_type_len,
+            );
+
+            // Test lseek on the socket - this should return ESPIPE (29) for normal sockets
+            let lseek_result = libc::lseek(fd, 0, libc::SEEK_CUR);
+            let lseek_errno = if lseek_result < 0 {
+                let err = std::io::Error::last_os_error();
+                Some((err.raw_os_error().unwrap_or(-1), err.to_string()))
+            } else {
+                None
+            };
+
+            libc::close(fd);
+            serde_json::json!({
+                "socket_created": true,
+                "fd": fd,
+                "sock_type": sock_type,
+                "lseek_result": lseek_result,
+                "lseek_errno": lseek_errno.map(|(e, s)| serde_json::json!({"code": e, "str": s})),
+                "expected_errno_espipe": 29,  // ESPIPE = 29 on Linux
+            })
+        }
+    };
+
+    // Test 3: Try nc (netcat) if available
+    let nc_result = match std::process::Command::new("nc")
+        .args(["-w", "5", "1.1.1.1", "80"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(mut child) => {
+            // Send HTTP request via stdin
+            if let Some(ref mut stdin) = child.stdin {
+                let _ = stdin.write_all(b"GET / HTTP/1.0\r\nHost: 1.1.1.1\r\n\r\n");
+            }
+            drop(child.stdin.take());
+
+            match child.wait_with_output() {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    serde_json::json!({
+                        "tool": "nc",
+                        "success": output.status.success(),
+                        "exit_code": output.status.code(),
+                        "stdout_preview": stdout.chars().take(200).collect::<String>(),
+                        "stderr": stderr.to_string(),
+                    })
+                }
+                Err(e) => serde_json::json!({
+                    "tool": "nc",
+                    "error": format!("wait error: {}", e),
+                }),
+            }
+        }
+        Err(e) => serde_json::json!({
+            "tool": "nc",
+            "error": format!("spawn error: {}", e),
+        }),
+    };
+
+    // Test 4: Try curl if available
+    let curl_result = match std::process::Command::new("curl")
+        .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "--connect-timeout", "10", "http://1.1.1.1"])
+        .output()
+    {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            serde_json::json!({
+                "tool": "curl",
+                "success": output.status.success(),
+                "exit_code": output.status.code(),
+                "http_code": stdout,
+                "stderr": stderr,
+            })
+        }
+        Err(e) => serde_json::json!({
+            "tool": "curl",
+            "error": format!("{}", e),
+        }),
+    };
+
+    serde_json::json!({
+        "rust_std_net": connect_result,
+        "raw_socket": socket_test,
+        "nc": nc_result,
+        "curl": curl_result,
+    })
 }
 
 /// Handle command execution request (non-interactive).

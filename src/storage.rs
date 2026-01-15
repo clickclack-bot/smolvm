@@ -159,6 +159,70 @@ impl StorageDisk {
         Ok(())
     }
 
+    /// Pre-format the disk with ext4 on the host.
+    ///
+    /// This is much faster than formatting inside the VM (~500ms savings).
+    /// On macOS, requires e2fsprogs: `brew install e2fsprogs`
+    pub fn ensure_formatted(&self) -> Result<()> {
+        if !self.needs_format() {
+            tracing::debug!(path = %self.path.display(), "disk already formatted");
+            return Ok(());
+        }
+
+        tracing::info!(path = %self.path.display(), "pre-formatting disk on host");
+
+        // Find mkfs.ext4 binary
+        let mkfs_paths = [
+            "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4", // macOS ARM (Homebrew)
+            "/usr/local/opt/e2fsprogs/sbin/mkfs.ext4",    // macOS Intel (Homebrew)
+            "/opt/homebrew/sbin/mkfs.ext4",               // macOS ARM (Homebrew alt)
+            "/usr/local/sbin/mkfs.ext4",                  // macOS Intel (Homebrew alt)
+            "/sbin/mkfs.ext4",                            // Linux
+            "/usr/sbin/mkfs.ext4",                        // Linux alt
+            "mkfs.ext4",                                  // PATH lookup
+        ];
+
+        let mkfs_path = mkfs_paths
+            .iter()
+            .find(|p| {
+                if p.contains('/') {
+                    std::path::Path::new(p).exists()
+                } else {
+                    // Check if command exists in PATH
+                    std::process::Command::new(p)
+                        .arg("--version")
+                        .output()
+                        .is_ok()
+                }
+            })
+            .ok_or_else(|| {
+                Error::Storage(
+                    "mkfs.ext4 not found. On macOS, install with: brew install e2fsprogs".into(),
+                )
+            })?;
+
+        let path_str = self.path.to_str().ok_or_else(|| {
+            Error::Storage("invalid disk path".into())
+        })?;
+
+        // Format with ext4 (-F = force, -q = quiet, -m 0 = no reserved blocks)
+        let output = std::process::Command::new(mkfs_path)
+            .args(["-F", "-q", "-m", "0", "-L", "smolvm", path_str])
+            .output()
+            .map_err(|e| Error::Storage(format!("failed to run mkfs.ext4: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::Storage(format!("mkfs.ext4 failed: {}", stderr)));
+        }
+
+        // Mark as formatted
+        self.mark_formatted()?;
+
+        tracing::info!(path = %self.path.display(), "disk formatted successfully");
+        Ok(())
+    }
+
     /// Get the path to the disk image.
     pub fn path(&self) -> &Path {
         &self.path

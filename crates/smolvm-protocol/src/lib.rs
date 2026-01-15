@@ -101,6 +101,13 @@ pub enum AgentRequest {
     /// Get storage disk status.
     StorageStatus,
 
+    /// Test network connectivity directly from the agent (not via chroot).
+    /// Used to debug TSI networking.
+    NetworkTest {
+        /// URL to test (e.g., "http://1.1.1.1")
+        url: String,
+    },
+
     /// Shutdown the agent.
     Shutdown,
 

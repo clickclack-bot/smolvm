@@ -304,25 +304,12 @@ pub enum RootfsSource {
         /// Path to the rootfs directory.
         path: PathBuf,
     },
-
-    /// Buildah-managed container.
-    Buildah {
-        /// Buildah container ID.
-        container_id: String,
-    },
 }
 
 impl RootfsSource {
     /// Create a path-based rootfs source.
     pub fn path(p: impl Into<PathBuf>) -> Self {
         Self::Path { path: p.into() }
-    }
-
-    /// Create a buildah-managed rootfs source.
-    pub fn buildah(container_id: impl Into<String>) -> Self {
-        Self::Buildah {
-            container_id: container_id.into(),
-        }
     }
 }
 

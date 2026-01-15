@@ -171,9 +171,9 @@ mod tests {
 
     #[test]
     fn test_command_failed_includes_command_and_message() {
-        let err = Error::command_failed("buildah", "image not found");
+        let err = Error::command_failed("crane", "image not found");
         let msg = err.to_string();
-        assert!(msg.contains("buildah"), "Error should include command name");
+        assert!(msg.contains("crane"), "Error should include command name");
         assert!(
             msg.contains("image not found"),
             "Error should include error message"

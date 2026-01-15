@@ -220,6 +220,11 @@ impl AgentManager {
         self.inner.lock().unwrap().child.as_ref().map(|c| c.pid())
     }
 
+    /// Connect to the running agent and return a client.
+    pub fn connect(&self) -> crate::error::Result<super::AgentClient> {
+        super::AgentClient::connect(&self.vsock_socket)
+    }
+
     /// Get the currently configured mounts.
     pub fn mounts(&self) -> Vec<HostMount> {
         self.inner.lock().unwrap().mounts.clone()
@@ -367,6 +372,13 @@ impl AgentManager {
                 "agent rootfs not found: {}",
                 self.rootfs_path.display()
             )));
+        }
+
+        // Pre-format storage disk on host (much faster than in-VM formatting)
+        // This saves ~500-1000ms on first boot
+        if let Err(e) = self.storage_disk.ensure_formatted() {
+            tracing::warn!(error = %e, "failed to pre-format disk on host, will format in VM");
+            // Don't fail - VM can still format the disk (just slower)
         }
 
         // Clean up old socket

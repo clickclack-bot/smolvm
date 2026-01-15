@@ -5,11 +5,16 @@
 //! - OCI image pulling via crane
 //! - Layer extraction and deduplication
 //! - Overlay filesystem management
+//! - Container execution via crun OCI runtime
 
+use crate::oci::{generate_container_id, OciSpec};
 use smolvm_protocol::{ImageInfo, OverlayInfo, StorageStatus};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use tracing::{debug, info, warn};
+
+/// Path to crun binary (static build on Alpine).
+const CRUN_PATH: &str = "/usr/bin/crun";
 
 /// Storage root path (where the ext4 disk is mounted).
 const STORAGE_ROOT: &str = "/storage";
@@ -414,6 +419,18 @@ pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
     std::fs::create_dir_all(&work_path)?;
     std::fs::create_dir_all(&merged_path)?;
 
+    // Set up DNS resolution BEFORE mounting (TSI intercepts writes to mounted overlays)
+    let upper_etc = upper_path.join("etc");
+    std::fs::create_dir_all(&upper_etc)?;
+    let resolv_path = upper_etc.join("resolv.conf");
+    if let Err(e) = std::fs::write(&resolv_path, "nameserver 8.8.8.8\nnameserver 1.1.1.1\n") {
+        warn!(error = %e, "failed to write resolv.conf to upper layer");
+    }
+
+    // Create /dev directory in upper layer - we'll bind mount the real /dev later
+    let upper_dev = upper_path.join("dev");
+    std::fs::create_dir_all(&upper_dev)?;
+
     // Build lowerdir from layers (in order)
     let lowerdirs: Vec<String> = info
         .layers
@@ -445,6 +462,20 @@ pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
     }
 
     info!(workload_id = %workload_id, "overlay mounted");
+
+    // Create OCI bundle directory structure
+    // crun will use this bundle to run containers
+    let bundle_path = overlay_root.join("bundle");
+    std::fs::create_dir_all(&bundle_path)?;
+
+    // Create symlink: bundle/rootfs -> ../merged
+    let rootfs_link = bundle_path.join("rootfs");
+    if !rootfs_link.exists() {
+        std::os::unix::fs::symlink("../merged", &rootfs_link)
+            .map_err(|e| StorageError(format!("failed to create rootfs symlink: {}", e)))?;
+    }
+
+    debug!(bundle = %bundle_path.display(), "OCI bundle directory created");
 
     Ok(OverlayInfo {
         rootfs_path: merged_path.display().to_string(),
@@ -480,7 +511,7 @@ pub struct RunResult {
     pub stderr: String,
 }
 
-/// Run a command in an image's overlay rootfs.
+/// Run a command in an image's overlay rootfs using crun OCI runtime.
 /// Uses a persistent overlay per image for fast repeated execution.
 pub fn run_command(
     image: &str,
@@ -497,14 +528,36 @@ pub fn run_command(
     let overlay = get_or_create_overlay(image, &workload_id)?;
     debug!(rootfs = %overlay.rootfs_path, "using overlay for command execution");
 
-    // Setup volume mounts if any
-    let _mounted_paths = setup_volume_mounts(&overlay.rootfs_path, mounts)?;
+    // Setup volume mounts (mount virtiofs to staging area)
+    let mounted_paths = setup_volume_mounts(&overlay.rootfs_path, mounts)?;
 
-    // Run the command
-    let result = run_in_chroot(&overlay.rootfs_path, command, env, workdir, timeout_ms);
+    // Get bundle path
+    let overlay_root = Path::new(STORAGE_ROOT).join(OVERLAYS_DIR).join(&workload_id);
+    let bundle_path = overlay_root.join("bundle");
 
-    // Note: We don't unmount the virtiofs mounts here since they may be reused
-    // The mounts will be cleaned up when the overlay is cleaned up or the VM shuts down
+    // Create OCI spec
+    let workdir_str = workdir.unwrap_or("/");
+    let mut spec = OciSpec::new(command, env, workdir_str, false);
+
+    // Add virtiofs bind mounts to OCI spec
+    for (tag, container_path, read_only) in mounts {
+        let virtiofs_mount = Path::new(VIRTIOFS_MOUNT_ROOT).join(tag);
+        spec.add_bind_mount(&virtiofs_mount.to_string_lossy(), container_path, *read_only);
+    }
+
+    // Write config.json to bundle
+    spec.write_to(&bundle_path)
+        .map_err(|e| StorageError(format!("failed to write OCI spec: {}", e)))?;
+
+    // Generate unique container ID for this execution
+    let container_id = generate_container_id();
+
+    // Run with crun
+    let result = run_with_crun(&bundle_path, &container_id, timeout_ms);
+
+    // Note: virtiofs mounts are left in place for reuse
+    // They will be cleaned up when the overlay is cleaned up or the VM shuts down
+    let _ = mounted_paths; // Suppress unused warning
 
     result
 }
@@ -637,62 +690,44 @@ fn is_mountpoint(path: &Path) -> bool {
 /// Exit code used when command is killed due to timeout.
 const TIMEOUT_EXIT_CODE: i32 = 124;
 
-/// Run a command inside a chroot with optional timeout.
-fn run_in_chroot(
-    rootfs: &str,
-    command: &[String],
-    env: &[(String, String)],
-    workdir: Option<&str>,
+/// Run a command using crun OCI runtime (one-shot execution).
+///
+/// This uses `crun run` which creates, starts, waits, and deletes the container
+/// in a single operation. Stdout and stderr are captured.
+fn run_with_crun(
+    bundle_dir: &Path,
+    container_id: &str,
     timeout_ms: Option<u64>,
 ) -> Result<RunResult> {
     use std::io::Read as _;
-    use std::process::Stdio;
     use std::time::{Duration, Instant};
 
-    if command.is_empty() {
-        return Err(StorageError("empty command".into()));
-    }
+    info!(
+        container_id = %container_id,
+        bundle = %bundle_dir.display(),
+        timeout_ms = ?timeout_ms,
+        "running container with crun"
+    );
 
-    // Build chroot command
-    let mut cmd = Command::new("chroot");
-    cmd.arg(rootfs);
-
-    // Add the actual command
-    for arg in command {
-        cmd.arg(arg);
-    }
-
-    // Set environment
-    cmd.env_clear();
-    cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-    cmd.env("HOME", "/root");
-    cmd.env("TERM", "xterm-256color");
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-
-    // Set working directory
-    if let Some(wd) = workdir {
-        cmd.current_dir(format!("{}{}", rootfs, wd));
-    }
-
-    // Setup stdio for capturing output
+    // Build crun run command
+    let mut cmd = Command::new(CRUN_PATH);
+    cmd.args(["run", "--bundle", &bundle_dir.to_string_lossy(), container_id]);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    info!(command = ?command, timeout_ms = ?timeout_ms, "executing command in chroot");
+    // Spawn the container
+    let mut child = cmd.spawn().map_err(|e| {
+        StorageError(format!("failed to spawn crun: {}. Is crun installed at {}?", e, CRUN_PATH))
+    })?;
 
-    let mut child = cmd.spawn()?;
     let start = Instant::now();
-
-    // Calculate timeout deadline
     let deadline = timeout_ms.map(|ms| start + Duration::from_millis(ms));
 
-    // Poll for completion
+    // Poll for completion with timeout
     loop {
         match child.try_wait()? {
             Some(status) => {
-                // Process completed - read output
+                // Container finished - read output
                 let mut stdout = String::new();
                 let mut stderr = String::new();
 
@@ -704,7 +739,13 @@ fn run_in_chroot(
                 }
 
                 let exit_code = status.code().unwrap_or(-1);
-                info!(exit_code = exit_code, "command completed");
+                info!(
+                    container_id = %container_id,
+                    exit_code = exit_code,
+                    stdout_len = stdout.len(),
+                    stderr_len = stderr.len(),
+                    "container finished"
+                );
 
                 return Ok(RunResult {
                     exit_code,
@@ -716,11 +757,23 @@ fn run_in_chroot(
                 // Still running - check timeout
                 if let Some(deadline) = deadline {
                     if Instant::now() >= deadline {
-                        warn!(timeout_ms = ?timeout_ms, "command timed out, killing process");
+                        warn!(
+                            container_id = %container_id,
+                            timeout_ms = ?timeout_ms,
+                            "container timed out, killing"
+                        );
 
-                        // Kill the process
+                        // Kill the crun process (which will kill the container)
                         let _ = child.kill();
-                        let _ = child.wait(); // Clean up zombie
+                        let _ = child.wait();
+
+                        // Also explicitly kill the container (in case it's orphaned)
+                        let _ = Command::new(CRUN_PATH)
+                            .args(["kill", container_id, "SIGKILL"])
+                            .status();
+                        let _ = Command::new(CRUN_PATH)
+                            .args(["delete", "-f", container_id])
+                            .status();
 
                         // Collect any partial output
                         let mut stdout = String::new();
@@ -736,7 +789,11 @@ fn run_in_chroot(
                         return Ok(RunResult {
                             exit_code: TIMEOUT_EXIT_CODE,
                             stdout,
-                            stderr: format!("{}\ncommand timed out after {}ms", stderr, timeout_ms.unwrap_or(0)),
+                            stderr: format!(
+                                "{}\ncontainer timed out after {}ms",
+                                stderr,
+                                timeout_ms.unwrap_or(0)
+                            ),
                         });
                     }
                 }

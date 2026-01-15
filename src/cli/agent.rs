@@ -12,6 +12,8 @@ pub enum AgentCmd {
     Stop(AgentStopCmd),
     /// Show agent status
     Status(AgentStatusCmd),
+    /// Test network connectivity (debug TSI)
+    NetworkTest(AgentNetworkTestCmd),
 }
 
 impl AgentCmd {
@@ -20,6 +22,7 @@ impl AgentCmd {
             AgentCmd::Start(cmd) => cmd.run(),
             AgentCmd::Stop(cmd) => cmd.run(),
             AgentCmd::Status(cmd) => cmd.run(),
+            AgentCmd::NetworkTest(cmd) => cmd.run(),
         }
     }
 }
@@ -118,6 +121,43 @@ impl AgentStatusCmd {
         } else {
             println!("Agent VM '{}': stopped", label);
         }
+
+        Ok(())
+    }
+}
+
+/// Test network connectivity directly from agent (debug TSI)
+#[derive(Args, Debug)]
+pub struct AgentNetworkTestCmd {
+    /// Named VM's agent to test (default: anonymous agent)
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// URL to test (default: http://1.1.1.1)
+    #[arg(default_value = "http://1.1.1.1")]
+    pub url: String,
+}
+
+impl AgentNetworkTestCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let manager = get_manager(&self.name)?;
+        let label = agent_label(&self.name);
+
+        // Ensure agent is running
+        if manager.try_connect_existing().is_none() {
+            println!("Starting agent VM '{}'...", label);
+            manager.ensure_running()?;
+        }
+
+        // Connect and test
+        println!("Testing network from agent (not chroot): {}", self.url);
+        let mut client = manager.connect()?;
+        let result = client.network_test(&self.url)?;
+
+        println!("Result: {}", serde_json::to_string_pretty(&result).unwrap_or_default());
+
+        // Don't stop - keep agent running
+        std::mem::forget(manager);
 
         Ok(())
     }

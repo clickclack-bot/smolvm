@@ -43,7 +43,7 @@
 //!
 //! ## Phase 0 (Current)
 //! - VM creation and lifecycle management
-//! - Rootfs from path or buildah containers
+//! - Rootfs from path
 //! - Host directory mounts via virtiofs
 //! - Network egress via NAT
 //!
