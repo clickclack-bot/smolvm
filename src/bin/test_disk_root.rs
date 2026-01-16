@@ -6,7 +6,7 @@ use std::ffi::CString;
 use std::ptr;
 
 #[link(name = "krun")]
-
+#[allow(dead_code)]
 extern "C" {
     fn krun_set_log_level(level: u32) -> i32;
     fn krun_create_ctx() -> i32;

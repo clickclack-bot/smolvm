@@ -74,6 +74,7 @@ pub mod process;
 pub mod protocol;
 pub mod rootfs;
 pub mod storage;
+pub mod util;
 pub mod vm;
 
 // Re-export main types for convenience

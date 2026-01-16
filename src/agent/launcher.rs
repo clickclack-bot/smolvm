@@ -7,6 +7,7 @@
 use crate::error::{Error, Result};
 use crate::protocol::ports;
 use crate::storage::StorageDisk;
+use crate::vm::config::HostMount;
 use std::ffi::CString;
 use std::path::Path;
 
@@ -47,17 +48,6 @@ extern "C" {
         path: *const libc::c_char,
     ) -> i32;
     fn krun_start_enter(ctx: u32) -> i32;
-}
-
-/// A host mount to be exposed to the guest via virtiofs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostMount {
-    /// Path on the host filesystem
-    pub host_path: std::path::PathBuf,
-    /// Mount path inside the guest
-    pub guest_path: std::path::PathBuf,
-    /// Whether the mount is read-only
-    pub read_only: bool,
 }
 
 /// Launch the agent VM (call in the forked child process).
@@ -153,19 +143,19 @@ pub fn launch_agent_vm(
         for (i, mount) in mounts.iter().enumerate() {
             let tag = CString::new(format!("smolvm{}", i))
                 .map_err(|_| Error::AgentError("invalid mount tag".into()))?;
-            let host_path = path_to_cstring(&mount.host_path)?;
+            let host_path = path_to_cstring(&mount.source)?;
 
             tracing::debug!(
                 tag = %format!("smolvm{}", i),
-                host = %mount.host_path.display(),
-                guest = %mount.guest_path.display(),
+                host = %mount.source.display(),
+                guest = %mount.target.display(),
                 read_only = mount.read_only,
                 "adding virtiofs mount"
             );
 
             if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
                 tracing::warn!(
-                    host = %mount.host_path.display(),
+                    host = %mount.source.display(),
                     "failed to add virtiofs mount"
                 );
             }
@@ -190,7 +180,7 @@ pub fn launch_agent_vm(
                 "SMOLVM_MOUNT_{}=smolvm{}:{}:{}",
                 i,
                 i,
-                mount.guest_path.display(),
+                mount.target.display(),
                 ro_flag
             );
             if let Ok(cstr) = CString::new(env_val) {

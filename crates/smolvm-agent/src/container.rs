@@ -78,14 +78,14 @@ impl ContainerRegistry {
 
     /// Register a new container.
     pub fn register(&self, info: ContainerInfo) {
-        let mut containers = self.containers.write().unwrap();
+        let mut containers = self.containers.write().unwrap_or_else(|e| e.into_inner());
         info!(container_id = %info.id, image = %info.image, "registered container");
         containers.insert(info.id.clone(), info);
     }
 
     /// Unregister a container.
     pub fn unregister(&self, id: &str) -> Option<ContainerInfo> {
-        let mut containers = self.containers.write().unwrap();
+        let mut containers = self.containers.write().unwrap_or_else(|e| e.into_inner());
         let removed = containers.remove(id);
         if removed.is_some() {
             info!(container_id = %id, "unregistered container");
@@ -95,13 +95,13 @@ impl ContainerRegistry {
 
     /// Get a container by ID.
     pub fn get(&self, id: &str) -> Option<ContainerInfo> {
-        let containers = self.containers.read().unwrap();
+        let containers = self.containers.read().unwrap_or_else(|e| e.into_inner());
         containers.get(id).cloned()
     }
 
     /// Update container state.
     pub fn update_state(&self, id: &str, state: ContainerState) {
-        let mut containers = self.containers.write().unwrap();
+        let mut containers = self.containers.write().unwrap_or_else(|e| e.into_inner());
         if let Some(info) = containers.get_mut(id) {
             info.state = state;
             debug!(container_id = %id, state = %state, "updated container state");
@@ -110,13 +110,13 @@ impl ContainerRegistry {
 
     /// List all containers.
     pub fn list(&self) -> Vec<ContainerInfo> {
-        let containers = self.containers.read().unwrap();
+        let containers = self.containers.read().unwrap_or_else(|e| e.into_inner());
         containers.values().cloned().collect()
     }
 
     /// Find container by ID prefix (for short IDs).
     pub fn find_by_prefix(&self, prefix: &str) -> Option<ContainerInfo> {
-        let containers = self.containers.read().unwrap();
+        let containers = self.containers.read().unwrap_or_else(|e| e.into_inner());
 
         // First try exact match
         if let Some(info) = containers.get(prefix) {

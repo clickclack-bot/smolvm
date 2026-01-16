@@ -24,9 +24,6 @@ pub const DEFAULT_STORAGE_SIZE_GB: u64 = 20;
 /// Storage disk filename.
 pub const STORAGE_DISK_FILENAME: &str = "storage.raw";
 
-/// Marker file indicating disk has been formatted.
-const FORMATTED_MARKER: &str = ".smolvm_formatted";
-
 /// Disk format version info (stored at `/.smolvm/version.json` in ext4 disk).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiskVersion {
@@ -51,7 +48,7 @@ impl DiskVersion {
     pub fn new(base_digest: impl Into<String>) -> Self {
         Self {
             format_version: Self::CURRENT_VERSION,
-            created_at: current_timestamp(),
+            created_at: crate::util::current_timestamp(),
             base_digest: base_digest.into(),
             smolvm_version: env!("CARGO_PKG_VERSION").to_string(),
         }
@@ -314,16 +311,6 @@ impl WritableDisk {
     }
 }
 
-/// Get current timestamp as a simple string.
-fn current_timestamp() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-
-    format!("{}", duration.as_secs())
-}
 
 #[cfg(test)]
 mod tests {

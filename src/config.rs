@@ -4,7 +4,6 @@
 //! including default settings and VM registry.
 
 use crate::error::{Error, Result};
-use crate::vm::config::VmConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -186,7 +185,7 @@ impl VmRecord {
         Self {
             name,
             image,
-            created_at: chrono_lite_now(),
+            created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
             pid: None,
             cpus,
@@ -221,17 +220,6 @@ impl VmRecord {
     }
 }
 
-/// Get current timestamp as ISO 8601 string (simplified, no chrono dependency).
-fn chrono_lite_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-
-    // Simple ISO-like format
-    format!("{}", duration.as_secs())
-}
 
 #[cfg(test)]
 mod tests {

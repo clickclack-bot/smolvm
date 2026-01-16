@@ -8,7 +8,7 @@ mod launcher;
 mod manager;
 
 pub use client::AgentClient;
-pub use launcher::HostMount;
+pub use crate::vm::config::HostMount;
 pub use manager::{AgentManager, AgentState};
 
 /// Default agent VM memory in MiB.

@@ -16,6 +16,8 @@ use crate::vm::{VmBackend, VmHandle, VmId};
 
 // FFI bindings to libkrun
 // Linking is handled by build.rs
+// Note: Some functions are declared but not yet used - allow dead_code for FFI completeness
+#[allow(dead_code)]
 extern "C" {
     // Logging
     fn krun_set_log_level(level: u32) -> i32;
@@ -185,8 +187,8 @@ impl LibkrunVm {
         // Raise file descriptor limits (required by libkrun)
         set_rlimits();
 
-        // Check if we're running in a real TTY
-        let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+        // Check if we're running in a real TTY (reserved for future TTY support)
+        let _is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
 
         unsafe {
             // Initialize libkrun logging (0 = off, 1 = error, 2 = warn, 3 = info, 4 = debug)

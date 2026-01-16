@@ -173,7 +173,7 @@ impl RunCmd {
             .map(|(i, m)| {
                 (
                     format!("smolvm{}", i),
-                    m.guest_path.to_string_lossy().to_string(),
+                    m.target.to_string_lossy().to_string(),
                     m.read_only,
                 )
             })
@@ -269,8 +269,8 @@ impl RunCmd {
             })?;
 
             mounts.push(HostMount {
-                host_path,
-                guest_path,
+                source: host_path,
+                target: guest_path,
                 read_only,
             });
         }

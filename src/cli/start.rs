@@ -38,8 +38,8 @@ impl StartCmd {
             .mounts
             .iter()
             .map(|(host, guest, ro)| HostMount {
-                host_path: PathBuf::from(host),
-                guest_path: PathBuf::from(guest),
+                source: PathBuf::from(host),
+                target: PathBuf::from(guest),
                 read_only: *ro,
             })
             .collect();
@@ -90,7 +90,7 @@ impl StartCmd {
             .map(|(i, m)| {
                 (
                     format!("smolvm{}", i),
-                    m.guest_path.to_string_lossy().to_string(),
+                    m.target.to_string_lossy().to_string(),
                     m.read_only,
                 )
             })

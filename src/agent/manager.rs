@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::launcher::{launch_agent_vm, HostMount};
-use super::{PortMapping, VmResources};
+use super::launcher::launch_agent_vm;
+use super::{HostMount, PortMapping, VmResources};
 
 /// State of the agent VM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

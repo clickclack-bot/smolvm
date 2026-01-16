@@ -2,6 +2,15 @@
 //!
 //! This module re-exports types from smolvm-protocol and adds host-specific
 //! functionality like authentication tokens.
+//!
+//! # Note on AuthToken
+//!
+//! The `AuthToken` type is defined here as a placeholder for Phase 1 security
+//! features. It is **not currently used** in the codebase. When integrated:
+//!
+//! 1. Replace the LCG PRNG with `getrandom` crate for cryptographic security
+//! 2. Replace custom base64 with `base64` crate or use raw bytes
+//! 3. Integrate with vsock authentication handshake
 
 // Re-export everything from the shared protocol crate
 pub use smolvm_protocol::*;
@@ -71,6 +80,8 @@ impl std::fmt::Debug for AuthToken {
 }
 
 // Simple base64 implementation (no external dependency)
+// TODO: Replace with `base64` crate when AuthToken is integrated
+#[allow(dead_code)]
 fn base64_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -98,6 +109,7 @@ fn base64_encode(data: &[u8]) -> String {
     result
 }
 
+#[allow(dead_code)]
 fn base64_decode(s: &str) -> Option<[u8; 32]> {
     const DECODE: [i8; 128] = [
         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,

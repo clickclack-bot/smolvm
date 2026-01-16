@@ -18,34 +18,29 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Run a VM from a rootfs path or OCI image (ephemeral).
+    /// Run a command in a container (ephemeral - stops microvm after).
+    ///
+    /// For persistent execution, use `microvm exec` instead.
     Run(cli::run::RunCmd),
 
-    /// Create a VM without starting it.
+    /// Create a named VM configuration without starting it.
     Create(cli::create::CreateCmd),
 
-    /// Start a created/stopped VM.
+    /// Start a created/stopped named VM.
     Start(cli::start::StartCmd),
 
-    /// Stop a running VM.
+    /// Stop a running named VM.
     Stop(cli::stop::StopCmd),
 
-    /// List all VMs.
-    #[command(alias = "ls")]
-    List(cli::list::ListCmd),
-
-    /// Delete a VM.
+    /// Delete a named VM configuration.
     #[command(alias = "rm")]
     Delete(cli::delete::DeleteCmd),
 
-    /// Manage microvms.
+    /// Manage microvms (start, stop, list, exec).
     #[command(subcommand)]
     Microvm(cli::microvm::MicrovmCmd),
 
-    /// Execute a command in a container via the agent VM.
-    Exec(cli::exec::ExecCmd),
-
-    /// Manage containers in the agent VM.
+    /// Manage containers inside the microvm.
     #[command(subcommand)]
     Container(cli::container::ContainerCmd),
 }
@@ -73,10 +68,8 @@ fn main() {
         Commands::Create(cmd) => cmd.run(&mut config),
         Commands::Start(cmd) => cmd.run(&mut config),
         Commands::Stop(cmd) => cmd.run(&mut config),
-        Commands::List(cmd) => cmd.run(&config),
         Commands::Delete(cmd) => cmd.run(&mut config),
         Commands::Microvm(cmd) => cmd.run(),
-        Commands::Exec(cmd) => cmd.run(),
         Commands::Container(cmd) => cmd.run(),
     };
 
