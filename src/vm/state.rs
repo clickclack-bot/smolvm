@@ -119,9 +119,9 @@ impl ExitReason {
         match self {
             ExitReason::Exited { code } => *code,
             ExitReason::Signaled { signal } => 128 + signal,
-            ExitReason::Timeout => 124, // Standard timeout exit code
+            ExitReason::Timeout => 124,   // Standard timeout exit code
             ExitReason::OomKilled => 137, // 128 + SIGKILL(9)
-            ExitReason::DiskFull => 200, // Per DESIGN.md
+            ExitReason::DiskFull => 200,  // Per DESIGN.md
             ExitReason::VmCrash { .. } => 1,
             ExitReason::ProtocolError { .. } => 1,
         }

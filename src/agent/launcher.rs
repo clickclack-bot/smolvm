@@ -42,11 +42,7 @@ extern "C" {
     ) -> i32;
     fn krun_set_console_output(ctx: u32, filepath: *const libc::c_char) -> i32;
     fn krun_set_port_map(ctx: u32, port_map: *const *const libc::c_char) -> i32;
-    fn krun_add_virtiofs(
-        ctx: u32,
-        tag: *const libc::c_char,
-        path: *const libc::c_char,
-    ) -> i32;
+    fn krun_add_virtiofs(ctx: u32, tag: *const libc::c_char, path: *const libc::c_char) -> i32;
     fn krun_start_enter(ctx: u32) -> i32;
 }
 
@@ -168,7 +164,8 @@ pub fn launch_agent_vm(
         // Build environment
         let mut env_strings = vec![
             CString::new("HOME=/root").unwrap(),
-            CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin").unwrap(),
+            CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+                .unwrap(),
             CString::new("TERM=xterm-256color").unwrap(),
         ];
 

@@ -32,7 +32,10 @@ pub fn available_backends() -> Vec<&'static str> {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        if LibkrunBackend::new().map(|b| b.is_available()).unwrap_or(false) {
+        if LibkrunBackend::new()
+            .map(|b| b.is_available())
+            .unwrap_or(false)
+        {
             backends.push("libkrun");
         }
     }

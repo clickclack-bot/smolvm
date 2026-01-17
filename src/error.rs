@@ -166,7 +166,10 @@ mod tests {
             path: PathBuf::from("/my/rootfs"),
         };
         let msg = err.to_string();
-        assert!(msg.contains("/my/rootfs"), "Error should include rootfs path");
+        assert!(
+            msg.contains("/my/rootfs"),
+            "Error should include rootfs path"
+        );
     }
 
     #[test]
@@ -187,7 +190,10 @@ mod tests {
             actual: "stopped".to_string(),
         };
         let msg = err.to_string();
-        assert!(msg.contains("running"), "Error should include expected state");
+        assert!(
+            msg.contains("running"),
+            "Error should include expected state"
+        );
         assert!(msg.contains("stopped"), "Error should include actual state");
     }
 

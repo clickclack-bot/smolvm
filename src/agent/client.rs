@@ -25,17 +25,12 @@ impl AgentClient {
     ///
     /// * `socket_path` - Path to the vsock Unix socket
     pub fn connect(socket_path: impl AsRef<Path>) -> Result<Self> {
-        let stream = UnixStream::connect(socket_path.as_ref()).map_err(|e| {
-            Error::AgentError(format!("failed to connect to agent: {}", e))
-        })?;
+        let stream = UnixStream::connect(socket_path.as_ref())
+            .map_err(|e| Error::AgentError(format!("failed to connect to agent: {}", e)))?;
 
         // Set timeouts
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .ok();
-        stream
-            .set_write_timeout(Some(Duration::from_secs(10)))
-            .ok();
+        stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
 
         Ok(Self { stream })
     }
@@ -236,6 +231,147 @@ impl AgentClient {
         }
     }
 
+    // ========================================================================
+    // VM-Level Exec (Direct Execution in VM)
+    // ========================================================================
+
+    /// Execute a command directly in the VM (not in a container).
+    ///
+    /// This runs the command in the agent's Alpine rootfs without any
+    /// container isolation. Useful for VM-level operations and debugging.
+    ///
+    /// # Arguments
+    ///
+    /// * `command` - Command and arguments
+    /// * `env` - Environment variables
+    /// * `workdir` - Working directory in the VM
+    /// * `timeout` - Optional timeout duration
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (exit_code, stdout, stderr)
+    pub fn vm_exec(
+        &mut self,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        timeout: Option<Duration>,
+    ) -> Result<(i32, String, String)> {
+        // Set socket read timeout based on command timeout (with buffer for response)
+        let socket_timeout = match timeout {
+            Some(t) => t + Duration::from_secs(5),
+            None => Duration::from_secs(3600),
+        };
+        self.stream.set_read_timeout(Some(socket_timeout)).ok();
+
+        let timeout_ms = timeout.map(|t| t.as_millis() as u64);
+
+        let resp = self.request(&AgentRequest::VmExec {
+            command,
+            env,
+            workdir,
+            timeout_ms,
+            interactive: false,
+            tty: false,
+        })?;
+
+        // Reset timeout
+        self.stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .ok();
+
+        match resp {
+            AgentResponse::Completed {
+                exit_code,
+                stdout,
+                stderr,
+            } => Ok((exit_code, stdout, stderr)),
+            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
+            _ => Err(Error::AgentError("unexpected response".into())),
+        }
+    }
+
+    /// Execute a command directly in the VM with interactive I/O.
+    ///
+    /// This method streams output directly to stdout/stderr and forwards stdin.
+    /// It blocks until the command exits.
+    ///
+    /// # Arguments
+    ///
+    /// * `command` - Command and arguments
+    /// * `env` - Environment variables
+    /// * `workdir` - Working directory in the VM
+    /// * `timeout` - Optional timeout duration
+    /// * `tty` - Whether to allocate a PTY
+    ///
+    /// # Returns
+    ///
+    /// The exit code of the command
+    pub fn vm_exec_interactive(
+        &mut self,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        timeout: Option<Duration>,
+        tty: bool,
+    ) -> Result<i32> {
+        use std::io::{stderr, stdout, Write};
+
+        // Set long socket timeout for interactive sessions
+        self.stream
+            .set_read_timeout(Some(Duration::from_secs(3600)))
+            .ok();
+
+        let timeout_ms = timeout.map(|t| t.as_millis() as u64);
+
+        // Send the vm_exec request with interactive mode
+        self.send(&AgentRequest::VmExec {
+            command,
+            env,
+            workdir,
+            timeout_ms,
+            interactive: true,
+            tty,
+        })?;
+
+        // Wait for Started response
+        let started = self.receive()?;
+        match started {
+            AgentResponse::Started => {}
+            AgentResponse::Error { message, .. } => {
+                return Err(Error::AgentError(message));
+            }
+            _ => {
+                return Err(Error::AgentError("expected Started response".into()));
+            }
+        }
+
+        // Stream I/O until we get an Exited response
+        loop {
+            let resp = self.receive()?;
+            match resp {
+                AgentResponse::Stdout { data } => {
+                    stdout().write_all(&data)?;
+                    stdout().flush()?;
+                }
+                AgentResponse::Stderr { data } => {
+                    stderr().write_all(&data)?;
+                    stderr().flush()?;
+                }
+                AgentResponse::Exited { exit_code } => {
+                    return Ok(exit_code);
+                }
+                AgentResponse::Error { message, .. } => {
+                    return Err(Error::AgentError(message));
+                }
+                _ => {
+                    // Ignore unexpected responses
+                    tracing::warn!("unexpected response during interactive VM exec session");
+                }
+            }
+        }
+    }
+
     /// Run a command in an image's rootfs.
     ///
     /// # Arguments
@@ -370,10 +506,12 @@ impl AgentClient {
         timeout: Option<Duration>,
         tty: bool,
     ) -> Result<i32> {
-        use std::io::{stdout, stderr, Write};
+        use std::io::{stderr, stdout, Write};
 
         // Set long socket timeout for interactive sessions
-        self.stream.set_read_timeout(Some(Duration::from_secs(3600))).ok();
+        self.stream
+            .set_read_timeout(Some(Duration::from_secs(3600)))
+            .ok();
 
         // Convert timeout to milliseconds for protocol
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);

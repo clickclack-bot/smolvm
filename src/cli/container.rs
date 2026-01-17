@@ -126,7 +126,8 @@ impl ContainerCreateCmd {
         };
 
         // Create container
-        let info = client.create_container(&self.image, command, env, self.workdir.clone(), mounts)?;
+        let info =
+            client.create_container(&self.image, command, env, self.workdir.clone(), mounts)?;
 
         println!("Created container: {}", info.id);
         println!("  Image: {}", info.image);
@@ -297,11 +298,7 @@ impl ContainerListCmd {
                 }
 
                 // Truncate container ID for display
-                let short_id = if c.id.len() > 12 {
-                    &c.id[..12]
-                } else {
-                    &c.id
-                };
+                let short_id = if c.id.len() > 12 { &c.id[..12] } else { &c.id };
 
                 // Truncate image name for display
                 let short_image = if c.image.len() > 18 {
@@ -378,8 +375,13 @@ impl ContainerExecCmd {
         };
 
         // Execute in container
-        let (exit_code, stdout, stderr) =
-            client.exec(&self.container_id, command, env, self.workdir.clone(), self.timeout)?;
+        let (exit_code, stdout, stderr) = client.exec(
+            &self.container_id,
+            command,
+            env,
+            self.workdir.clone(),
+            self.timeout,
+        )?;
 
         // Print output
         if !stdout.is_empty() {

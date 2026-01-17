@@ -76,7 +76,8 @@ fn main() {
         eprintln!("Set VM config");
 
         // Set virtiofs root filesystem
-        let root_path = CString::new("/Users/binsquare/Documents/smolvm/helper-rootfs/rootfs").unwrap();
+        let root_path =
+            CString::new("/Users/binsquare/Documents/smolvm/helper-rootfs/rootfs").unwrap();
         let ret = krun_set_root(ctx, root_path.as_ptr());
         eprintln!("krun_set_root returned: {}", ret);
         if ret < 0 {
@@ -108,7 +109,8 @@ fn main() {
         let env_strings: Vec<CString> = vec![
             CString::new("HOSTNAME=test-vm").unwrap(),
             CString::new("HOME=/root").unwrap(),
-            CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin").unwrap(),
+            CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+                .unwrap(),
             CString::new("TERM=xterm").unwrap(),
         ];
         let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();
@@ -131,6 +133,9 @@ fn main() {
 
         // Start VM - this should not return on success
         let ret = krun_start_enter(ctx);
-        eprintln!("krun_start_enter returned: {} (should not happen on success)", ret);
+        eprintln!(
+            "krun_start_enter returned: {} (should not happen on success)",
+            ret
+        );
     }
 }

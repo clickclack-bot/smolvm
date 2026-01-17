@@ -150,10 +150,8 @@ impl AgentManager {
         std::fs::create_dir_all(&storage_dir)?;
 
         let storage_path = storage_dir.join("storage.img");
-        let storage_disk = StorageDisk::open_or_create_at(
-            &storage_path,
-            crate::storage::DEFAULT_STORAGE_SIZE_GB,
-        )?;
+        let storage_disk =
+            StorageDisk::open_or_create_at(&storage_path, crate::storage::DEFAULT_STORAGE_SIZE_GB)?;
 
         Self::new_named(name, rootfs_path, storage_disk)
     }
@@ -258,7 +256,11 @@ impl AgentManager {
     /// Ensure the agent is running with the specified mounts and resources.
     ///
     /// If the agent is running with different mounts or resources, it will be restarted.
-    pub fn ensure_running_with_config(&self, mounts: Vec<HostMount>, resources: VmResources) -> Result<()> {
+    pub fn ensure_running_with_config(
+        &self,
+        mounts: Vec<HostMount>,
+        resources: VmResources,
+    ) -> Result<()> {
         self.ensure_running_with_full_config(mounts, Vec::new(), resources)
     }
 
@@ -414,7 +416,9 @@ impl AgentManager {
                     Ok(d) => d,
                     Err(e) => {
                         eprintln!("failed to open storage disk: {}", e);
-                        unsafe { libc::_exit(1); }
+                        unsafe {
+                            libc::_exit(1);
+                        }
                     }
                 };
 
@@ -434,7 +438,9 @@ impl AgentManager {
                     eprintln!("agent VM failed to start: {}", e);
                 }
 
-                unsafe { libc::_exit(1); }
+                unsafe {
+                    libc::_exit(1);
+                }
             }
             child_pid => {
                 // Parent process
@@ -584,7 +590,9 @@ impl AgentManager {
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        Err(Error::AgentError("timeout waiting for agent to stop".into()))
+        Err(Error::AgentError(
+            "timeout waiting for agent to stop".into(),
+        ))
     }
 
     /// Check if agent process is still running.

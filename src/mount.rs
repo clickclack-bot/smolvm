@@ -87,16 +87,7 @@ pub fn is_safe_mount_source(path: &Path) -> bool {
 
     // Block obvious sensitive paths
     const BLOCKED_PATHS: &[&str] = &[
-        "/",
-        "/etc",
-        "/var",
-        "/usr",
-        "/bin",
-        "/sbin",
-        "/lib",
-        "/System",
-        "/Library",
-        "/private",
+        "/", "/etc", "/var", "/usr", "/bin", "/sbin", "/lib", "/System", "/Library", "/private",
     ];
 
     for blocked in BLOCKED_PATHS {
@@ -213,8 +204,14 @@ mod tests {
         // Should fail with helpful error
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("single file"), "Error should mention single file");
-        assert!(err_msg.contains("directory"), "Error should suggest directory mount");
+        assert!(
+            err_msg.contains("single file"),
+            "Error should mention single file"
+        );
+        assert!(
+            err_msg.contains("directory"),
+            "Error should suggest directory mount"
+        );
     }
 
     // === Safe Mount Source Checks ===

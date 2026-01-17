@@ -7,8 +7,8 @@ mod client;
 mod launcher;
 mod manager;
 
-pub use client::AgentClient;
 pub use crate::vm::config::HostMount;
+pub use client::AgentClient;
 pub use manager::{AgentManager, AgentState};
 
 /// Default agent VM memory in MiB.
@@ -37,7 +37,10 @@ impl PortMapping {
 
     /// Create a port mapping where host and guest ports are the same.
     pub fn same(port: u16) -> Self {
-        Self { host: port, guest: port }
+        Self {
+            host: port,
+            guest: port,
+        }
     }
 }
 

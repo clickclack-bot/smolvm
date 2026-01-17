@@ -246,7 +246,12 @@ impl LibkrunVm {
                 .mounts
                 .iter()
                 .enumerate()
-                .map(|(i, m)| (format!("smolvm{}", i), m.target.to_string_lossy().to_string()))
+                .map(|(i, m)| {
+                    (
+                        format!("smolvm{}", i),
+                        m.target.to_string_lossy().to_string(),
+                    )
+                })
                 .collect();
 
             // Build exec command (with mount wrapper on macOS if needed)
@@ -429,7 +434,6 @@ impl VmHandle for LibkrunVm {
     }
 }
 
-
 // Helper functions
 
 /// Resolve a rootfs source to an actual path.
@@ -479,11 +483,9 @@ fn inject_init_krun(rootfs: &Path) -> Result<()> {
     // Look for init.krun in standard locations
     let sources = [
         // User's local smolvm data directory (macOS: ~/Library/Application Support)
-        dirs::data_local_dir()
-            .map(|d| d.join("smolvm/init.krun")),
+        dirs::data_local_dir().map(|d| d.join("smolvm/init.krun")),
         // XDG data home (Linux: ~/.local/share, works on macOS too)
-        dirs::home_dir()
-            .map(|d| d.join(".local/share/smolvm/init.krun")),
+        dirs::home_dir().map(|d| d.join(".local/share/smolvm/init.krun")),
         // System-wide location
         Some(PathBuf::from("/usr/local/share/smolvm/init.krun")),
         // Homebrew location
@@ -493,7 +495,11 @@ fn inject_init_krun(rootfs: &Path) -> Result<()> {
     for source in sources.into_iter().flatten() {
         tracing::debug!("[libkrun] checking for init.krun at {:?}", source);
         if source.exists() {
-            tracing::debug!("[libkrun] found init.krun at {:?}, copying to {:?}", source, target);
+            tracing::debug!(
+                "[libkrun] found init.krun at {:?}, copying to {:?}",
+                source,
+                target
+            );
             std::fs::copy(&source, &target).map_err(|e| {
                 Error::vm_creation(format!("failed to copy init.krun to rootfs: {}", e))
             })?;
@@ -564,16 +570,13 @@ fn build_env_args(
         CString::new(format!("HOSTNAME={}", vm_id.as_str()))
             .map_err(|_| Error::vm_creation("invalid hostname"))?,
     );
-    cstrings.push(
-        CString::new("HOME=/root").map_err(|_| Error::vm_creation("invalid HOME"))?,
-    );
+    cstrings.push(CString::new("HOME=/root").map_err(|_| Error::vm_creation("invalid HOME"))?);
     cstrings.push(
         CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
             .map_err(|_| Error::vm_creation("invalid PATH"))?,
     );
-    cstrings.push(
-        CString::new("TERM=xterm-256color").map_err(|_| Error::vm_creation("invalid TERM"))?,
-    );
+    cstrings
+        .push(CString::new("TERM=xterm-256color").map_err(|_| Error::vm_creation("invalid TERM"))?);
 
     // Add user-provided environment variables
     for (k, v) in env {
@@ -633,8 +636,9 @@ fn write_mount_script(
 
     // Make executable
     let perms = fs::Permissions::from_mode(0o755);
-    fs::set_permissions(&host_path, perms)
-        .map_err(|e| Error::vm_creation(format!("failed to set mount script permissions: {}", e)))?;
+    fs::set_permissions(&host_path, perms).map_err(|e| {
+        Error::vm_creation(format!("failed to set mount script permissions: {}", e))
+    })?;
 
     tracing::debug!("wrote mount script to {:?}", host_path);
     Ok(guest_path.to_string())

@@ -220,7 +220,6 @@ impl VmRecord {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -75,7 +75,11 @@ mod linux {
         /// Accept a new connection.
         pub fn accept(&self) -> std::io::Result<VsockStream> {
             unsafe {
-                let fd = libc::accept(self.fd.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut());
+                let fd = libc::accept(
+                    self.fd.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
                 if fd < 0 {
                     return Err(std::io::Error::last_os_error());
                 }

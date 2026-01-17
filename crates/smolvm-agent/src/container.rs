@@ -180,7 +180,9 @@ pub fn create_container(
     storage::setup_mounts(&overlay.rootfs_path, mounts)?;
 
     // Get bundle path
-    let overlay_root = Path::new(STORAGE_ROOT).join(OVERLAYS_DIR).join(&workload_id);
+    let overlay_root = Path::new(STORAGE_ROOT)
+        .join(OVERLAYS_DIR)
+        .join(&workload_id);
     let bundle_path = overlay_root.join("bundle");
 
     // Create OCI spec
@@ -190,7 +192,11 @@ pub fn create_container(
     // Add bind mounts for virtiofs volumes
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = Path::new("/mnt/virtiofs").join(tag);
-        spec.add_bind_mount(&virtiofs_mount.to_string_lossy(), container_path, *read_only);
+        spec.add_bind_mount(
+            &virtiofs_mount.to_string_lossy(),
+            container_path,
+            *read_only,
+        );
     }
 
     // Write config.json
@@ -202,7 +208,13 @@ pub fn create_container(
     info!(container_id = %container_id, bundle = %bundle_path.display(), "creating container");
 
     let mut child = Command::new(CRUN_PATH)
-        .args(["run", "--detach", "--bundle", &bundle_path.to_string_lossy(), &container_id])
+        .args([
+            "run",
+            "--detach",
+            "--bundle",
+            &bundle_path.to_string_lossy(),
+            &container_id,
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -210,7 +222,8 @@ pub fn create_container(
         .map_err(|e| StorageError::new(format!("failed to spawn crun: {}", e)))?;
 
     // Wait for crun to complete (should be fast with --detach)
-    let status = child.wait()
+    let status = child
+        .wait()
         .map_err(|e| StorageError::new(format!("failed to wait for crun: {}", e)))?;
 
     if !status.success() {
@@ -250,7 +263,8 @@ pub fn create_container(
 /// For stopped containers, it attempts to restart by recreating the container.
 pub fn start_container(container_id: &str) -> Result<(), StorageError> {
     // Find container
-    let info = REGISTRY.find_by_prefix(container_id)
+    let info = REGISTRY
+        .find_by_prefix(container_id)
         .ok_or_else(|| StorageError::new(format!("container not found: {}", container_id)))?;
 
     // Check actual state from crun
@@ -282,7 +296,8 @@ pub fn exec_in_container(
     use std::time::{Duration, Instant};
 
     // Find container
-    let info = REGISTRY.find_by_prefix(container_id)
+    let info = REGISTRY
+        .find_by_prefix(container_id)
         .ok_or_else(|| StorageError::new(format!("container not found: {}", container_id)))?;
 
     // Check container is running
@@ -322,7 +337,8 @@ pub fn exec_in_container(
     cmd.stderr(Stdio::piped());
 
     // Spawn the exec
-    let mut child = cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| StorageError::new(format!("failed to spawn crun exec: {}", e)))?;
 
     let start = Instant::now();
@@ -377,7 +393,8 @@ pub fn exec_in_container(
 
 /// Stop a running container.
 pub fn stop_container(container_id: &str, timeout_secs: u64) -> Result<(), StorageError> {
-    let info = REGISTRY.find_by_prefix(container_id)
+    let info = REGISTRY
+        .find_by_prefix(container_id)
         .ok_or_else(|| StorageError::new(format!("container not found: {}", container_id)))?;
 
     info!(container_id = %info.id, timeout_secs = timeout_secs, "stopping container");
@@ -414,7 +431,8 @@ pub fn stop_container(container_id: &str, timeout_secs: u64) -> Result<(), Stora
 
 /// Delete a container (must be stopped).
 pub fn delete_container(container_id: &str, force: bool) -> Result<(), StorageError> {
-    let info = REGISTRY.find_by_prefix(container_id)
+    let info = REGISTRY
+        .find_by_prefix(container_id)
         .ok_or_else(|| StorageError::new(format!("container not found: {}", container_id)))?;
 
     // Check if running
@@ -441,7 +459,8 @@ pub fn delete_container(container_id: &str, force: bool) -> Result<(), StorageEr
     }
     cmd.arg(&info.id);
 
-    let output = cmd.output()
+    let output = cmd
+        .output()
         .map_err(|e| StorageError::new(format!("failed to run crun delete: {}", e)))?;
 
     if !output.status.success() {
@@ -527,7 +546,10 @@ mod tests {
         assert!(registry.get("nonexistent").is_none());
 
         registry.update_state("test-123", ContainerState::Running);
-        assert_eq!(registry.get("test-123").unwrap().state, ContainerState::Running);
+        assert_eq!(
+            registry.get("test-123").unwrap().state,
+            ContainerState::Running
+        );
 
         registry.unregister("test-123");
         assert!(registry.get("test-123").is_none());

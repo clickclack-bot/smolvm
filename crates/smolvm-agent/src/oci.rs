@@ -98,7 +98,11 @@ pub struct OciLinux {
     #[serde(rename = "maskedPaths", default, skip_serializing_if = "Vec::is_empty")]
     pub masked_paths: Vec<String>,
     /// Read-only paths.
-    #[serde(rename = "readonlyPaths", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "readonlyPaths",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub readonly_paths: Vec<String>,
 }
 
@@ -136,12 +140,7 @@ impl OciSpec {
     /// * `env` - Environment variables as (key, value) pairs
     /// * `workdir` - Working directory inside the container
     /// * `tty` - Whether to allocate a pseudo-terminal
-    pub fn new(
-        command: &[String],
-        env: &[(String, String)],
-        workdir: &str,
-        tty: bool,
-    ) -> Self {
+    pub fn new(command: &[String], env: &[(String, String)], workdir: &str, tty: bool) -> Self {
         // Build environment variables
         let env_strings: Vec<String> = [
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
@@ -296,7 +295,11 @@ fn default_mounts() -> Vec<OciMount> {
             destination: "/proc".to_string(),
             mount_type: Some("proc".to_string()),
             source: "proc".to_string(),
-            options: vec!["nosuid".to_string(), "noexec".to_string(), "nodev".to_string()],
+            options: vec![
+                "nosuid".to_string(),
+                "noexec".to_string(),
+                "nodev".to_string(),
+            ],
         },
         // /dev - device nodes
         OciMount {

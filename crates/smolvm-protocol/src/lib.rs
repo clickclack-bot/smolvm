@@ -111,6 +111,29 @@ pub enum AgentRequest {
     /// Shutdown the agent.
     Shutdown,
 
+    /// Execute a command directly in the VM (not in a container).
+    ///
+    /// This runs the command in the agent's Alpine rootfs without any
+    /// container isolation. Useful for VM-level operations and debugging.
+    VmExec {
+        /// Command and arguments.
+        command: Vec<String>,
+        /// Environment variables.
+        #[serde(default)]
+        env: Vec<(String, String)>,
+        /// Working directory in the VM.
+        workdir: Option<String>,
+        /// Timeout in milliseconds.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        /// Interactive mode - stream I/O instead of buffering.
+        #[serde(default)]
+        interactive: bool,
+        /// Allocate a pseudo-TTY for the command.
+        #[serde(default)]
+        tty: bool,
+    },
+
     /// Run a command in an image's rootfs.
     ///
     /// This prepares an overlay, chroots into it, and executes the command.
@@ -161,7 +184,6 @@ pub enum AgentRequest {
     // ========================================================================
     // Container Lifecycle (Phase 2/3)
     // ========================================================================
-
     /// Create a long-running container from an image.
     ///
     /// The container is created but not started. Use StartContainer to start it.
@@ -542,7 +564,11 @@ impl std::fmt::Display for DecodeError {
             DecodeError::TooShort => write!(f, "data too short for length header"),
             DecodeError::TooLarge(size) => write!(f, "frame too large: {} bytes", size),
             DecodeError::Incomplete { expected, got } => {
-                write!(f, "incomplete frame: expected {} bytes, got {}", expected, got)
+                write!(
+                    f,
+                    "incomplete frame: expected {} bytes, got {}",
+                    expected, got
+                )
             }
             DecodeError::Json(e) => write!(f, "JSON decode error: {}", e),
         }

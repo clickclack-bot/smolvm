@@ -222,9 +222,7 @@ fn build_libkrun_from_submodule() -> Option<PathBuf> {
                 return None;
             }
         } else if !init_dst.exists() {
-            println!(
-                "cargo:warning=init binary not found. Need init/init or init/init.krun"
-            );
+            println!("cargo:warning=init binary not found. Need init/init or init/init.krun");
             return None;
         }
     }
@@ -232,7 +230,10 @@ fn build_libkrun_from_submodule() -> Option<PathBuf> {
     // Determine profile
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "release".to_string());
 
-    println!("cargo:warning=Building libkrun from submodule ({} build)...", profile);
+    println!(
+        "cargo:warning=Building libkrun from submodule ({} build)...",
+        profile
+    );
 
     // Build libkrun using cargo directly (make has issues on macOS)
     // Note: blk,net features require additional setup and are optional
@@ -287,7 +288,11 @@ fn build_libkrun_from_submodule() -> Option<PathBuf> {
         let dst = lib_out_dir.join(lib_name);
         std::fs::copy(&src, &dst).ok()?;
 
-        println!("cargo:warning=Copied {} to {}", src.display(), dst.display());
+        println!(
+            "cargo:warning=Copied {} to {}",
+            src.display(),
+            dst.display()
+        );
 
         // On macOS, change the install_name to use @rpath so the binary finds
         // the bundled library instead of a system-installed one
@@ -309,8 +314,14 @@ fn build_libkrun_from_submodule() -> Option<PathBuf> {
         }
 
         // Tell cargo to rebuild if libkrun source changes
-        println!("cargo:rerun-if-changed={}", libkrun_dir.join("src").display());
-        println!("cargo:rerun-if-changed={}", libkrun_dir.join("init").display());
+        println!(
+            "cargo:rerun-if-changed={}",
+            libkrun_dir.join("src").display()
+        );
+        println!(
+            "cargo:rerun-if-changed={}",
+            libkrun_dir.join("init").display()
+        );
 
         Some(lib_out_dir)
     } else {

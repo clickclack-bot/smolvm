@@ -17,9 +17,7 @@ pub const GOOGLE_DNS: &str = "8.8.8.8";
 pub fn get_dns_server(policy: &NetworkPolicy) -> Option<IpAddr> {
     match policy {
         NetworkPolicy::None => None,
-        NetworkPolicy::Egress { dns } => {
-            Some(dns.unwrap_or_else(|| DEFAULT_DNS.parse().unwrap()))
-        }
+        NetworkPolicy::Egress { dns } => Some(dns.unwrap_or_else(|| DEFAULT_DNS.parse().unwrap())),
     }
 }
 

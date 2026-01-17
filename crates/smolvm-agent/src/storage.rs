@@ -136,11 +136,17 @@ pub fn pull_image(image: &str, platform: Option<&str>) -> Result<ImageInfo> {
     // Determine platform - default to current architecture
     let platform = platform.or_else(|| {
         #[cfg(target_arch = "aarch64")]
-        { Some("linux/arm64") }
+        {
+            Some("linux/arm64")
+        }
         #[cfg(target_arch = "x86_64")]
-        { Some("linux/amd64") }
+        {
+            Some("linux/amd64")
+        }
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        { None }
+        {
+            None
+        }
     });
 
     // Get manifest with platform specified
@@ -161,11 +167,10 @@ pub fn pull_image(image: &str, platform: Option<&str>) -> Result<ImageInfo> {
         return Err(StorageError(format!(
             "got manifest list instead of image manifest - platform may not be available. \
              manifests: {:?}",
-            manifest_json["manifests"]
-                .as_array()
-                .map(|arr| arr.iter()
-                    .filter_map(|m| m["platform"]["architecture"].as_str())
-                    .collect::<Vec<_>>())
+            manifest_json["manifests"].as_array().map(|arr| arr
+                .iter()
+                .filter_map(|m| m["platform"]["architecture"].as_str())
+                .collect::<Vec<_>>())
         )));
     } else {
         return Err(StorageError("unknown manifest format".into()));
@@ -186,7 +191,9 @@ pub fn pull_image(image: &str, platform: Option<&str>) -> Result<ImageInfo> {
 
     // Fetch and save config
     let config = crane_config(image, platform)?;
-    let config_id = config_digest.strip_prefix("sha256:").unwrap_or(config_digest);
+    let config_id = config_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(config_digest);
     let config_path = root.join(CONFIGS_DIR).join(format!("{}.json", config_id));
     std::fs::write(&config_path, &config)?;
 
@@ -197,9 +204,7 @@ pub fn pull_image(image: &str, platform: Option<&str>) -> Result<ImageInfo> {
     // Extract layers
     let mut total_size = 0u64;
     for (i, layer_digest) in layers.iter().enumerate() {
-        let layer_id = layer_digest
-            .strip_prefix("sha256:")
-            .unwrap_or(layer_digest);
+        let layer_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
         let layer_dir = root.join(LAYERS_DIR).join(layer_id);
 
         if layer_dir.exists() {
@@ -222,7 +227,9 @@ pub fn pull_image(image: &str, platform: Option<&str>) -> Result<ImageInfo> {
                 "crane blob '{}@{}' {} | tar -xzf - -C '{}'",
                 image,
                 layer_digest,
-                platform.map(|p| format!("--platform={}", p)).unwrap_or_default(),
+                platform
+                    .map(|p| format!("--platform={}", p))
+                    .unwrap_or_default(),
                 layer_dir.display()
             ))
             .status()?;
@@ -290,7 +297,9 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
         .collect();
 
     // Read config
-    let config_id = config_digest.strip_prefix("sha256:").unwrap_or(config_digest);
+    let config_id = config_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(config_digest);
     let config_path = root.join(CONFIGS_DIR).join(format!("{}.json", config_id));
     let config = std::fs::read_to_string(&config_path)?;
     let config_json: serde_json::Value =
@@ -306,9 +315,7 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
     // Calculate total size
     let mut total_size = 0u64;
     for layer_digest in &layers {
-        let layer_id = layer_digest
-            .strip_prefix("sha256:")
-            .unwrap_or(layer_digest);
+        let layer_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
         let layer_dir = root.join(LAYERS_DIR).join(layer_id);
         if let Ok(size) = dir_size(&layer_dir) {
             total_size += size;
@@ -414,7 +421,8 @@ pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
     let root = Path::new(STORAGE_ROOT);
 
     // Ensure image exists
-    let info = query_image(image)?.ok_or_else(|| StorageError(format!("image not found: {}", image)))?;
+    let info =
+        query_image(image)?.ok_or_else(|| StorageError(format!("image not found: {}", image)))?;
 
     // Create overlay directories
     let overlay_root = root.join(OVERLAYS_DIR).join(workload_id);
@@ -539,7 +547,9 @@ pub fn run_command(
     let mounted_paths = setup_volume_mounts(&overlay.rootfs_path, mounts)?;
 
     // Get bundle path
-    let overlay_root = Path::new(STORAGE_ROOT).join(OVERLAYS_DIR).join(&workload_id);
+    let overlay_root = Path::new(STORAGE_ROOT)
+        .join(OVERLAYS_DIR)
+        .join(&workload_id);
     let bundle_path = overlay_root.join("bundle");
 
     // Create OCI spec
@@ -549,7 +559,11 @@ pub fn run_command(
     // Add virtiofs bind mounts to OCI spec
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = Path::new(VIRTIOFS_MOUNT_ROOT).join(tag);
-        spec.add_bind_mount(&virtiofs_mount.to_string_lossy(), container_path, *read_only);
+        spec.add_bind_mount(
+            &virtiofs_mount.to_string_lossy(),
+            container_path,
+            *read_only,
+        );
     }
 
     // Write config.json to bundle
@@ -630,15 +644,9 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
                 "bind-mounting into container"
             );
 
-            let args = [
-                "--bind",
-                &virtiofs_mount.to_string_lossy(),
-                &target_path,
-            ];
+            let args = ["--bind", &virtiofs_mount.to_string_lossy(), &target_path];
 
-            let status = Command::new("mount")
-                .args(args)
-                .status()?;
+            let status = Command::new("mount").args(args).status()?;
 
             if !status.success() {
                 warn!(target = %target_path, "failed to bind-mount");
@@ -718,13 +726,21 @@ fn run_with_crun(
 
     // Build crun run command
     let mut cmd = Command::new(CRUN_PATH);
-    cmd.args(["run", "--bundle", &bundle_dir.to_string_lossy(), container_id]);
+    cmd.args([
+        "run",
+        "--bundle",
+        &bundle_dir.to_string_lossy(),
+        container_id,
+    ]);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
     // Spawn the container
     let mut child = cmd.spawn().map_err(|e| {
-        StorageError(format!("failed to spawn crun: {}. Is crun installed at {}?", e, CRUN_PATH))
+        StorageError(format!(
+            "failed to spawn crun: {}. Is crun installed at {}?",
+            e, CRUN_PATH
+        ))
     })?;
 
     let start = Instant::now();
@@ -856,10 +872,7 @@ fn crane_config(image: &str, platform: Option<&str>) -> Result<String> {
 
 /// Sanitize image name for use as filename.
 fn sanitize_image_name(image: &str) -> String {
-    image
-        .replace('/', "_")
-        .replace(':', "_")
-        .replace('@', "_")
+    image.replace('/', "_").replace(':', "_").replace('@', "_")
 }
 
 /// Reverse sanitization.

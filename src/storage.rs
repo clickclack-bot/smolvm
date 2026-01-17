@@ -143,10 +143,7 @@ impl StorageDisk {
 
         tracing::info!(path = %path.display(), size_gb = size_bytes / (1024*1024*1024), "creating sparse storage disk");
 
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
+        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
 
         // Seek to end and write a single byte to create sparse file
         file.seek(SeekFrom::Start(size_bytes - 1))?;
@@ -198,9 +195,10 @@ impl StorageDisk {
                 )
             })?;
 
-        let path_str = self.path.to_str().ok_or_else(|| {
-            Error::Storage("invalid disk path".into())
-        })?;
+        let path_str = self
+            .path
+            .to_str()
+            .ok_or_else(|| Error::Storage("invalid disk path".into()))?;
 
         // Format with ext4 (-F = force, -q = quiet, -m 0 = no reserved blocks)
         let output = std::process::Command::new(mkfs_path)
@@ -310,7 +308,6 @@ impl WritableDisk {
         ))
     }
 }
-
 
 #[cfg(test)]
 mod tests {

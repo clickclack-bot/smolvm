@@ -96,10 +96,13 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             Ok(req) => req,
             Err(e) => {
                 warn!(error = %e, "invalid request");
-                send_response(stream, &AgentResponse::Error {
-                    message: format!("invalid request: {}", e),
-                    code: Some("INVALID_REQUEST".to_string()),
-                })?;
+                send_response(
+                    stream,
+                    &AgentResponse::Error {
+                        message: format!("invalid request: {}", e),
+                        code: Some("INVALID_REQUEST".to_string()),
+                    },
+                )?;
                 continue;
             }
         };
@@ -107,9 +110,24 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         debug!(?request, "received request");
 
         // Check if this is an interactive run request
-        if let AgentRequest::Run { interactive: true, .. } | AgentRequest::Run { tty: true, .. } = &request {
+        if let AgentRequest::Run {
+            interactive: true, ..
+        }
+        | AgentRequest::Run { tty: true, .. } = &request
+        {
             // Handle interactive session
             handle_interactive_run(stream, request)?;
+            continue;
+        }
+
+        // Check if this is an interactive VM exec request
+        if let AgentRequest::VmExec {
+            interactive: true, ..
+        }
+        | AgentRequest::VmExec { tty: true, .. } = &request
+        {
+            // Handle interactive VM exec session
+            handle_interactive_vm_exec(stream, request)?;
             continue;
         }
 
@@ -219,6 +237,24 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             }
         }
 
+        // VM-level exec (direct command execution in VM, not container)
+        AgentRequest::VmExec {
+            command,
+            env,
+            workdir,
+            timeout_ms,
+            interactive: false,
+            tty: false,
+        } => handle_vm_exec(&command, &env, workdir.as_deref(), timeout_ms),
+
+        AgentRequest::VmExec { .. } => {
+            // Interactive mode should be handled by handle_interactive_vm_exec
+            AgentResponse::Error {
+                message: "interactive VM exec not handled here".into(),
+                code: Some("INTERNAL_ERROR".into()),
+            }
+        }
+
         AgentRequest::Run {
             image,
             command,
@@ -228,7 +264,14 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             timeout_ms,
             interactive: false,
             tty: false,
-        } => handle_run(&image, &command, &env, workdir.as_deref(), &mounts, timeout_ms),
+        } => handle_run(
+            &image,
+            &command,
+            &env,
+            workdir.as_deref(),
+            &mounts,
+            timeout_ms,
+        ),
 
         AgentRequest::Run { .. } => {
             // Interactive mode should be handled by handle_interactive_run
@@ -238,12 +281,10 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             }
         }
 
-        AgentRequest::Stdin { .. } | AgentRequest::Resize { .. } => {
-            AgentResponse::Error {
-                message: "stdin/resize only valid during interactive session".into(),
-                code: Some("INVALID_REQUEST".into()),
-            }
-        }
+        AgentRequest::Stdin { .. } | AgentRequest::Resize { .. } => AgentResponse::Error {
+            message: "stdin/resize only valid during interactive session".into(),
+            code: Some("INVALID_REQUEST".into()),
+        },
 
         // Container lifecycle (Phase 2/3)
         AgentRequest::CreateContainer {
@@ -261,9 +302,10 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             timeout_secs,
         } => handle_stop_container(&container_id, timeout_secs.unwrap_or(10)),
 
-        AgentRequest::DeleteContainer { container_id, force } => {
-            handle_delete_container(&container_id, force)
-        }
+        AgentRequest::DeleteContainer {
+            container_id,
+            force,
+        } => handle_delete_container(&container_id, force),
 
         AgentRequest::ListContainers => handle_list_containers(),
 
@@ -273,7 +315,13 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             env,
             workdir,
             timeout_ms,
-        } => handle_exec(&container_id, &command, &env, workdir.as_deref(), timeout_ms),
+        } => handle_exec(
+            &container_id,
+            &command,
+            &env,
+            workdir.as_deref(),
+            timeout_ms,
+        ),
     }
 }
 
@@ -294,10 +342,13 @@ fn handle_interactive_run(
             ..
         } => (image, command, env, workdir, mounts, timeout_ms, tty),
         _ => {
-            send_response(stream, &AgentResponse::Error {
-                message: "expected Run request".into(),
-                code: Some("INVALID_REQUEST".into()),
-            })?;
+            send_response(
+                stream,
+                &AgentResponse::Error {
+                    message: "expected Run request".into(),
+                    code: Some("INVALID_REQUEST".into()),
+                },
+            )?;
             return Ok(());
         }
     };
@@ -308,31 +359,47 @@ fn handle_interactive_run(
     let rootfs = match storage::prepare_for_run(&image) {
         Ok(path) => path,
         Err(e) => {
-            send_response(stream, &AgentResponse::Error {
-                message: e.to_string(),
-                code: Some("RUN_FAILED".into()),
-            })?;
+            send_response(
+                stream,
+                &AgentResponse::Error {
+                    message: e.to_string(),
+                    code: Some("RUN_FAILED".into()),
+                },
+            )?;
             return Ok(());
         }
     };
 
     // Setup virtiofs mounts at staging area (crun will bind-mount them via OCI spec)
     if let Err(e) = storage::setup_mounts(&rootfs, &mounts) {
-        send_response(stream, &AgentResponse::Error {
-            message: e.to_string(),
-            code: Some("MOUNT_FAILED".into()),
-        })?;
+        send_response(
+            stream,
+            &AgentResponse::Error {
+                message: e.to_string(),
+                code: Some("MOUNT_FAILED".into()),
+            },
+        )?;
         return Ok(());
     }
 
     // Spawn the command with crun
-    let mut child = match spawn_interactive_command(&rootfs, &command, &env, workdir.as_deref(), &mounts, tty) {
+    let mut child = match spawn_interactive_command(
+        &rootfs,
+        &command,
+        &env,
+        workdir.as_deref(),
+        &mounts,
+        tty,
+    ) {
         Ok(child) => child,
         Err(e) => {
-            send_response(stream, &AgentResponse::Error {
-                message: e.to_string(),
-                code: Some("SPAWN_FAILED".into()),
-            })?;
+            send_response(
+                stream,
+                &AgentResponse::Error {
+                    message: e.to_string(),
+                    code: Some("SPAWN_FAILED".into()),
+                },
+            )?;
             return Ok(());
         }
     };
@@ -390,7 +457,11 @@ fn spawn_interactive_command(
     // Add virtiofs bind mounts to OCI spec
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = Path::new(VIRTIOFS_MOUNT_ROOT).join(tag);
-        spec.add_bind_mount(&virtiofs_mount.to_string_lossy(), container_path, *read_only);
+        spec.add_bind_mount(
+            &virtiofs_mount.to_string_lossy(),
+            container_path,
+            *read_only,
+        );
     }
 
     // Write config.json to bundle
@@ -402,7 +473,12 @@ fn spawn_interactive_command(
 
     // Build crun run command
     let mut cmd = Command::new(CRUN_PATH);
-    cmd.args(["run", "--bundle", &bundle_path.to_string_lossy(), &container_id]);
+    cmd.args([
+        "run",
+        "--bundle",
+        &bundle_path.to_string_lossy(),
+        &container_id,
+    ]);
 
     // Setup stdio for interactive mode
     cmd.stdin(Stdio::piped());
@@ -461,9 +537,12 @@ fn run_interactive_loop(
                         match stdout.read(&mut stdout_buf) {
                             Ok(0) => break,
                             Ok(n) => {
-                                send_response(stream, &AgentResponse::Stdout {
-                                    data: stdout_buf[..n].to_vec(),
-                                })?;
+                                send_response(
+                                    stream,
+                                    &AgentResponse::Stdout {
+                                        data: stdout_buf[..n].to_vec(),
+                                    },
+                                )?;
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                             Err(_) => break,
@@ -475,9 +554,12 @@ fn run_interactive_loop(
                         match stderr.read(&mut stderr_buf) {
                             Ok(0) => break,
                             Ok(n) => {
-                                send_response(stream, &AgentResponse::Stderr {
-                                    data: stderr_buf[..n].to_vec(),
-                                })?;
+                                send_response(
+                                    stream,
+                                    &AgentResponse::Stderr {
+                                        data: stderr_buf[..n].to_vec(),
+                                    },
+                                )?;
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                             Err(_) => break,
@@ -504,9 +586,12 @@ fn run_interactive_loop(
             match stdout.read(&mut stdout_buf) {
                 Ok(0) => {} // EOF
                 Ok(n) => {
-                    send_response(stream, &AgentResponse::Stdout {
-                        data: stdout_buf[..n].to_vec(),
-                    })?;
+                    send_response(
+                        stream,
+                        &AgentResponse::Stdout {
+                            data: stdout_buf[..n].to_vec(),
+                        },
+                    )?;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => {
@@ -520,9 +605,12 @@ fn run_interactive_loop(
             match stderr.read(&mut stderr_buf) {
                 Ok(0) => {} // EOF
                 Ok(n) => {
-                    send_response(stream, &AgentResponse::Stderr {
-                        data: stderr_buf[..n].to_vec(),
-                    })?;
+                    send_response(
+                        stream,
+                        &AgentResponse::Stderr {
+                            data: stderr_buf[..n].to_vec(),
+                        },
+                    )?;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => {
@@ -560,7 +648,9 @@ fn run_interactive_loop(
 }
 
 /// Try to read a request with a very short timeout.
-fn try_read_request(stream: &mut impl ReadWrite) -> Result<Option<AgentRequest>, Box<dyn std::error::Error>> {
+fn try_read_request(
+    stream: &mut impl ReadWrite,
+) -> Result<Option<AgentRequest>, Box<dyn std::error::Error>> {
     // For now, use a simple non-blocking approach
     // In a production implementation, we'd use poll/select
 
@@ -584,7 +674,7 @@ fn set_nonblocking(fd: i32) {
 /// Connects to 1.1.1.1:80 and sends HTTP GET request.
 fn test_tcp_syscall() -> serde_json::Value {
     use std::io::{Read as _, Write as _};
-    use std::net::{TcpStream, SocketAddr};
+    use std::net::{SocketAddr, TcpStream};
     use std::time::Duration;
 
     info!("testing TCP with pure Rust std::net");
@@ -606,7 +696,8 @@ fn test_tcp_syscall() -> serde_json::Value {
                     let mut response = vec![0u8; 1024];
                     match stream.read(&mut response) {
                         Ok(n) => {
-                            let response_str = String::from_utf8_lossy(&response[..n.min(200)]).to_string();
+                            let response_str =
+                                String::from_utf8_lossy(&response[..n.min(200)]).to_string();
                             serde_json::json!({
                                 "success": true,
                                 "connected": true,
@@ -661,7 +752,8 @@ fn test_tcp_syscall() -> serde_json::Value {
         } else {
             // Get socket type info
             let mut sock_type: libc::c_int = 0;
-            let mut sock_type_len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            let mut sock_type_len: libc::socklen_t =
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t;
             libc::getsockopt(
                 fd,
                 libc::SOL_SOCKET,
@@ -732,7 +824,16 @@ fn test_tcp_syscall() -> serde_json::Value {
 
     // Test 4: Try curl if available
     let curl_result = match std::process::Command::new("curl")
-        .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "--connect-timeout", "10", "http://1.1.1.1"])
+        .args([
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "--connect-timeout",
+            "10",
+            "http://1.1.1.1",
+        ])
         .output()
     {
         Ok(output) => {
@@ -900,6 +1001,205 @@ fn handle_storage_status() -> AgentResponse {
 }
 
 // ============================================================================
+// VM-Level Exec Handlers (Direct Execution in VM)
+// ============================================================================
+
+/// Handle VM-level exec (non-interactive).
+/// Executes command directly in the VM's rootfs without any container isolation.
+fn handle_vm_exec(
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    timeout_ms: Option<u64>,
+) -> AgentResponse {
+    info!(command = ?command, "executing directly in VM");
+
+    if command.is_empty() {
+        return AgentResponse::Error {
+            message: "command cannot be empty".into(),
+            code: Some("INVALID_REQUEST".into()),
+        };
+    }
+
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..]);
+
+    // Set environment variables
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+
+    // Set working directory
+    if let Some(wd) = workdir {
+        cmd.current_dir(wd);
+    }
+
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    // Spawn the command
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return AgentResponse::Error {
+                message: format!("failed to spawn command: {}", e),
+                code: Some("SPAWN_FAILED".into()),
+            };
+        }
+    };
+
+    // Handle timeout
+    let deadline = timeout_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+
+    loop {
+        // Check if process has exited
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Process exited, collect output
+                let mut stdout = String::new();
+                let mut stderr = String::new();
+
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = out.read_to_string(&mut stdout);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    let _ = err.read_to_string(&mut stderr);
+                }
+
+                return AgentResponse::Completed {
+                    exit_code: status.code().unwrap_or(-1),
+                    stdout,
+                    stderr,
+                };
+            }
+            Ok(None) => {
+                // Still running, check timeout
+                if let Some(deadline) = deadline {
+                    if std::time::Instant::now() >= deadline {
+                        // Timeout - kill process
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return AgentResponse::Completed {
+                            exit_code: 124, // Standard timeout exit code
+                            stdout: String::new(),
+                            stderr: "command timed out".to_string(),
+                        };
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                return AgentResponse::Error {
+                    message: format!("failed to check process status: {}", e),
+                    code: Some("WAIT_FAILED".into()),
+                };
+            }
+        }
+    }
+}
+
+/// Handle interactive VM-level exec with streaming I/O.
+fn handle_interactive_vm_exec(
+    stream: &mut impl ReadWrite,
+    request: AgentRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (command, env, workdir, timeout_ms, tty) = match request {
+        AgentRequest::VmExec {
+            command,
+            env,
+            workdir,
+            timeout_ms,
+            tty,
+            ..
+        } => (command, env, workdir, timeout_ms, tty),
+        _ => {
+            send_response(
+                stream,
+                &AgentResponse::Error {
+                    message: "expected VmExec request".into(),
+                    code: Some("INVALID_REQUEST".into()),
+                },
+            )?;
+            return Ok(());
+        }
+    };
+
+    info!(command = ?command, tty = tty, "starting interactive VM exec");
+
+    if command.is_empty() {
+        send_response(
+            stream,
+            &AgentResponse::Error {
+                message: "command cannot be empty".into(),
+                code: Some("INVALID_REQUEST".into()),
+            },
+        )?;
+        return Ok(());
+    }
+
+    // Spawn the command directly
+    let mut child = match spawn_direct_interactive_command(&command, &env, workdir.as_deref(), tty) {
+        Ok(child) => child,
+        Err(e) => {
+            send_response(
+                stream,
+                &AgentResponse::Error {
+                    message: e.to_string(),
+                    code: Some("SPAWN_FAILED".into()),
+                },
+            )?;
+            return Ok(());
+        }
+    };
+
+    // Send Started response
+    send_response(stream, &AgentResponse::Started)?;
+
+    // Run the interactive I/O loop
+    let exit_code = run_interactive_loop(stream, &mut child, timeout_ms)?;
+
+    // Send Exited response
+    send_response(stream, &AgentResponse::Exited { exit_code })?;
+
+    Ok(())
+}
+
+/// Spawn a command directly in the VM for interactive execution.
+fn spawn_direct_interactive_command(
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    tty: bool,
+) -> Result<Child, Box<dyn std::error::Error>> {
+    if tty {
+        // For TTY mode, we need to use a PTY
+        // TODO: For TTY mode, use --console-socket or similar
+        // For now, fall back to pipe-based I/O
+        warn!("TTY mode requested but not fully supported for direct VM exec, using pipes");
+    }
+
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..]);
+
+    // Set environment variables
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+
+    // Set working directory
+    if let Some(wd) = workdir {
+        cmd.current_dir(wd);
+    }
+
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let child = cmd.spawn()?;
+    Ok(child)
+}
+
+// ============================================================================
 // Container Lifecycle Handlers (Phase 2/3)
 // ============================================================================
 
@@ -924,14 +1224,16 @@ fn handle_create_container(
             }
 
             AgentResponse::Ok {
-                data: Some(serde_json::to_value(ContainerInfo {
-                    id: info.id,
-                    image: info.image,
-                    state: "running".to_string(),
-                    created_at: info.created_at,
-                    command: info.command,
-                })
-                .unwrap()),
+                data: Some(
+                    serde_json::to_value(ContainerInfo {
+                        id: info.id,
+                        image: info.image,
+                        state: "running".to_string(),
+                        created_at: info.created_at,
+                        command: info.command,
+                    })
+                    .unwrap(),
+                ),
             }
         }
         Err(e) => AgentResponse::Error {
