@@ -344,6 +344,9 @@ impl AgentManager {
         ports: Vec<PortMapping>,
         resources: VmResources,
     ) -> Result<()> {
+        // Install SIGCHLD handler to automatically reap zombie children
+        crate::process::install_sigchld_handler();
+
         // Check and update state
         {
             let mut inner = self.inner.lock().unwrap();
