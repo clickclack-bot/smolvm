@@ -4,6 +4,8 @@
 
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd};
 
 /// vsock listener.
 pub struct VsockListener {

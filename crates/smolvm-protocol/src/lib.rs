@@ -246,6 +246,15 @@ pub enum AgentRequest {
         /// Timeout in milliseconds.
         #[serde(default)]
         timeout_ms: Option<u64>,
+        /// Interactive mode - stream I/O instead of buffering.
+        /// When true, output is streamed via Stdout/Stderr responses,
+        /// and stdin can be sent via the Stdin request.
+        #[serde(default)]
+        interactive: bool,
+        /// Allocate a pseudo-TTY for the command.
+        /// Enables terminal features like colors, line editing, and signal handling.
+        #[serde(default)]
+        tty: bool,
     },
 }
 
