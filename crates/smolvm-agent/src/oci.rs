@@ -94,6 +94,9 @@ pub struct OciRlimit {
 pub struct OciLinux {
     /// Namespaces to create.
     pub namespaces: Vec<OciNamespace>,
+    /// Device nodes to create in the container.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<OciDevice>,
     /// Masked paths (paths that should appear empty).
     #[serde(rename = "maskedPaths", default, skip_serializing_if = "Vec::is_empty")]
     pub masked_paths: Vec<String>,
@@ -104,6 +107,29 @@ pub struct OciLinux {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub readonly_paths: Vec<String>,
+}
+
+/// Device node configuration for OCI runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OciDevice {
+    /// Device type: "c" (char), "b" (block), "p" (pipe)
+    #[serde(rename = "type")]
+    pub device_type: String,
+    /// Path inside the container
+    pub path: String,
+    /// Major device number
+    pub major: u32,
+    /// Minor device number
+    pub minor: u32,
+    /// File mode/permissions
+    #[serde(rename = "fileMode", skip_serializing_if = "Option::is_none")]
+    pub file_mode: Option<u32>,
+    /// Owner UID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    /// Owner GID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gid: Option<u32>,
 }
 
 /// Namespace configuration.
@@ -203,6 +229,7 @@ impl OciSpec {
                         path: None,
                     },
                 ],
+                devices: default_devices(),
                 masked_paths: vec![
                     "/proc/asound".to_string(),
                     "/proc/acpi".to_string(),
@@ -256,15 +283,184 @@ impl OciSpec {
     }
 }
 
+/// Maximum allowed length for an image reference.
+const MAX_IMAGE_REF_LENGTH: usize = 512;
+
+/// Validate an OCI image reference format.
+///
+/// This validates that the image reference follows the expected format:
+/// `[registry/][repository/]name[:tag][@digest]`
+///
+/// # Arguments
+/// * `image` - The image reference to validate
+///
+/// # Returns
+/// * `Ok(())` if valid
+/// * `Err(message)` if invalid
+///
+/// # Example valid references:
+/// * `alpine`
+/// * `alpine:latest`
+/// * `alpine:3.18`
+/// * `library/alpine`
+/// * `docker.io/library/alpine:latest`
+/// * `ghcr.io/owner/repo:tag`
+/// * `alpine@sha256:abc123...`
+pub fn validate_image_reference(image: &str) -> Result<(), String> {
+    // Check length
+    if image.is_empty() {
+        return Err("image reference cannot be empty".into());
+    }
+    if image.len() > MAX_IMAGE_REF_LENGTH {
+        return Err(format!(
+            "image reference too long: {} bytes (max: {})",
+            image.len(),
+            MAX_IMAGE_REF_LENGTH
+        ));
+    }
+
+    // Check for obviously dangerous characters that could enable injection
+    // These should never appear in valid OCI references
+    let forbidden_chars = ['$', '`', '|', ';', '&', '>', '<', '\n', '\r', '\0'];
+    for c in forbidden_chars {
+        if image.contains(c) {
+            return Err(format!(
+                "image reference contains forbidden character: {:?}",
+                c
+            ));
+        }
+    }
+
+    // Check for shell metacharacters in sequence
+    if image.contains("..") && image.contains('/') {
+        // Path traversal attempt
+        return Err("image reference contains suspicious path traversal".into());
+    }
+
+    // Basic format validation: must have at least one valid character
+    // Valid characters: alphanumeric, '.', '-', '_', '/', ':', '@'
+    let valid_chars = |c: char| {
+        c.is_ascii_alphanumeric()
+            || c == '.'
+            || c == '-'
+            || c == '_'
+            || c == '/'
+            || c == ':'
+            || c == '@'
+    };
+
+    if !image.chars().all(valid_chars) {
+        return Err("image reference contains invalid characters".into());
+    }
+
+    // Must not start or end with special characters
+    // Note: We already checked for empty above, but use defensive programming
+    let first = match image.chars().next() {
+        Some(c) => c,
+        None => return Err("image reference is empty".into()),
+    };
+    let last = match image.chars().last() {
+        Some(c) => c,
+        None => return Err("image reference is empty".into()),
+    };
+
+    if !first.is_ascii_alphanumeric() {
+        return Err("image reference must start with alphanumeric character".into());
+    }
+    if !last.is_ascii_alphanumeric() {
+        return Err("image reference must end with alphanumeric character".into());
+    }
+
+    Ok(())
+}
+
+/// Validate environment variables.
+///
+/// Environment variable keys must:
+/// - Not be empty
+/// - Start with a letter or underscore
+/// - Contain only alphanumeric characters and underscores
+/// - Not exceed 256 characters
+///
+/// Values can be any string but must not exceed 32KB.
+pub fn validate_env_vars(env: &[(String, String)]) -> Result<(), String> {
+    const MAX_KEY_LEN: usize = 256;
+    const MAX_VALUE_LEN: usize = 32 * 1024; // 32KB
+
+    for (key, value) in env {
+        // Key validation
+        if key.is_empty() {
+            return Err("environment variable key cannot be empty".into());
+        }
+
+        if key.len() > MAX_KEY_LEN {
+            return Err(format!(
+                "environment variable key '{}...' exceeds {} character limit",
+                &key[..32.min(key.len())],
+                MAX_KEY_LEN
+            ));
+        }
+
+        // Key must start with letter or underscore
+        let first_char = key.chars().next().unwrap();
+        if !first_char.is_ascii_alphabetic() && first_char != '_' {
+            return Err(format!(
+                "environment variable key '{}' must start with a letter or underscore",
+                key
+            ));
+        }
+
+        // Key must contain only alphanumeric and underscore
+        if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!(
+                "environment variable key '{}' contains invalid characters (only alphanumeric and underscore allowed)",
+                key
+            ));
+        }
+
+        // Value length validation
+        if value.len() > MAX_VALUE_LEN {
+            return Err(format!(
+                "environment variable '{}' value exceeds {} byte limit",
+                key, MAX_VALUE_LEN
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Generate a unique container ID.
+///
+/// Uses a combination of timestamp and random bytes to ensure uniqueness
+/// even when containers are created in rapid succession.
 pub fn generate_container_id() -> String {
+    use std::fs::File;
+    use std::io::Read;
+
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
 
-    // Use lower 48 bits of timestamp + some randomness from the upper bits
-    format!("smolvm-{:012x}", timestamp & 0xFFFF_FFFF_FFFF)
+    // Get 4 bytes of randomness from /dev/urandom
+    let random_bytes: u32 = File::open("/dev/urandom")
+        .and_then(|mut f| {
+            let mut buf = [0u8; 4];
+            f.read_exact(&mut buf)?;
+            Ok(u32::from_ne_bytes(buf))
+        })
+        .unwrap_or_else(|_| {
+            // Fallback: use process ID and more timestamp bits if /dev/urandom fails
+            std::process::id() ^ ((timestamp >> 32) as u32)
+        });
+
+    // Combine lower 32 bits of timestamp with 32 bits of randomness
+    format!(
+        "smolvm-{:08x}{:08x}",
+        (timestamp & 0xFFFF_FFFF) as u32,
+        random_bytes
+    )
 }
 
 /// Default Linux capabilities for root containers.
@@ -284,6 +480,73 @@ fn default_capabilities() -> Vec<String> {
         "CAP_SYS_CHROOT".to_string(),
         "CAP_KILL".to_string(),
         "CAP_AUDIT_WRITE".to_string(),
+    ]
+}
+
+/// Default device nodes for container execution.
+/// These are standard Linux devices that should exist in /dev.
+fn default_devices() -> Vec<OciDevice> {
+    vec![
+        // /dev/null - discard all writes, reads return EOF
+        OciDevice {
+            device_type: "c".to_string(),
+            path: "/dev/null".to_string(),
+            major: 1,
+            minor: 3,
+            file_mode: Some(0o666),
+            uid: Some(0),
+            gid: Some(0),
+        },
+        // /dev/zero - reads return null bytes
+        OciDevice {
+            device_type: "c".to_string(),
+            path: "/dev/zero".to_string(),
+            major: 1,
+            minor: 5,
+            file_mode: Some(0o666),
+            uid: Some(0),
+            gid: Some(0),
+        },
+        // /dev/full - writes fail with ENOSPC
+        OciDevice {
+            device_type: "c".to_string(),
+            path: "/dev/full".to_string(),
+            major: 1,
+            minor: 7,
+            file_mode: Some(0o666),
+            uid: Some(0),
+            gid: Some(0),
+        },
+        // /dev/random - random number generator (blocking)
+        OciDevice {
+            device_type: "c".to_string(),
+            path: "/dev/random".to_string(),
+            major: 1,
+            minor: 8,
+            file_mode: Some(0o666),
+            uid: Some(0),
+            gid: Some(0),
+        },
+        // /dev/urandom - random number generator (non-blocking)
+        OciDevice {
+            device_type: "c".to_string(),
+            path: "/dev/urandom".to_string(),
+            major: 1,
+            minor: 9,
+            file_mode: Some(0o666),
+            uid: Some(0),
+            gid: Some(0),
+        },
+        // /dev/tty - controlling terminal
+        OciDevice {
+            device_type: "c".to_string(),
+            path: "/dev/tty".to_string(),
+            major: 5,
+            minor: 0,
+            file_mode: Some(0o666),
+            uid: Some(0),
+            gid: Some(0),
+        },
     ]
 }
 
@@ -382,13 +645,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_validate_image_reference_valid() {
+        // Valid references should pass
+        assert!(validate_image_reference("alpine").is_ok());
+        assert!(validate_image_reference("alpine:latest").is_ok());
+        assert!(validate_image_reference("alpine:3.18").is_ok());
+        assert!(validate_image_reference("library/alpine").is_ok());
+        assert!(validate_image_reference("docker.io/library/alpine").is_ok());
+        assert!(validate_image_reference("ghcr.io/owner/repo:tag").is_ok());
+        assert!(validate_image_reference("my-registry.com/my-image:v1.0.0").is_ok());
+        assert!(validate_image_reference("alpine@sha256:abc123def456").is_ok());
+    }
+
+    #[test]
+    fn test_validate_image_reference_invalid() {
+        // Empty
+        assert!(validate_image_reference("").is_err());
+
+        // Forbidden characters (shell injection)
+        assert!(validate_image_reference("alpine; rm -rf /").is_err());
+        assert!(validate_image_reference("alpine | cat /etc/passwd").is_err());
+        assert!(validate_image_reference("alpine`whoami`").is_err());
+        assert!(validate_image_reference("alpine$PATH").is_err());
+        assert!(validate_image_reference("alpine > /tmp/x").is_err());
+        assert!(validate_image_reference("alpine\nmalicious").is_err());
+
+        // Invalid characters
+        assert!(validate_image_reference("alpine image").is_err()); // space
+        assert!(validate_image_reference("alpine!").is_err());
+
+        // Must start/end with alphanumeric
+        assert!(validate_image_reference("/alpine").is_err());
+        assert!(validate_image_reference("alpine:").is_err());
+        assert!(validate_image_reference("-alpine").is_err());
+    }
+
+    #[test]
+    fn test_validate_image_reference_length() {
+        // Very long reference should fail
+        let long_ref = "a".repeat(600);
+        assert!(validate_image_reference(&long_ref).is_err());
+
+        // Just under limit should pass
+        let ok_ref = "a".repeat(500);
+        assert!(validate_image_reference(&ok_ref).is_ok());
+    }
+
+    #[test]
     fn test_generate_container_id() {
         let id1 = generate_container_id();
         let id2 = generate_container_id();
 
         assert!(id1.starts_with("smolvm-"));
         assert!(id2.starts_with("smolvm-"));
-        // IDs should be unique (different timestamps)
+        // ID format: smolvm-{8 hex}{8 hex} = "smolvm-" (7) + 16 hex chars = 23 total
+        assert_eq!(id1.len(), 23);
+        assert_eq!(id2.len(), 23);
+        // IDs should be unique (different timestamps + random bytes)
         assert_ne!(id1, id2);
     }
 
@@ -416,5 +729,48 @@ mod tests {
         assert_eq!(mount.destination, "/container/path");
         assert_eq!(mount.source, "/host/path");
         assert!(mount.options.contains(&"ro".to_string()));
+    }
+
+    #[test]
+    fn test_validate_env_vars_valid() {
+        // Valid env vars should pass
+        assert!(validate_env_vars(&[]).is_ok());
+        assert!(validate_env_vars(&[("FOO".to_string(), "bar".to_string())]).is_ok());
+        assert!(validate_env_vars(&[("_FOO".to_string(), "bar".to_string())]).is_ok());
+        assert!(validate_env_vars(&[("FOO_BAR".to_string(), "baz".to_string())]).is_ok());
+        assert!(validate_env_vars(&[("FOO123".to_string(), "value".to_string())]).is_ok());
+        assert!(validate_env_vars(&[("PATH".to_string(), "/usr/bin:/bin".to_string())]).is_ok());
+        // Empty values are allowed
+        assert!(validate_env_vars(&[("EMPTY".to_string(), "".to_string())]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_env_vars_invalid_keys() {
+        // Empty key
+        assert!(validate_env_vars(&[("".to_string(), "value".to_string())]).is_err());
+
+        // Key starting with number
+        assert!(validate_env_vars(&[("1FOO".to_string(), "value".to_string())]).is_err());
+
+        // Key with invalid characters
+        assert!(validate_env_vars(&[("FOO-BAR".to_string(), "value".to_string())]).is_err());
+        assert!(validate_env_vars(&[("FOO.BAR".to_string(), "value".to_string())]).is_err());
+        assert!(validate_env_vars(&[("FOO BAR".to_string(), "value".to_string())]).is_err());
+        assert!(validate_env_vars(&[("FOO=BAR".to_string(), "value".to_string())]).is_err());
+    }
+
+    #[test]
+    fn test_validate_env_vars_length_limits() {
+        // Key too long (> 256 chars)
+        let long_key = "A".repeat(300);
+        assert!(validate_env_vars(&[(long_key, "value".to_string())]).is_err());
+
+        // Value too long (> 32KB)
+        let long_value = "x".repeat(33 * 1024);
+        assert!(validate_env_vars(&[("KEY".to_string(), long_value)]).is_err());
+
+        // Values just under limit should pass
+        let ok_value = "x".repeat(32 * 1024);
+        assert!(validate_env_vars(&[("KEY".to_string(), ok_value)]).is_ok());
     }
 }
