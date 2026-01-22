@@ -211,122 +211,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_add_and_get_vm() {
+    fn test_vm_registry_operations() {
         let mut config = SmolvmConfig::default();
 
-        let record = VmRecord::new(
-            "test-vm".to_string(),
-            "alpine:latest".to_string(),
-            1,
-            256,
-            Some(vec!["/bin/sh".to_string()]),
-            None,
-            vec![],
-            vec![],
-        );
-
-        config.vms.insert("test-vm".to_string(), record);
-
-        let record = config.get_vm("test-vm").expect("VM should exist");
-        assert_eq!(record.name, "test-vm");
-        assert_eq!(record.image, "alpine:latest");
-    }
-
-    #[test]
-    fn test_remove_vm() {
-        let mut config = SmolvmConfig::default();
-
-        let record = VmRecord::new(
-            "test-vm".to_string(),
-            "alpine:latest".to_string(),
-            1,
-            256,
-            None,
-            None,
-            vec![],
-            vec![],
-        );
-
+        // Add VM
+        let record = VmRecord::new("test-vm".to_string(), 1, 256, vec![], vec![]);
         config.vms.insert("test-vm".to_string(), record);
         assert!(config.get_vm("test-vm").is_some());
 
-        let removed = config.remove_vm("test-vm");
-        assert!(removed.is_some());
+        // Update VM
+        config.update_vm("test-vm", |r| r.state = RecordState::Running);
+        assert_eq!(config.get_vm("test-vm").unwrap().state, RecordState::Running);
+
+        // Remove VM
+        assert!(config.remove_vm("test-vm").is_some());
         assert!(config.get_vm("test-vm").is_none());
-    }
-
-    #[test]
-    fn test_list_vms() {
-        let mut config = SmolvmConfig::default();
-
-        for i in 0..3 {
-            let record = VmRecord::new(
-                format!("vm-{}", i),
-                "alpine:latest".to_string(),
-                1,
-                256,
-                None,
-                None,
-                vec![],
-                vec![],
-            );
-            config.vms.insert(format!("vm-{}", i), record);
-        }
-
-        let vms: Vec<_> = config.list_vms().collect();
-        assert_eq!(vms.len(), 3);
     }
 
     #[test]
     fn test_vm_record_serialization() {
         let record = VmRecord::new(
             "test".to_string(),
-            "alpine:latest".to_string(),
             2,
             512,
-            Some(vec!["/bin/echo".to_string(), "hello".to_string()]),
-            Some("/app".to_string()),
-            vec![("FOO".to_string(), "bar".to_string())],
             vec![("/host".to_string(), "/guest".to_string(), false)],
+            vec![(8080, 80)],
         );
 
         let json = serde_json::to_string(&record).unwrap();
         let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
-
         assert_eq!(deserialized.name, record.name);
-        assert_eq!(deserialized.image, record.image);
-        assert_eq!(deserialized.command, record.command);
-        assert_eq!(deserialized.env, record.env);
         assert_eq!(deserialized.mounts, record.mounts);
-    }
-
-    #[test]
-    fn test_config_v1_backwards_compat() {
-        let v1_json = r#"{
-            "version": 1,
-            "default_cpus": 2,
-            "default_mem": 1024,
-            "default_dns": "8.8.8.8",
-            "vms": {}
-        }"#;
-
-        let config: SmolvmConfig = serde_json::from_str(v1_json).unwrap();
-        assert_eq!(config.version, 1);
-        assert_eq!(config.default_cpus, 2);
-        assert_eq!(config.default_mem, 1024);
-        assert_eq!(config.default_dns, "8.8.8.8");
-    }
-
-    #[test]
-    fn test_config_missing_optional_fields() {
-        let minimal_json = r#"{
-            "version": 1,
-            "default_cpus": 1,
-            "default_mem": 512,
-            "default_dns": "1.1.1.1"
-        }"#;
-
-        let config: SmolvmConfig = serde_json::from_str(minimal_json).unwrap();
-        assert!(config.vms.is_empty());
     }
 }

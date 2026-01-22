@@ -28,6 +28,9 @@ enum Commands {
     /// Manage containers inside the microvm
     #[command(subcommand)]
     Container(cli::container::ContainerCmd),
+
+    /// Start the HTTP API server
+    Serve(cli::serve::ServeCmd),
 }
 
 fn main() {
@@ -43,6 +46,7 @@ fn main() {
         Commands::Sandbox(cmd) => cmd.run(),
         Commands::Microvm(cmd) => cmd.run(),
         Commands::Container(cmd) => cmd.run(),
+        Commands::Serve(cmd) => cmd.run(),
     };
 
     // Handle errors
