@@ -68,6 +68,7 @@
 pub mod agent;
 pub mod api;
 pub mod config;
+pub mod db;
 pub mod error;
 pub mod mount;
 pub mod network;
@@ -81,6 +82,7 @@ pub mod vm;
 // Re-export main types for convenience
 pub use agent::{AgentClient, AgentManager};
 pub use config::{RecordState, SmolvmConfig, VmRecord};
+pub use db::SmolvmDb;
 pub use error::{Error, Result};
 pub use process::ChildProcess;
 pub use vm::config::{HostMount, NetworkPolicy, Resources, RootfsSource, Timeouts, VmConfig, VmId};

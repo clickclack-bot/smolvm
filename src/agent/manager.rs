@@ -357,9 +357,6 @@ impl AgentManager {
         ports: Vec<PortMapping>,
         resources: VmResources,
     ) -> Result<()> {
-        // Install SIGCHLD handler to automatically reap zombie children
-        crate::process::install_sigchld_handler();
-
         // Check and update state
         {
             let mut inner = self.inner.lock().unwrap();
@@ -398,6 +395,11 @@ impl AgentManager {
             tracing::warn!(error = %e, "failed to pre-format disk on host, will format in VM");
             // Don't fail - VM can still format the disk (just slower)
         }
+
+        // Install SIGCHLD handler to automatically reap zombie children.
+        // This must be done AFTER ensure_formatted() because the handler
+        // reaps all children, which interferes with Command::output().
+        crate::process::install_sigchld_handler();
 
         // Clean up old socket
         let _ = std::fs::remove_file(&self.vsock_socket);

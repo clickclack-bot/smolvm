@@ -88,6 +88,10 @@ pub enum Error {
     #[error("failed to save config: {0}")]
     ConfigSave(String),
 
+    /// Database error.
+    #[error("database error: {0}")]
+    Database(String),
+
     // Command execution errors
     /// External command failed.
     #[error("command failed: {command}: {message}")]

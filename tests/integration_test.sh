@@ -339,6 +339,110 @@ test_timeout() {
 }
 
 # =============================================================================
+# Database Persistence Tests
+# =============================================================================
+
+test_db_persistence_across_restart() {
+    # Test that VM configuration persists across process restarts
+
+    # Create a named VM with specific configuration
+    local vm_name="db-test-vm-$$"
+    $SMOLVM microvm create "$vm_name" --cpus 2 --mem 1024 2>&1
+
+    # Verify it was created
+    local list_output
+    list_output=$($SMOLVM microvm ls --json 2>&1)
+    if [[ "$list_output" != *"$vm_name"* ]]; then
+        echo "VM was not created"
+        return 1
+    fi
+
+    # Verify the configuration is correct (this exercises the database read)
+    if [[ "$list_output" != *'"cpus": 2'* ]] || [[ "$list_output" != *'"memory_mib": 1024'* ]]; then
+        echo "VM configuration not persisted correctly"
+        $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    fi
+
+    # List again (simulates a "restart" by re-reading from database)
+    local list_output2
+    list_output2=$($SMOLVM microvm ls --json 2>&1)
+
+    # Clean up
+    $SMOLVM microvm delete "$vm_name" -f 2>&1
+
+    # Verify the data was consistent
+    [[ "$list_output" == "$list_output2" ]]
+}
+
+test_db_vm_state_update() {
+    # Test that VM state updates are persisted to database
+
+    # Create a named VM
+    local vm_name="db-state-test-$$"
+    $SMOLVM microvm create "$vm_name" 2>&1
+
+    # Check initial state is "created"
+    local initial_state
+    initial_state=$($SMOLVM microvm ls --json 2>&1)
+    if [[ "$initial_state" != *'"state": "created"'* ]]; then
+        echo "Initial state should be 'created'"
+        $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    fi
+
+    # Start the VM
+    $SMOLVM microvm start "$vm_name" 2>&1
+
+    # Check state changed to "running"
+    local running_state
+    running_state=$($SMOLVM microvm ls --json 2>&1)
+    if [[ "$running_state" != *'"state": "running"'* ]]; then
+        echo "State should be 'running' after start"
+        $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+        $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    fi
+
+    # Stop the VM
+    $SMOLVM microvm stop "$vm_name" 2>&1
+
+    # Check state changed to "stopped"
+    local stopped_state
+    stopped_state=$($SMOLVM microvm ls --json 2>&1)
+
+    # Clean up
+    $SMOLVM microvm delete "$vm_name" -f 2>&1
+
+    [[ "$stopped_state" == *'"state": "stopped"'* ]]
+}
+
+test_db_delete_removes_from_db() {
+    # Test that deleting a VM removes it from the database
+
+    # Create a VM
+    local vm_name="db-delete-test-$$"
+    $SMOLVM microvm create "$vm_name" 2>&1
+
+    # Verify it exists
+    local before_delete
+    before_delete=$($SMOLVM microvm ls --json 2>&1)
+    if [[ "$before_delete" != *"$vm_name"* ]]; then
+        echo "VM should exist before delete"
+        return 1
+    fi
+
+    # Delete it
+    $SMOLVM microvm delete "$vm_name" -f 2>&1
+
+    # Verify it's gone
+    local after_delete
+    after_delete=$($SMOLVM microvm ls --json 2>&1)
+
+    [[ "$after_delete" != *"$vm_name"* ]]
+}
+
+# =============================================================================
 # Run Tests
 # =============================================================================
 
@@ -368,6 +472,11 @@ run_test "Container ID format" test_container_id_format || true
 
 # Timeout test
 run_test "Command timeout" test_timeout || true
+
+# Database persistence tests
+run_test "DB persistence across restart" test_db_persistence_across_restart || true
+run_test "DB VM state update" test_db_vm_state_update || true
+run_test "DB delete removes from database" test_db_delete_removes_from_db || true
 
 # =============================================================================
 # Summary

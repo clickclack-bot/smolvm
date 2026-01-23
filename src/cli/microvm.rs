@@ -242,9 +242,8 @@ impl CreateCmd {
             ports,
         );
 
-        // Store in config
-        config.vms.insert(self.name.clone(), record);
-        config.save()?;
+        // Store in config (persisted immediately to database)
+        config.insert_vm(self.name.clone(), record)?;
 
         println!("Created microvm: {}", self.name);
         println!("  CPUs: {}, Memory: {} MiB", self.cpus, self.mem);

@@ -2,8 +2,13 @@
 //!
 //! This module handles persistent configuration storage for smolvm,
 //! including default settings and VM registry.
+//!
+//! State is persisted to a redb database at `~/.local/share/smolvm/server/smolvm.redb`.
+//! For backward compatibility, `SmolvmConfig` maintains an in-memory cache of VMs
+//! and provides the same API as the old confy-based implementation.
 
-use crate::error::{Error, Result};
+use crate::db::SmolvmDb;
+use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -33,37 +38,34 @@ impl std::fmt::Display for RecordState {
     }
 }
 
-/// Application name for config file storage.
-const APP_NAME: &str = "smolvm";
-
-/// Global smolvm configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Global smolvm configuration with database-backed persistence.
+///
+/// This struct provides backward-compatible access to VM records while
+/// using redb for ACID-compliant storage. The `vms` field is an in-memory
+/// cache that is kept in sync with the database.
+#[derive(Debug, Clone)]
 pub struct SmolvmConfig {
+    /// Database handle for persistence.
+    db: SmolvmDb,
     /// Configuration format version.
     pub version: u8,
-
     /// Default number of vCPUs for new VMs.
     pub default_cpus: u8,
-
     /// Default memory in MiB for new VMs.
     pub default_mem: u32,
-
     /// Default DNS server for VMs with network egress.
     pub default_dns: String,
-
     /// Storage volume path (macOS only, for case-sensitive filesystem).
     #[cfg(target_os = "macos")]
-    #[serde(default)]
     pub storage_volume: String,
-
-    /// Registry of known VMs (by name).
-    #[serde(default)]
+    /// Registry of known VMs (by name) - in-memory cache.
     pub vms: HashMap<String, VmRecord>,
 }
 
 impl Default for SmolvmConfig {
     fn default() -> Self {
         Self {
+            db: SmolvmDb::open().expect("failed to open database"),
             version: 1,
             default_cpus: 1,
             default_mem: 512,
@@ -76,20 +78,83 @@ impl Default for SmolvmConfig {
 }
 
 impl SmolvmConfig {
-    /// Load configuration from disk.
+    /// Load configuration from the database.
     ///
-    /// If the configuration file doesn't exist, returns the default configuration.
+    /// Opens the database and loads all VM records into the in-memory cache.
+    /// If this is the first run and an old confy config exists, it will be
+    /// migrated automatically.
     pub fn load() -> Result<Self> {
-        confy::load(APP_NAME, None).map_err(|e| Error::ConfigLoad(e.to_string()))
+        let db = SmolvmDb::open()?;
+
+        // Load global config settings with defaults
+        let version = db
+            .get_config("version")?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let default_cpus = db
+            .get_config("default_cpus")?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let default_mem = db
+            .get_config("default_mem")?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(512);
+        let default_dns = db
+            .get_config("default_dns")?
+            .unwrap_or_else(|| "1.1.1.1".to_string());
+
+        #[cfg(target_os = "macos")]
+        let storage_volume = db.get_config("storage_volume")?.unwrap_or_default();
+
+        // Load all VMs into cache
+        let vms = db.load_all_vms()?;
+
+        Ok(Self {
+            db,
+            version,
+            default_cpus,
+            default_mem,
+            default_dns,
+            #[cfg(target_os = "macos")]
+            storage_volume,
+            vms,
+        })
     }
 
-    /// Save configuration to disk.
+    /// Save configuration to the database.
+    ///
+    /// This is now a no-op for VM records since writes are immediate.
+    /// Global config changes are persisted here.
     pub fn save(&self) -> Result<()> {
-        confy::store(APP_NAME, None, self).map_err(|e| Error::ConfigSave(e.to_string()))
+        // Persist global config settings
+        self.db.set_config("version", &self.version.to_string())?;
+        self.db
+            .set_config("default_cpus", &self.default_cpus.to_string())?;
+        self.db
+            .set_config("default_mem", &self.default_mem.to_string())?;
+        self.db.set_config("default_dns", &self.default_dns)?;
+
+        #[cfg(target_os = "macos")]
+        if !self.storage_volume.is_empty() {
+            self.db.set_config("storage_volume", &self.storage_volume)?;
+        }
+
+        Ok(())
+    }
+
+    /// Insert a VM record (persists immediately to database).
+    pub fn insert_vm(&mut self, name: String, record: VmRecord) -> Result<()> {
+        self.db.insert_vm(&name, &record)?;
+        self.vms.insert(name, record);
+        Ok(())
     }
 
     /// Remove a VM from the registry.
     pub fn remove_vm(&mut self, id: &str) -> Option<VmRecord> {
+        // Remove from database (ignore errors, just log)
+        if let Err(e) = self.db.remove_vm(id) {
+            tracing::warn!(error = %e, vm = %id, "failed to remove VM from database");
+        }
         self.vms.remove(id)
     }
 
@@ -103,17 +168,26 @@ impl SmolvmConfig {
         self.vms.iter()
     }
 
-    /// Update a VM record in place.
+    /// Update a VM record in place (persists immediately to database).
     pub fn update_vm<F>(&mut self, id: &str, f: F) -> Option<()>
     where
         F: FnOnce(&mut VmRecord),
     {
         if let Some(record) = self.vms.get_mut(id) {
             f(record);
+            // Persist to database
+            if let Err(e) = self.db.insert_vm(id, record) {
+                tracing::warn!(error = %e, vm = %id, "failed to persist VM update");
+            }
             Some(())
         } else {
             None
         }
+    }
+
+    /// Get the underlying database handle.
+    pub fn db(&self) -> &SmolvmDb {
+        &self.db
     }
 }
 
@@ -211,24 +285,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_vm_registry_operations() {
-        let mut config = SmolvmConfig::default();
-
-        // Add VM
-        let record = VmRecord::new("test-vm".to_string(), 1, 256, vec![], vec![]);
-        config.vms.insert("test-vm".to_string(), record);
-        assert!(config.get_vm("test-vm").is_some());
-
-        // Update VM
-        config.update_vm("test-vm", |r| r.state = RecordState::Running);
-        assert_eq!(config.get_vm("test-vm").unwrap().state, RecordState::Running);
-
-        // Remove VM
-        assert!(config.remove_vm("test-vm").is_some());
-        assert!(config.get_vm("test-vm").is_none());
-    }
-
-    #[test]
     fn test_vm_record_serialization() {
         let record = VmRecord::new(
             "test".to_string(),
@@ -242,5 +298,13 @@ mod tests {
         let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, record.name);
         assert_eq!(deserialized.mounts, record.mounts);
+    }
+
+    #[test]
+    fn test_record_state_display() {
+        assert_eq!(RecordState::Created.to_string(), "created");
+        assert_eq!(RecordState::Running.to_string(), "running");
+        assert_eq!(RecordState::Stopped.to_string(), "stopped");
+        assert_eq!(RecordState::Failed.to_string(), "failed");
     }
 }

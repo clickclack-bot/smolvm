@@ -3,7 +3,8 @@
 use crate::agent::{AgentManager, HostMount, PortMapping, VmResources};
 use crate::api::error::ApiError;
 use crate::api::types::{MountInfo, MountSpec, PortSpec, ResourceSpec, SandboxInfo};
-use crate::config::{RecordState, SmolvmConfig, VmRecord};
+use crate::config::{RecordState, VmRecord};
+use crate::db::SmolvmDb;
 use crate::mount::validate_mount;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -13,8 +14,8 @@ use std::sync::Arc;
 pub struct ApiState {
     /// Registry of sandbox managers by name.
     sandboxes: RwLock<HashMap<String, Arc<parking_lot::Mutex<SandboxEntry>>>>,
-    /// Persistent configuration.
-    config: RwLock<SmolvmConfig>,
+    /// Database for persistent state.
+    db: SmolvmDb,
 }
 
 /// Internal sandbox entry with manager and configuration.
@@ -30,22 +31,29 @@ pub struct SandboxEntry {
 }
 
 impl ApiState {
-    /// Create a new API state, loading persisted config.
+    /// Create a new API state, opening the database.
     pub fn new() -> Self {
-        let config = SmolvmConfig::load().unwrap_or_default();
+        let db = SmolvmDb::open().expect("failed to open database");
         Self {
             sandboxes: RwLock::new(HashMap::new()),
-            config: RwLock::new(config),
+            db,
         }
     }
 
-    /// Load existing sandboxes from persistent config.
+    /// Load existing sandboxes from persistent database.
     /// Call this on server startup to reconnect to running VMs.
     pub fn load_persisted_sandboxes(&self) -> Vec<String> {
-        let config = self.config.read();
+        let vms = match self.db.list_vms() {
+            Ok(vms) => vms,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to load VMs from database");
+                return Vec::new();
+            }
+        };
+
         let mut loaded = Vec::new();
 
-        for (name, record) in config.vms.iter() {
+        for (name, record) in vms {
             // Check if VM process is still alive
             if !record.is_process_alive() {
                 tracing::info!(sandbox = %name, "skipping dead sandbox");
@@ -78,7 +86,7 @@ impl ApiState {
             };
 
             // Create AgentManager and try to reconnect
-            match AgentManager::for_vm(name) {
+            match AgentManager::for_vm(&name) {
                 Ok(manager) => {
                     // Try to reconnect to existing running VM
                     if manager.try_connect_existing_with_pid(record.pid).is_some() {
@@ -107,7 +115,7 @@ impl ApiState {
         loaded
     }
 
-    /// Register a new sandbox (also persists to config).
+    /// Register a new sandbox (also persists to database).
     pub fn register_sandbox(
         &self,
         name: String,
@@ -127,20 +135,20 @@ impl ApiState {
             }
         }
 
-        // Persist to config
-        {
-            let mut config = self.config.write();
-            let record = VmRecord::new(
-                name.clone(),
-                resources.cpus.unwrap_or(crate::agent::DEFAULT_CPUS),
-                resources.memory_mb.unwrap_or(crate::agent::DEFAULT_MEMORY_MIB),
-                mounts.iter().map(|m| (m.source.clone(), m.target.clone(), m.readonly)).collect(),
-                ports.iter().map(|p| (p.host, p.guest)).collect(),
-            );
-            config.vms.insert(name.clone(), record);
-            if let Err(e) = config.save() {
-                tracing::warn!(error = %e, "failed to persist sandbox config");
-            }
+        // Persist to database
+        let record = VmRecord::new(
+            name.clone(),
+            resources.cpus.unwrap_or(crate::agent::DEFAULT_CPUS),
+            resources.memory_mb.unwrap_or(crate::agent::DEFAULT_MEMORY_MIB),
+            mounts
+                .iter()
+                .map(|m| (m.source.clone(), m.target.clone(), m.readonly))
+                .collect(),
+            ports.iter().map(|p| (p.host, p.guest)).collect(),
+        );
+
+        if let Err(e) = self.db.insert_vm(&name, &record) {
+            tracing::warn!(error = %e, "failed to persist sandbox to database");
         }
 
         // Add to in-memory registry
@@ -158,7 +166,10 @@ impl ApiState {
     }
 
     /// Get a sandbox entry by name.
-    pub fn get_sandbox(&self, name: &str) -> Result<Arc<parking_lot::Mutex<SandboxEntry>>, ApiError> {
+    pub fn get_sandbox(
+        &self,
+        name: &str,
+    ) -> Result<Arc<parking_lot::Mutex<SandboxEntry>>, ApiError> {
         let sandboxes = self.sandboxes.read();
         sandboxes
             .get(name)
@@ -166,8 +177,11 @@ impl ApiState {
             .ok_or_else(|| ApiError::NotFound(format!("sandbox '{}' not found", name)))
     }
 
-    /// Remove a sandbox from the registry (also removes from config).
-    pub fn remove_sandbox(&self, name: &str) -> Result<Arc<parking_lot::Mutex<SandboxEntry>>, ApiError> {
+    /// Remove a sandbox from the registry (also removes from database).
+    pub fn remove_sandbox(
+        &self,
+        name: &str,
+    ) -> Result<Arc<parking_lot::Mutex<SandboxEntry>>, ApiError> {
         // Remove from in-memory registry
         let entry = {
             let mut sandboxes = self.sandboxes.write();
@@ -176,27 +190,21 @@ impl ApiState {
                 .ok_or_else(|| ApiError::NotFound(format!("sandbox '{}' not found", name)))?
         };
 
-        // Remove from persistent config
-        {
-            let mut config = self.config.write();
-            config.vms.remove(name);
-            if let Err(e) = config.save() {
-                tracing::warn!(error = %e, "failed to persist sandbox removal");
-            }
+        // Remove from database
+        if let Err(e) = self.db.remove_vm(name) {
+            tracing::warn!(error = %e, "failed to remove sandbox from database");
         }
 
         Ok(entry)
     }
 
-    /// Update sandbox state in config (call after start/stop).
+    /// Update sandbox state in database (call after start/stop).
     pub fn update_sandbox_state(&self, name: &str, state: RecordState, pid: Option<i32>) {
-        let mut config = self.config.write();
-        if let Some(record) = config.vms.get_mut(name) {
+        if let Err(e) = self.db.update_vm(name, |record| {
             record.state = state;
             record.pid = pid;
-            if let Err(e) = config.save() {
-                tracing::warn!(error = %e, "failed to persist sandbox state");
-            }
+        }) {
+            tracing::warn!(error = %e, "failed to persist sandbox state");
         }
     }
 
@@ -250,6 +258,11 @@ impl ApiState {
                 }
             }
         }
+    }
+
+    /// Get the underlying database handle.
+    pub fn db(&self) -> &SmolvmDb {
+        &self.db
     }
 }
 
@@ -318,15 +331,26 @@ mod tests {
 
     #[test]
     fn test_type_conversions() {
-        // MountSpec -> HostMount preserves readonly flag
-        let spec = MountSpec { source: "/host".into(), target: "/guest".into(), readonly: true };
+        // MountSpec -> HostMount preserves readonly flag (use /tmp which exists)
+        let spec = MountSpec {
+            source: "/tmp".into(),
+            target: "/guest".into(),
+            readonly: true,
+        };
         assert!(mount_spec_to_host_mount(&spec).unwrap().read_only);
 
-        let spec = MountSpec { source: "/host".into(), target: "/guest".into(), readonly: false };
+        let spec = MountSpec {
+            source: "/tmp".into(),
+            target: "/guest".into(),
+            readonly: false,
+        };
         assert!(!mount_spec_to_host_mount(&spec).unwrap().read_only);
 
         // ResourceSpec with None uses defaults
-        let spec = ResourceSpec { cpus: None, memory_mb: None };
+        let spec = ResourceSpec {
+            cpus: None,
+            memory_mb: None,
+        };
         let res = resource_spec_to_vm_resources(&spec);
         assert_eq!(res.cpus, crate::agent::DEFAULT_CPUS);
         assert_eq!(res.mem, crate::agent::DEFAULT_MEMORY_MIB);
@@ -335,7 +359,13 @@ mod tests {
     #[test]
     fn test_sandbox_not_found() {
         let state = ApiState::new();
-        assert!(matches!(state.get_sandbox("nope"), Err(ApiError::NotFound(_))));
-        assert!(matches!(state.remove_sandbox("nope"), Err(ApiError::NotFound(_))));
+        assert!(matches!(
+            state.get_sandbox("nope"),
+            Err(ApiError::NotFound(_))
+        ));
+        assert!(matches!(
+            state.remove_sandbox("nope"),
+            Err(ApiError::NotFound(_))
+        ));
     }
 }
