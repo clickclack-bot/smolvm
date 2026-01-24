@@ -157,7 +157,7 @@ impl ExecCmd {
         };
 
         // Keep microvm running (persistent)
-        std::mem::forget(manager);
+        manager.detach();
         std::process::exit(exit_code);
     }
 }
@@ -341,8 +341,8 @@ impl StartCmd {
         println!("MicroVM '{}' running (PID: {})", name, pid.unwrap_or(0));
         println!("\nUse 'smolvm container create {} <image>' to run containers", name);
 
-        // Keep microvm running
-        std::mem::forget(manager);
+        // Keep microvm running (persistent)
+        manager.detach();
         Ok(())
     }
 
@@ -356,7 +356,7 @@ impl StartCmd {
                 .map(|p| format!(" (PID: {})", p))
                 .unwrap_or_default();
             println!("MicroVM 'default' already running{}", pid);
-            std::mem::forget(manager);
+            manager.detach();
             return Ok(());
         }
 
@@ -366,7 +366,7 @@ impl StartCmd {
         let pid = manager.child_pid().unwrap_or(0);
         println!("MicroVM 'default' running (PID: {})", pid);
 
-        std::mem::forget(manager);
+        manager.detach();
         Ok(())
     }
 }
@@ -538,7 +538,7 @@ impl StatusCmd {
                 .map(|p| format!(" (PID: {})", p))
                 .unwrap_or_default();
             println!("MicroVM '{}': running{}", label, pid);
-            std::mem::forget(manager);
+            manager.detach();
         } else {
             println!("MicroVM '{}': stopped", label);
         }
@@ -674,7 +674,7 @@ impl NetworkTestCmd {
             serde_json::to_string_pretty(&result).unwrap_or_default()
         );
 
-        std::mem::forget(manager);
+        manager.detach();
         Ok(())
     }
 }
