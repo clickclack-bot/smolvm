@@ -1,9 +1,6 @@
 //! Network configuration.
 //!
 //! This module provides network policy configuration for VMs.
-//!
-//! Phase 0: Types and DNS configuration.
-//! Phase 1: Full NAT egress support via libkrun.
 
 use crate::vm::config::NetworkPolicy;
 use std::net::IpAddr;

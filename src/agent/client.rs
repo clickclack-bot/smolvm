@@ -622,7 +622,7 @@ impl AgentClient {
     }
 
     // ========================================================================
-    // Container Lifecycle (Phase 2/3)
+    // Container Lifecycle
     // ========================================================================
 
     /// Create a long-running container from an image.

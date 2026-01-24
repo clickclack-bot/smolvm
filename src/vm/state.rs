@@ -12,7 +12,7 @@ pub enum VmState {
     /// VM is booting.
     Booting,
 
-    /// VM is ready (guest agent connected) - Phase 1.
+    /// VM is ready (guest agent connected).
     Ready,
 
     /// VM is running workload.

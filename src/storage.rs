@@ -1,17 +1,18 @@
 //! Persistent storage management.
 //!
-//! This module provides types and utilities for managing persistent
-//! writable disks for VMs and shared OCI layer storage.
+//! This module provides [`StorageDisk`] for managing persistent storage.
+//! Each VM (default or named) gets its own sparse ext4 disk image that stores
+//! OCI layers, container overlays, and cached manifests.
 //!
-//! # Storage Types
+//! # Storage Locations
 //!
-//! - [`StorageDisk`]: Shared disk for OCI layer storage (used by helper VM)
-//! - [`WritableDisk`]: Per-VM writable overlay disk
+//! - Default VM: `~/Library/Application Support/smolvm/storage.raw` (macOS)
+//! - Named VMs: `~/Library/Caches/smolvm/vms/{name}/storage.img` (macOS)
 //!
 //! # Architecture
 //!
 //! The storage disk is a sparse raw disk image formatted with ext4.
-//! It's mounted inside the helper VM which handles OCI layer extraction
+//! It's mounted inside the agent VM which handles OCI layer extraction
 //! and overlay filesystem management.
 
 use crate::error::{Error, Result};
@@ -268,44 +269,6 @@ impl StorageDisk {
             std::fs::remove_file(&marker)?;
         }
         Ok(())
-    }
-}
-
-/// A writable disk image for VM state persistence.
-#[derive(Debug, Clone)]
-pub struct WritableDisk {
-    /// Path to the disk image file.
-    pub path: PathBuf,
-
-    /// Disk version information.
-    pub version: Option<DiskVersion>,
-
-    /// Size in bytes.
-    pub size_bytes: u64,
-}
-
-impl WritableDisk {
-    /// Default disk size (10 GB).
-    pub const DEFAULT_SIZE_MB: u64 = 10240;
-
-    /// Create a new writable disk (Phase 1 implementation).
-    ///
-    /// This is a placeholder that will be implemented in Phase 1.
-    pub fn create(
-        _path: &std::path::Path,
-        _size_mb: u64,
-        _base_digest: &str,
-    ) -> crate::error::Result<Self> {
-        Err(crate::error::Error::Storage(
-            "disk creation not yet implemented (Phase 1)".into(),
-        ))
-    }
-
-    /// Open an existing writable disk (Phase 1 implementation).
-    pub fn open(_path: &std::path::Path) -> crate::error::Result<Self> {
-        Err(crate::error::Error::Storage(
-            "disk open not yet implemented (Phase 1)".into(),
-        ))
     }
 }
 

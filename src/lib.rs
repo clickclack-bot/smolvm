@@ -41,17 +41,13 @@
 //!
 //! # Features
 //!
-//! ## Phase 0 (Current)
 //! - VM creation and lifecycle management
-//! - Rootfs from path
+//! - Rootfs from path or OCI images
 //! - Host directory mounts via virtiofs
 //! - Network egress via NAT
-//!
-//! ## Phase 1 (Planned)
 //! - vsock control channel
 //! - Persistent overlay disks
 //! - `exec` into running VMs
-//! - Clean shutdown protocol
 //!
 //! # Platform Support
 //!

@@ -338,7 +338,7 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             code: Some("INVALID_REQUEST".into()),
         },
 
-        // Container lifecycle (Phase 2/3)
+        // Container lifecycle
         AgentRequest::CreateContainer {
             image,
             command,
@@ -1392,7 +1392,7 @@ fn spawn_direct_interactive_command(
 }
 
 // ============================================================================
-// Container Lifecycle Handlers (Phase 2/3)
+// Container Lifecycle Handlers
 // ============================================================================
 
 fn handle_create_container(

@@ -2,9 +2,6 @@
 //!
 //! This module provides utilities for managing host directory mounts
 //! into guest VMs using virtiofs.
-//!
-//! Phase 0: Basic types and validation.
-//! Phase 1: Full virtiofs integration with the guest agent.
 
 use crate::api::types::{MountInfo, MountSpec};
 use crate::error::{Error, Result};

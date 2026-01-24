@@ -44,9 +44,6 @@ pub trait VmHandle: Send {
     /// This immediately terminates the VM without waiting for graceful shutdown.
     fn kill(&mut self) -> Result<()>;
 
-    // Phase 1: vsock-based control
-    // fn exec(&mut self, cmd: &[String]) -> Result<ExecHandle>;
-    // fn signal(&mut self, sig: i32) -> Result<()>;
 }
 
 /// Factory for creating VMs.
