@@ -10,6 +10,7 @@
 //! - ls: List all named VMs
 
 use crate::cli::parsers::{parse_duration, parse_env_spec, parse_mounts_as_tuples, parse_port};
+use crate::cli::{flush_output, format_pid_suffix, truncate};
 use clap::{Args, Subcommand};
 use smolvm::agent::{AgentClient, AgentManager, HostMount, PortMapping, VmResources};
 use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
@@ -108,8 +109,6 @@ pub struct ExecCmd {
 
 impl ExecCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        use std::io::Write;
-
         let manager = get_manager(&self.name)?;
         let label = microvm_label(&self.name);
 
@@ -151,8 +150,7 @@ impl ExecCmd {
             if !stderr.is_empty() {
                 eprint!("{}", stderr);
             }
-            let _ = std::io::stdout().flush();
-            let _ = std::io::stderr().flush();
+            flush_output();
             exit_code
         };
 
@@ -200,7 +198,7 @@ pub struct CreateCmd {
 
 impl CreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let mut config = SmolvmConfig::load().unwrap_or_default();
+        let mut config = SmolvmConfig::load()?;
 
         // Check if VM already exists
         if config.get_vm(&self.name).is_some() {
@@ -267,7 +265,7 @@ impl StartCmd {
         }
 
         let name = self.name.as_ref().unwrap();
-        let mut config = SmolvmConfig::load().unwrap_or_default();
+        let mut config = SmolvmConfig::load()?;
 
         // Get VM record
         let record = config
@@ -278,11 +276,8 @@ impl StartCmd {
         // Check state
         let actual_state = record.actual_state();
         if actual_state == RecordState::Running {
-            let pid = record
-                .pid
-                .map(|p| format!(" (PID: {})", p))
-                .unwrap_or_default();
-            println!("MicroVM '{}' already running{}", name, pid);
+            let pid_suffix = format_pid_suffix(record.pid);
+            println!("MicroVM '{}' already running{}", name, pid_suffix);
             return Ok(());
         }
 
@@ -347,15 +342,12 @@ impl StartCmd {
     }
 
     fn start_anonymous(&self) -> smolvm::Result<()> {
-        let manager = AgentManager::default()?;
+        let manager = AgentManager::new_default()?;
 
         // Check if already running
         if manager.try_connect_existing().is_some() {
-            let pid = manager
-                .child_pid()
-                .map(|p| format!(" (PID: {})", p))
-                .unwrap_or_default();
-            println!("MicroVM 'default' already running{}", pid);
+            let pid_suffix = format_pid_suffix(manager.child_pid());
+            println!("MicroVM 'default' already running{}", pid_suffix);
             manager.detach();
             return Ok(());
         }
@@ -393,7 +385,7 @@ impl StopCmd {
         }
 
         let name = self.name.as_ref().unwrap();
-        let mut config = SmolvmConfig::load().unwrap_or_default();
+        let mut config = SmolvmConfig::load()?;
 
         // Get VM record
         let record = match config.get_vm(name) {
@@ -432,7 +424,7 @@ impl StopCmd {
     }
 
     fn stop_anonymous(&self) -> smolvm::Result<()> {
-        let manager = AgentManager::default()?;
+        let manager = AgentManager::new_default()?;
 
         if manager.try_connect_existing().is_some() {
             println!("Stopping microvm 'default'...");
@@ -481,7 +473,7 @@ pub struct DeleteCmd {
 
 impl DeleteCmd {
     pub fn run(&self) -> smolvm::Result<()> {
-        let mut config = SmolvmConfig::load().unwrap_or_default();
+        let mut config = SmolvmConfig::load()?;
 
         // Check if VM exists
         if config.get_vm(&self.name).is_none() {
@@ -533,11 +525,8 @@ impl StatusCmd {
         let label = microvm_label(&self.name);
 
         if manager.try_connect_existing().is_some() {
-            let pid = manager
-                .child_pid()
-                .map(|p| format!(" (PID: {})", p))
-                .unwrap_or_default();
-            println!("MicroVM '{}': running{}", label, pid);
+            let pid_suffix = format_pid_suffix(manager.child_pid());
+            println!("MicroVM '{}': running{}", label, pid_suffix);
             manager.detach();
         } else {
             println!("MicroVM '{}': stopped", label);
@@ -567,7 +556,7 @@ pub struct LsCmd {
 
 impl LsCmd {
     pub fn run(&self) -> smolvm::Result<()> {
-        let config = SmolvmConfig::load().unwrap_or_default();
+        let config = SmolvmConfig::load()?;
         let vms: Vec<_> = config.list_vms().collect();
 
         if vms.is_empty() {
@@ -688,20 +677,11 @@ fn get_manager(name: &Option<String>) -> smolvm::Result<AgentManager> {
     if let Some(name) = name {
         AgentManager::for_vm(name)
     } else {
-        AgentManager::default()
+        AgentManager::new_default()
     }
 }
 
 /// Format the microvm label for display.
 fn microvm_label(name: &Option<String>) -> String {
     name.as_deref().unwrap_or("default").to_string()
-}
-
-/// Truncate a string to max length, adding "..." if needed.
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max - 3])
-    }
 }

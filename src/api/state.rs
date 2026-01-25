@@ -109,13 +109,17 @@ impl Drop for ReservationGuard<'_> {
 
 impl ApiState {
     /// Create a new API state, opening the database.
-    pub fn new() -> Self {
-        let db = SmolvmDb::open().expect("failed to open database");
-        Self {
+    ///
+    /// Returns an error if the database cannot be opened.
+    pub fn new() -> Result<Self, ApiError> {
+        let db = SmolvmDb::open().map_err(|e| {
+            ApiError::Internal(format!("failed to open database: {}", e))
+        })?;
+        Ok(Self {
             sandboxes: RwLock::new(HashMap::new()),
             reserved_names: RwLock::new(HashSet::new()),
             db,
-        }
+        })
     }
 
     /// Load existing sandboxes from persistent database.
@@ -572,9 +576,14 @@ impl ApiState {
     }
 }
 
-impl Default for ApiState {
-    fn default() -> Self {
-        Self::new()
+impl ApiState {
+    /// Create a new API state with default settings.
+    ///
+    /// # Panics
+    /// Panics if the database cannot be opened. For fallible construction,
+    /// use `ApiState::new()` instead.
+    pub fn new_or_panic() -> Self {
+        Self::new().expect("failed to create API state")
     }
 }
 
@@ -694,7 +703,7 @@ mod tests {
 
     #[test]
     fn test_sandbox_not_found() {
-        let state = ApiState::new();
+        let state = ApiState::new().expect("failed to create API state for test");
         assert!(matches!(
             state.get_sandbox("nope"),
             Err(ApiError::NotFound(_))

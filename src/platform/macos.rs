@@ -146,42 +146,47 @@ fn write_mount_script(rootfs: &Path, mounts: &[(String, String)], rosetta: bool)
     let mut file = File::create(&host_path)
         .map_err(|e| Error::vm_creation(format!("failed to create mount script: {}", e)))?;
 
-    writeln!(file, "#!/bin/sh").unwrap();
-    writeln!(file, "set -e").unwrap();
+    // Helper to write lines with proper error handling
+    let write_line = |file: &mut File, line: &str| -> Result<()> {
+        writeln!(file, "{}", line)
+            .map_err(|e| Error::vm_creation(format!("failed to write mount script: {}", e)))
+    };
+
+    write_line(&mut file, "#!/bin/sh")?;
+    write_line(&mut file, "set -e")?;
 
     // Mount each virtiofs volume
     for (tag, guest_mount) in mounts {
-        writeln!(file, "mkdir -p \"{}\"", guest_mount).unwrap();
-        writeln!(file, "mount -t virtiofs {} \"{}\"", tag, guest_mount).unwrap();
+        write_line(&mut file, &format!("mkdir -p \"{}\"", guest_mount))?;
+        write_line(&mut file, &format!("mount -t virtiofs {} \"{}\"", tag, guest_mount))?;
     }
 
     // If Rosetta is enabled, mount the runtime and register binfmt_misc
     if rosetta {
-        writeln!(file, "# Mount Rosetta runtime").unwrap();
-        writeln!(
-            file,
-            "mkdir -p \"{}\"",
-            crate::vm::rosetta::ROSETTA_GUEST_PATH
-        )
-        .unwrap();
-        writeln!(
-            file,
-            "mount -t virtiofs {} \"{}\"",
-            crate::vm::rosetta::ROSETTA_TAG,
-            crate::vm::rosetta::ROSETTA_GUEST_PATH
-        )
-        .unwrap();
+        write_line(&mut file, "# Mount Rosetta runtime")?;
+        write_line(
+            &mut file,
+            &format!("mkdir -p \"{}\"", crate::vm::rosetta::ROSETTA_GUEST_PATH),
+        )?;
+        write_line(
+            &mut file,
+            &format!(
+                "mount -t virtiofs {} \"{}\"",
+                crate::vm::rosetta::ROSETTA_TAG,
+                crate::vm::rosetta::ROSETTA_GUEST_PATH
+            ),
+        )?;
 
         // Register Rosetta with binfmt_misc for x86_64 ELF binaries
-        writeln!(file, "# Register Rosetta with binfmt_misc").unwrap();
-        writeln!(file, "{}", crate::vm::rosetta::BINFMT_REGISTER_CMD).unwrap();
+        write_line(&mut file, "# Register Rosetta with binfmt_misc")?;
+        write_line(&mut file, crate::vm::rosetta::BINFMT_REGISTER_CMD)?;
     }
 
     // Clean up the mount script after execution
-    writeln!(file, "rm -f \"$0\"").unwrap();
+    write_line(&mut file, "rm -f \"$0\"")?;
 
     // Execute the user's command
-    writeln!(file, "exec \"$@\"").unwrap();
+    write_line(&mut file, "exec \"$@\"")?;
 
     // Make executable
     let perms = fs::Permissions::from_mode(0o755);

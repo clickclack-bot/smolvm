@@ -95,6 +95,13 @@ pub struct RestartConfig {
     pub user_stopped: bool,
 }
 
+/// Default vCPU count for new VMs.
+pub const DEFAULT_VM_CPUS: u8 = 1;
+/// Default memory in MiB for new VMs.
+pub const DEFAULT_VM_MEMORY_MIB: u32 = 512;
+/// Default DNS server for VMs with network egress.
+pub const DEFAULT_DNS: &str = "1.1.1.1";
+
 /// Global smolvm configuration with database-backed persistence.
 ///
 /// This struct provides backward-compatible access to VM records while
@@ -119,18 +126,22 @@ pub struct SmolvmConfig {
     pub vms: HashMap<String, VmRecord>,
 }
 
-impl Default for SmolvmConfig {
-    fn default() -> Self {
-        Self {
-            db: SmolvmDb::open().expect("failed to open database"),
+impl SmolvmConfig {
+    /// Create a new configuration with default values.
+    ///
+    /// This is the fallible version of `Default::default()`. Use this when
+    /// you need to handle database initialization errors.
+    pub fn try_default() -> Result<Self> {
+        Ok(Self {
+            db: SmolvmDb::open()?,
             version: 1,
-            default_cpus: 1,
-            default_mem: 512,
-            default_dns: "1.1.1.1".to_string(),
+            default_cpus: DEFAULT_VM_CPUS,
+            default_mem: DEFAULT_VM_MEMORY_MIB,
+            default_dns: DEFAULT_DNS.to_string(),
             #[cfg(target_os = "macos")]
             storage_volume: String::new(),
             vms: HashMap::new(),
-        }
+        })
     }
 }
 
@@ -151,14 +162,14 @@ impl SmolvmConfig {
         let default_cpus = db
             .get_config("default_cpus")?
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
+            .unwrap_or(DEFAULT_VM_CPUS);
         let default_mem = db
             .get_config("default_mem")?
             .and_then(|s| s.parse().ok())
-            .unwrap_or(512);
+            .unwrap_or(DEFAULT_VM_MEMORY_MIB);
         let default_dns = db
             .get_config("default_dns")?
-            .unwrap_or_else(|| "1.1.1.1".to_string());
+            .unwrap_or_else(|| DEFAULT_DNS.to_string());
 
         #[cfg(target_os = "macos")]
         let storage_volume = db.get_config("storage_volume")?.unwrap_or_default();

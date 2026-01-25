@@ -17,6 +17,11 @@ pub const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default timeout for SIGKILL to take effect.
 pub const SIGKILL_WAIT: Duration = Duration::from_millis(500);
 
+/// Exit code returned when the actual exit status cannot be determined.
+/// This happens when a process is confirmed dead but waitpid() fails to
+/// retrieve the exit status (e.g., process was reaped by another handler).
+pub const UNKNOWN_EXIT_CODE: i32 = -1;
+
 /// Install a SIGCHLD handler to automatically reap zombie child processes.
 ///
 /// This function installs a signal handler that calls waitpid(-1, WNOHANG) to
@@ -152,8 +157,9 @@ pub fn stop_process(pid: libc::pid_t, timeout: Duration, force: bool) -> Result<
 
     // Send SIGTERM
     if !terminate(pid) {
-        // Process already dead
-        return Ok(try_wait(pid).unwrap_or(0));
+        // Process already dead - signal couldn't be sent.
+        // Try to get exit code; if unavailable (e.g., already reaped), use unknown.
+        return Ok(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE));
     }
 
     // Wait for graceful exit
@@ -166,7 +172,8 @@ pub fn stop_process(pid: libc::pid_t, timeout: Duration, force: bool) -> Result<
         }
 
         if !is_alive(pid) {
-            return Ok(try_wait(pid).unwrap_or(0));
+            // Process died during wait - get exit code or return unknown.
+            return Ok(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE));
         }
 
         std::thread::sleep(poll_interval);

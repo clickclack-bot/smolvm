@@ -3,10 +3,12 @@
 //! This module provides network policy configuration for VMs.
 
 use crate::vm::config::NetworkPolicy;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
-/// Default DNS server (Cloudflare).
+/// Default DNS server (Cloudflare) as string.
 pub const DEFAULT_DNS: &str = "1.1.1.1";
+/// Default DNS server as IpAddr (compile-time constant).
+pub const DEFAULT_DNS_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
 /// Google's public DNS server.
 pub const GOOGLE_DNS: &str = "8.8.8.8";
 
@@ -14,7 +16,7 @@ pub const GOOGLE_DNS: &str = "8.8.8.8";
 pub fn get_dns_server(policy: &NetworkPolicy) -> Option<IpAddr> {
     match policy {
         NetworkPolicy::None => None,
-        NetworkPolicy::Egress { dns } => Some(dns.unwrap_or_else(|| DEFAULT_DNS.parse().unwrap())),
+        NetworkPolicy::Egress { dns } => Some(dns.unwrap_or(DEFAULT_DNS_ADDR)),
     }
 }
 

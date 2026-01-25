@@ -568,10 +568,14 @@ fn run_interactive_loop(
 
     // Set non-blocking mode on stdout/stderr
     if let Some(ref stdout) = child_stdout {
-        set_nonblocking(stdout.as_raw_fd());
+        if !set_nonblocking(stdout.as_raw_fd()) {
+            warn!("failed to set stdout to non-blocking mode");
+        }
     }
     if let Some(ref stderr) = child_stderr {
-        set_nonblocking(stderr.as_raw_fd());
+        if !set_nonblocking(stderr.as_raw_fd()) {
+            warn!("failed to set stderr to non-blocking mode");
+        }
     }
 
     let mut stdout_buf = [0u8; IO_BUFFER_SIZE];
@@ -579,21 +583,23 @@ fn run_interactive_loop(
 
     loop {
         // Check if child has exited
-        match child.try_wait()? {
-            Some(status) => {
-                // Drain any remaining output
-                drain_remaining_output(stream, &mut child_stdout, &mut child_stderr, &mut stdout_buf, &mut stderr_buf)?;
-                return Ok(status.code().unwrap_or(-1));
-            }
-            None => {}
+        if let Some(status) = child.try_wait()? {
+            // Drain any remaining output
+            drain_remaining_output(stream, &mut child_stdout, &mut child_stderr, &mut stdout_buf, &mut stderr_buf)?;
+            return Ok(status.code().unwrap_or(-1));
         }
 
         // Check timeout
         if let Some(deadline) = deadline {
             if Instant::now() >= deadline {
-                warn!("interactive command timed out");
-                let _ = child.kill();
-                let _ = child.wait();
+                warn!("interactive command timed out, killing process");
+                if let Err(e) = child.kill() {
+                    warn!(error = %e, "failed to kill timed out process");
+                }
+                // Wait to reap the process and avoid zombies
+                if let Err(e) = child.wait() {
+                    warn!(error = %e, "failed to wait for killed process");
+                }
                 return Ok(124); // Timeout exit code
             }
         }
@@ -782,10 +788,21 @@ fn try_read_request(
 }
 
 /// Set a file descriptor to non-blocking mode.
-fn set_nonblocking(fd: i32) {
+///
+/// Returns true if successful, false if fcntl() failed.
+fn set_nonblocking(fd: i32) -> bool {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
-        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        if flags < 0 {
+            debug!(fd, "fcntl(F_GETFL) failed");
+            return false;
+        }
+        let result = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        if result < 0 {
+            debug!(fd, "fcntl(F_SETFL, O_NONBLOCK) failed");
+            return false;
+        }
+        true
     }
 }
 
@@ -1268,8 +1285,14 @@ fn handle_vm_exec(
                 if let Some(deadline) = deadline {
                     if std::time::Instant::now() >= deadline {
                         // Timeout - kill process
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        warn!("VM exec command timed out, killing process");
+                        if let Err(e) = child.kill() {
+                            warn!(error = %e, "failed to kill timed out process");
+                        }
+                        // Wait to reap the process and avoid zombies
+                        if let Err(e) = child.wait() {
+                            warn!(error = %e, "failed to wait for killed process");
+                        }
                         return AgentResponse::Completed {
                             exit_code: 124, // Standard timeout exit code
                             stdout: String::new(),
