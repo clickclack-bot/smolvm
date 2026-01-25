@@ -205,9 +205,16 @@ impl StorageDisk {
                 }
             })
             .ok_or_else(|| {
-                Error::Storage(
-                    "mkfs.ext4 not found. On macOS, install with: brew install e2fsprogs".into(),
-                )
+                let hint = if cfg!(target_os = "macos") {
+                    "On macOS, install with: brew install e2fsprogs"
+                } else {
+                    "On Linux, install with: apt install e2fsprogs (or equivalent for your distro)"
+                };
+                Error::Storage(format!(
+                    "mkfs.ext4 not found - required for storage disk formatting.\n  {}\n  \
+                    After installing, run your smolvm command again.",
+                    hint
+                ))
             })?;
 
         let path_str = self
