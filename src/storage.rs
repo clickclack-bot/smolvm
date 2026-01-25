@@ -113,6 +113,13 @@ impl StorageDisk {
 
     /// Open or create the storage disk at a custom path.
     pub fn open_or_create_at(path: &Path, size_gb: u64) -> Result<Self> {
+        // Validate size
+        if size_gb == 0 {
+            return Err(crate::error::Error::Config(
+                "storage disk size must be greater than 0 GB".to_string(),
+            ));
+        }
+
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -138,9 +145,16 @@ impl StorageDisk {
     }
 
     /// Create a sparse disk image.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size_bytes` is 0 (would cause underflow).
     fn create_sparse(path: &Path, size_bytes: u64) -> Result<()> {
         use std::fs::OpenOptions;
         use std::io::{Seek, SeekFrom, Write};
+
+        // Guard against zero-size disk (would underflow in seek)
+        assert!(size_bytes > 0, "disk size must be greater than 0");
 
         tracing::info!(path = %path.display(), size_gb = size_bytes / (1024*1024*1024), "creating sparse storage disk");
 

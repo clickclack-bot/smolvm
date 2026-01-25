@@ -234,7 +234,8 @@ pub async fn start_sandbox(
     // Clear user_stopped flag since user is explicitly starting
     state.mark_user_stopped(&id, false);
 
-    // Close database before forking to prevent child from inheriting the fd lock
+    // Close database before forking to prevent child from inheriting the fd lock.
+    // Use a closure to ensure reopen happens even if the task fails/panics.
     state.close_db_temporarily();
 
     // Start the sandbox in a blocking task (this forks)
@@ -245,12 +246,14 @@ pub async fn start_sandbox(
             .manager
             .ensure_running_with_full_config(mounts, ports, resources)
     })
-    .await?;
+    .await;
 
-    // Reopen database after fork completes
+    // CRITICAL: Always reopen database, regardless of task result.
+    // If we don't reopen, the DB stays closed for the rest of the process.
     state.reopen_db().map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    // Now check the start result
+    // Now check the task join result, then the start result
+    let start_result = start_result?;
     start_result.map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Get updated state and persist
@@ -339,14 +342,25 @@ pub async fn delete_sandbox(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let entry = state.remove_sandbox(&id)?;
+    // First, get the entry and stop the sandbox (before removing from registry).
+    // This ensures the VM isn't orphaned if stop fails.
+    let entry = state.get_sandbox(&id)?;
 
     // Stop the sandbox if running
-    tokio::task::spawn_blocking(move || {
-        let entry = entry.lock();
-        let _ = entry.manager.stop();
+    let entry_clone = entry.clone();
+    let stop_result = tokio::task::spawn_blocking(move || {
+        let entry = entry_clone.lock();
+        entry.manager.stop()
     })
     .await?;
+
+    // Log stop errors but continue with deletion
+    if let Err(e) = stop_result {
+        tracing::warn!(sandbox = %id, error = %e, "failed to stop sandbox during delete, continuing with removal");
+    }
+
+    // Now remove from registry and database
+    state.remove_sandbox(&id)?;
 
     Ok(Json(serde_json::json!({
         "deleted": id
