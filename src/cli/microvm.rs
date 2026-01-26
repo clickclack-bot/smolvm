@@ -609,8 +609,8 @@ impl LsCmd {
                 );
 
                 if self.verbose {
-                    if record.pid.is_some() {
-                        println!("  PID: {}", record.pid.unwrap());
+                    if let Some(pid) = record.pid {
+                        println!("  PID: {}", pid);
                     }
                     for (host, guest, ro) in &record.mounts {
                         let ro_str = if *ro { " (ro)" } else { "" };
