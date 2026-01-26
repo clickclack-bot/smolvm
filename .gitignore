@@ -20,9 +20,8 @@ Cargo.lock
 /dist/smolvm-*/
 /dist/*.tar.gz
 
-# Bundled libraries (large binaries - download or build locally)
+# Bundled libraries are in the /lib (large binaries - download or build locally)
 # These are bundled into release tarballs by build-dist.sh
-/lib/
 
 # Helper rootfs (downloaded/generated content)
 /helper-rootfs/rootfs/
