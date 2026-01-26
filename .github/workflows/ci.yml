@@ -74,7 +74,7 @@ jobs:
           LIBRARY_PATH: ${{ github.workspace }}/lib
           DYLD_LIBRARY_PATH: ${{ github.workspace }}/lib
 
-      - name: Sign binary for integration tests
+      - name: Sign binary
         run: |
           cat > /tmp/entitlements.plist << 'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -88,10 +88,12 @@ jobs:
           EOF
           codesign --sign - --entitlements /tmp/entitlements.plist --force target/release/smolvm
 
-      - name: Integration test - version
+      - name: Verify binary runs
         run: ./target/release/smolvm --version
         env:
           DYLD_LIBRARY_PATH: ${{ github.workspace }}/lib
+      # Note: Integration tests (E2E VM tests) require Hypervisor.framework access,
+      # which GitHub runners don't provide. Run integration tests locally.
 
   # ==========================================================================
   # Linux Build & Test
@@ -181,9 +183,8 @@ jobs:
         env:
           LIBRARY_PATH: /usr/local/lib
           LD_LIBRARY_PATH: /usr/local/lib
-
-      # Note: Full VM tests require KVM + real libkrun.
-      # Use macOS job or self-hosted Linux runner for integration tests.
+      # Note: Full VM integration tests require KVM + real libkrun.
+      # Run integration tests locally on a machine with KVM access.
 
   # ==========================================================================
   # Build agent (Linux musl for static binary)
