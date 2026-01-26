@@ -393,12 +393,25 @@ impl ApiState {
     ///
     /// Returns `Err(Conflict)` if the name is already taken or reserved.
     pub fn reserve_sandbox_name(&self, name: &str) -> Result<(), ApiError> {
-        // Check both sandboxes and reservations atomically
-        let sandboxes = self.sandboxes.read();
+        // First check: sandbox existence (early exit for common case).
+        // Use separate scope to release read lock before acquiring write lock.
+        // This prevents lock-order inversion with complete_sandbox_registration.
+        {
+            let sandboxes = self.sandboxes.read();
+            if sandboxes.contains_key(name) {
+                return Err(ApiError::Conflict(format!(
+                    "sandbox '{}' already exists",
+                    name
+                )));
+            }
+        }
+
+        // Acquire reservation lock
         let mut reserved = self.reserved_names.write();
 
-        // Check if sandbox already exists
-        if sandboxes.contains_key(name) {
+        // Double-check sandbox existence (could have been added while we
+        // didn't hold the sandboxes lock). This is necessary for correctness.
+        if self.sandboxes.read().contains_key(name) {
             return Err(ApiError::Conflict(format!(
                 "sandbox '{}' already exists",
                 name
@@ -505,8 +518,17 @@ impl ApiState {
 
     /// Stop all sandboxes (for graceful shutdown).
     pub fn stop_all_sandboxes(&self) {
-        let sandboxes = self.sandboxes.read();
-        for (name, entry) in sandboxes.iter() {
+        // Collect names first to avoid holding read lock during slow stop operations.
+        // This allows other sandbox operations to proceed while we're stopping.
+        let names: Vec<String> = self.sandboxes.read().keys().cloned().collect();
+
+        for name in names {
+            // Re-acquire lock for each sandbox to minimize lock hold time
+            let entry = match self.sandboxes.read().get(&name).cloned() {
+                Some(e) => e,
+                None => continue, // Sandbox was removed while we were iterating
+            };
+
             let entry = entry.lock();
             if entry.manager.is_running() {
                 tracing::info!(sandbox = %name, "stopping sandbox");

@@ -1,7 +1,7 @@
 //! Sandbox lifecycle handlers.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Json,
 };
 use std::sync::Arc;
@@ -13,12 +13,10 @@ use crate::api::state::{
     restart_spec_to_config, ApiState, DbCloseGuard, ReservationGuard,
 };
 use crate::api::types::{
-    CreateSandboxRequest, ListSandboxesResponse, MountInfo, MountSpec, ResourceSpec, SandboxInfo,
+    CreateSandboxRequest, DeleteQuery, ListSandboxesResponse, MountInfo, MountSpec, ResourceSpec,
+    SandboxInfo,
 };
 use crate::config::RecordState;
-
-/// Minimum sandbox name length.
-const MIN_NAME_LENGTH: usize = 1;
 
 /// Maximum sandbox name length.
 const MAX_NAME_LENGTH: usize = 64;
@@ -47,10 +45,11 @@ fn mounts_to_info(mounts: &[MountSpec]) -> Vec<MountInfo> {
 /// - No consecutive hyphens
 /// - No path separators (/, \)
 fn validate_sandbox_name(name: &str) -> Result<(), ApiError> {
-    // Check length
-    if name.len() < MIN_NAME_LENGTH {
-        return Err(ApiError::BadRequest("sandbox name cannot be empty".into()));
-    }
+    // Check length and get first/last chars safely
+    let first_char = name.chars().next().ok_or_else(|| {
+        ApiError::BadRequest("sandbox name cannot be empty".into())
+    })?;
+
     if name.len() > MAX_NAME_LENGTH {
         return Err(ApiError::BadRequest(format!(
             "sandbox name too long: {} characters (max {})",
@@ -60,7 +59,6 @@ fn validate_sandbox_name(name: &str) -> Result<(), ApiError> {
     }
 
     // Check first character (must be alphanumeric)
-    let first_char = name.chars().next().unwrap();
     if !first_char.is_ascii_alphanumeric() {
         return Err(ApiError::BadRequest(
             "sandbox name must start with a letter or digit".into(),
@@ -68,7 +66,8 @@ fn validate_sandbox_name(name: &str) -> Result<(), ApiError> {
     }
 
     // Check last character (cannot be hyphen)
-    let last_char = name.chars().last().unwrap();
+    // Safe to unwrap: we know string is non-empty from first_char check
+    let last_char = name.chars().last().expect("non-empty string has last char");
     if last_char == '-' {
         return Err(ApiError::BadRequest(
             "sandbox name cannot end with a hyphen".into(),
@@ -336,12 +335,15 @@ pub async fn stop_sandbox(
 }
 
 /// DELETE /api/v1/sandboxes/:id - Delete a sandbox.
+///
+/// Query parameters:
+/// - `force`: If true, delete even if stop fails and VM is still running (may orphan VM)
 pub async fn delete_sandbox(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
+    Query(query): Query<DeleteQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // First, get the entry and stop the sandbox (before removing from registry).
-    // This ensures the VM isn't orphaned if stop fails.
     let entry = state.get_sandbox(&id)?;
 
     // Stop the sandbox if running
@@ -352,9 +354,31 @@ pub async fn delete_sandbox(
     })
     .await?;
 
-    // Log stop errors but continue with deletion
-    if let Err(e) = stop_result {
-        tracing::warn!(sandbox = %id, error = %e, "failed to stop sandbox during delete, continuing with removal");
+    // Handle stop errors
+    if let Err(ref e) = stop_result {
+        // Check if VM is actually still running
+        let still_running = {
+            let entry = entry.lock();
+            entry.manager.is_running()
+        };
+
+        if still_running && !query.force {
+            // VM is still running and force not specified - refuse to orphan it
+            return Err(ApiError::Conflict(format!(
+                "failed to stop sandbox '{}': {}. VM is still running. \
+                 Use ?force=true to delete anyway (will orphan the VM process)",
+                id, e
+            )));
+        }
+
+        // Either VM is not running, or force=true - proceed with warning
+        tracing::warn!(
+            sandbox = %id,
+            error = %e,
+            still_running = still_running,
+            force = query.force,
+            "stop failed during delete, proceeding with removal"
+        );
     }
 
     // Now remove from registry and database

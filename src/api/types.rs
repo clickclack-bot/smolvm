@@ -323,6 +323,19 @@ pub struct LogsQuery {
 }
 
 // ============================================================================
+// Delete Types
+// ============================================================================
+
+/// Query parameters for delete sandbox endpoint.
+#[derive(Debug, Default, Deserialize)]
+pub struct DeleteQuery {
+    /// If true, force delete even if stop fails and VM is still running.
+    /// This may orphan the VM process. Default: false.
+    #[serde(default)]
+    pub force: bool,
+}
+
+// ============================================================================
 // Health Types
 // ============================================================================
 
