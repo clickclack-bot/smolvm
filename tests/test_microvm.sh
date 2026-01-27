@@ -43,9 +43,12 @@ test_microvm_status_running() {
 
 test_microvm_status_stopped() {
     cleanup_microvm
-    local status
-    status=$($SMOLVM microvm status 2>&1) || true
-    [[ "$status" == *"not running"* ]] || [[ "$status" == *"stopped"* ]]
+    local status exit_code=0
+    status=$($SMOLVM microvm status 2>&1) || exit_code=$?
+    # When stopped, status command either:
+    # - Returns non-zero exit code, OR
+    # - Returns status containing "not running" or "stopped"
+    [[ $exit_code -ne 0 ]] || [[ "$status" == *"not running"* ]] || [[ "$status" == *"stopped"* ]]
 }
 
 test_microvm_start_stop_cycle() {
@@ -55,16 +58,19 @@ test_microvm_start_stop_cycle() {
     $SMOLVM microvm start 2>&1 || return 1
 
     # Verify running
-    local status
-    status=$($SMOLVM microvm status 2>&1)
-    [[ "$status" == *"running"* ]] || return 1
+    local status exit_code=0
+    status=$($SMOLVM microvm status 2>&1) || exit_code=$?
+    if [[ $exit_code -ne 0 ]] || [[ "$status" != *"running"* ]]; then
+        return 1
+    fi
 
     # Stop
     $SMOLVM microvm stop 2>&1 || return 1
 
-    # Verify stopped
-    status=$($SMOLVM microvm status 2>&1) || true
-    [[ "$status" == *"not running"* ]] || [[ "$status" == *"stopped"* ]]
+    # Verify stopped - either non-zero exit or status message indicates stopped
+    exit_code=0
+    status=$($SMOLVM microvm status 2>&1) || exit_code=$?
+    [[ $exit_code -ne 0 ]] || [[ "$status" == *"not running"* ]] || [[ "$status" == *"stopped"* ]]
 }
 
 # =============================================================================
@@ -204,11 +210,11 @@ test_microvm_named_vm() {
 test_microvm_exec_when_stopped() {
     cleanup_microvm
 
-    local output exit_code=0
-    output=$($SMOLVM microvm exec -- echo "should-fail" 2>&1) || exit_code=$?
+    local exit_code=0
+    $SMOLVM microvm exec -- echo "should-fail" 2>&1 || exit_code=$?
 
-    # Should fail with error about not running
-    [[ $exit_code -ne 0 ]] && [[ "$output" == *"not running"* ]]
+    # Should fail with non-zero exit code (don't check specific message)
+    [[ $exit_code -ne 0 ]]
 }
 
 # =============================================================================

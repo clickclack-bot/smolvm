@@ -624,7 +624,7 @@ pub fn create_container(
 
     // Add bind mounts for virtiofs volumes
     for (tag, container_path, read_only) in mounts {
-        let virtiofs_mount = Path::new("/mnt/virtiofs").join(tag);
+        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
         spec.add_bind_mount(
             &virtiofs_mount.to_string_lossy(),
             container_path,

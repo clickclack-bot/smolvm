@@ -82,14 +82,15 @@ test_sandbox_timeout() {
     end_time=$(date +%s)
     elapsed=$((end_time - start_time))
 
-    # Should complete in much less than 60 seconds
-    if [[ $elapsed -ge 60 ]]; then
-        echo "Timeout test failed: took $elapsed seconds (expected < 60)"
+    # Should complete in much less than 60 seconds (timeout is 5s + some overhead)
+    # Allow up to 20 seconds for VM startup overhead
+    if [[ $elapsed -ge 30 ]]; then
+        echo "Timeout test failed: took $elapsed seconds (expected < 30)"
         return 1
     fi
 
-    # Check for timeout message or that it completed quickly
-    [[ "$output" == *"timed out"* ]] || [[ $elapsed -lt 30 ]]
+    # Success: command was terminated before the 60 second sleep completed
+    return 0
 }
 
 # =============================================================================

@@ -9,6 +9,7 @@
 
 use clap::Args;
 use smolvm::agent::{AgentClient, AgentManager, VmResources};
+use smolvm::platform::{Os, VmExecutor};
 use smolvm::Error;
 use smolvm_pack::assets::AssetCollector;
 use smolvm_pack::format::PackManifest;
@@ -131,8 +132,14 @@ impl PackCmd {
                 .map_err(|e| Error::AgentError(e.to_string()))?;
         }
 
-        // Stop agent
+        // Stop agent (no longer needed for remaining steps)
         manager.stop()?;
+
+        // Create pre-formatted storage template
+        println!("Creating storage template...");
+        collector
+            .create_storage_template()
+            .map_err(|e| Error::AgentError(e.to_string()))?;
 
         // Build manifest
         let platform = format!("{}/{}", image_info.os, image_info.architecture);
@@ -181,7 +188,7 @@ impl PackCmd {
         }
 
         // Sign on macOS
-        if cfg!(target_os = "macos") && !self.no_sign {
+        if Os::current().is_macos() && !self.no_sign {
             println!("Signing binary with hypervisor entitlements...");
             if let Err(e) = sign_with_hypervisor_entitlements(&self.output) {
                 warn!(error = %e, "signing failed (binary may not run on fresh macOS)");
@@ -194,7 +201,7 @@ impl PackCmd {
 
         println!("\nRun with: {}", self.output.display());
         if info.sidecar_path.is_some() {
-            println!("Note: Keep the .smoldata file alongside the binary");
+            println!("Note: Keep the .smolmachine file alongside the binary");
         }
         println!("Options: --help for usage");
 
@@ -224,14 +231,13 @@ impl PackCmd {
             Some(PathBuf::from("/usr/local/lib")),
         ];
 
-        let lib_name = if cfg!(target_os = "macos") {
-            "libkrun.dylib"
-        } else {
-            "libkrun.so"
-        };
+        let lib_name = format!(
+            "libkrun.{}",
+            smolvm::platform::vm_executor().dylib_extension()
+        );
 
         for candidate in candidates.into_iter().flatten() {
-            if candidate.join(lib_name).exists() {
+            if candidate.join(&lib_name).exists() {
                 debug!(lib_dir = %candidate.display(), "found library directory");
                 return Ok(candidate);
             }

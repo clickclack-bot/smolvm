@@ -18,6 +18,13 @@ pub const CRUN_PATH: &str = "/usr/bin/crun";
 pub const CRUN_CGROUP_MANAGER: &str = "disabled";
 
 // =============================================================================
+// Mount Paths
+// =============================================================================
+
+/// Root directory for virtiofs mounts from the host.
+pub const VIRTIOFS_MOUNT_ROOT: &str = "/mnt/virtiofs";
+
+// =============================================================================
 // Storage Paths
 // =============================================================================
 

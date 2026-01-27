@@ -73,7 +73,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("smolvm_agent=debug".parse().expect("valid directive")),
+                .add_directive("smolvm_agent=warn".parse().expect("valid directive")),
         )
         .init();
 
@@ -702,9 +702,6 @@ fn handle_interactive_run(
     Ok(())
 }
 
-/// Directory where virtiofs mounts are staged.
-const VIRTIOFS_MOUNT_ROOT: &str = "/mnt/virtiofs";
-
 /// Spawn a command for interactive execution using crun OCI runtime.
 fn spawn_interactive_command(
     rootfs: &str,
@@ -739,7 +736,7 @@ fn spawn_interactive_command(
 
     // Add virtiofs bind mounts to OCI spec
     for (tag, container_path, read_only) in mounts {
-        let virtiofs_mount = Path::new(VIRTIOFS_MOUNT_ROOT).join(tag);
+        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
         spec.add_bind_mount(
             &virtiofs_mount.to_string_lossy(),
             container_path,
@@ -1161,49 +1158,53 @@ fn test_tcp_syscall(target: &str) -> serde_json::Value {
         }
     };
 
-    // Also test raw socket() syscall and lseek behavior
-    let socket_test = unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
-        if fd < 0 {
-            let err = std::io::Error::last_os_error();
-            serde_json::json!({
-                "socket_created": false,
-                "errno": err.raw_os_error().unwrap_or(-1),
-                "errno_str": err.to_string(),
-            })
-        } else {
-            // Get socket type info
-            let mut sock_type: libc::c_int = 0;
-            let mut sock_type_len: libc::socklen_t =
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_TYPE,
-                &mut sock_type as *mut _ as *mut libc::c_void,
-                &mut sock_type_len,
-            );
+    // Also test socket syscall and lseek behavior using safe nix APIs
+    #[cfg(target_os = "linux")]
+    let socket_test = {
+        use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
+        use nix::unistd::{lseek, Whence};
+        use std::os::fd::AsRawFd;
 
-            // Test lseek on the socket - this should return ESPIPE (29) for normal sockets
-            let lseek_result = libc::lseek(fd, 0, libc::SEEK_CUR);
-            let lseek_errno = if lseek_result < 0 {
-                let err = std::io::Error::last_os_error();
-                Some((err.raw_os_error().unwrap_or(-1), err.to_string()))
-            } else {
-                None
-            };
+        match socket(
+            AddressFamily::Inet,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        ) {
+            Ok(fd) => {
+                let raw_fd = fd.as_raw_fd();
 
-            libc::close(fd);
-            serde_json::json!({
-                "socket_created": true,
-                "fd": fd,
-                "sock_type": sock_type,
-                "lseek_result": lseek_result,
-                "lseek_errno": lseek_errno.map(|(e, s)| serde_json::json!({"code": e, "str": s})),
-                "expected_errno_espipe": 29,  // ESPIPE = 29 on Linux
-            })
+                // Test lseek on the socket - this should return ESPIPE (29) for normal sockets
+                let (lseek_result, lseek_errno) = match lseek(&fd, 0, Whence::SeekCur) {
+                    Ok(offset) => (offset, None),
+                    Err(e) => (-1, Some((e as i32, e.desc().to_string()))),
+                };
+
+                // fd is automatically closed when OwnedFd drops
+                serde_json::json!({
+                    "socket_created": true,
+                    "fd": raw_fd,
+                    "sock_type": libc::SOCK_STREAM,  // We know we created SOCK_STREAM
+                    "lseek_result": lseek_result,
+                    "lseek_errno": lseek_errno.map(|(e, s)| serde_json::json!({"code": e, "str": s})),
+                    "expected_errno_espipe": 29,  // ESPIPE = 29 on Linux
+                })
+            }
+            Err(e) => {
+                serde_json::json!({
+                    "socket_created": false,
+                    "errno": e as i32,
+                    "errno_str": e.desc().to_string(),
+                })
+            }
         }
     };
+
+    #[cfg(not(target_os = "linux"))]
+    let socket_test = serde_json::json!({
+        "skipped": true,
+        "reason": "socket test only available on Linux"
+    });
 
     // Test 3: Try nc (netcat) if available
     let nc_result = match std::process::Command::new("nc")

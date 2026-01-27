@@ -607,13 +607,11 @@ mod tests {
         let encoded = encode_message(&req).unwrap();
         let decoded: AgentRequest = decode_message(&encoded).unwrap();
 
-        match decoded {
-            AgentRequest::Pull { image, platform } => {
-                assert_eq!(image, "alpine:latest");
-                assert_eq!(platform, Some("linux/arm64".to_string()));
-            }
-            _ => panic!("wrong variant"),
-        }
+        let AgentRequest::Pull { image, platform } = decoded else {
+            panic!("expected Pull variant, got {:?}", decoded);
+        };
+        assert_eq!(image, "alpine:latest");
+        assert_eq!(platform, Some("linux/arm64".to_string()));
     }
 
     #[test]

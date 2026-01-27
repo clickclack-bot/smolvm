@@ -3,7 +3,7 @@
 //! This module handles combining the stub executable, compressed assets,
 //! manifest, and footer into a self-contained package.
 //!
-//! Format version 2 uses a sidecar file for assets (.smoldata) to allow
+//! Format version 2 uses a sidecar file for assets (.smolmachine) to allow
 //! proper code signing on macOS.
 
 use std::fs::{self, File};
@@ -54,7 +54,7 @@ impl Packer {
     ///
     /// Creates two files:
     /// 1. `output` - Stub executable (pure Mach-O, signable)
-    /// 2. `output.smoldata` - Compressed assets + manifest + footer
+    /// 2. `output.smolmachine` - Compressed assets + manifest + footer
     ///
     /// This keeps the binary as a pure Mach-O executable that can be
     /// properly code-signed on macOS.
@@ -278,7 +278,7 @@ pub fn extract_assets(packed_path: impl AsRef<Path>, output_dir: impl AsRef<Path
     let footer = read_footer(packed_path.as_ref())?;
 
     if is_sidecar_mode(&footer) {
-        // Sidecar mode: read from .smoldata file
+        // Sidecar mode: read from .smolmachine file
         let sidecar = sidecar_path_for(packed_path.as_ref());
         crate::assets::decompress_assets_from_file(&sidecar, output_dir.as_ref())?;
     } else {

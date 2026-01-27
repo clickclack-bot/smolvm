@@ -37,6 +37,7 @@ impl AssetCollector {
                     size: 0,
                 },
                 layers: Vec::new(),
+                storage_template: None,
             },
         })
     }
@@ -146,6 +147,96 @@ impl AssetCollector {
         self.inventory.layers.push(LayerEntry {
             digest: digest.to_string(),
             path,
+            size: metadata.len(),
+        });
+
+        Ok(())
+    }
+
+    /// Create and collect a pre-formatted ext4 storage template.
+    ///
+    /// Creates a small sparse ext4 disk image that can be used as a template
+    /// for the storage disk at runtime. This eliminates the need for mkfs.ext4
+    /// on first boot and improves reliability.
+    ///
+    /// The template is a 512MB sparse file (actual size ~100KB when empty).
+    pub fn create_storage_template(&mut self) -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::process::Command;
+
+        const TEMPLATE_SIZE: u64 = 512 * 1024 * 1024; // 512MB virtual size
+        const TEMPLATE_NAME: &str = "storage.ext4";
+
+        let template_path = self.staging_dir.join(TEMPLATE_NAME);
+
+        // Create sparse file
+        let mut file = File::create(&template_path)?;
+        file.seek(SeekFrom::Start(TEMPLATE_SIZE - 1))?;
+        file.write_all(&[0])?;
+        file.sync_all()?;
+        drop(file);
+
+        // Find mkfs.ext4
+        let mkfs_paths = [
+            "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
+            "/usr/local/opt/e2fsprogs/sbin/mkfs.ext4",
+            "/opt/homebrew/sbin/mkfs.ext4",
+            "/usr/local/sbin/mkfs.ext4",
+            "/sbin/mkfs.ext4",
+            "/usr/sbin/mkfs.ext4",
+            "mkfs.ext4",
+        ];
+
+        let mkfs_path = mkfs_paths
+            .iter()
+            .find(|p| {
+                if p.contains('/') {
+                    std::path::Path::new(p).exists()
+                } else {
+                    Command::new(p).arg("--version").output().is_ok()
+                }
+            })
+            .ok_or_else(|| {
+                PackError::AssetNotFound(
+                    "mkfs.ext4 not found. Install e2fsprogs to create storage template.".into(),
+                )
+            })?;
+
+        // Format with ext4
+        // Reset SIGCHLD to default before spawning to avoid issues after agent stop
+        #[cfg(unix)]
+        unsafe {
+            libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+        }
+
+        let mut child = Command::new(mkfs_path)
+            .args([
+                "-F", // Force (don't ask)
+                "-q", // Quiet
+                "-m", "0", // No reserved blocks
+                "-L", "smolvm", // Label
+            ])
+            .arg(&template_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| PackError::AssetNotFound(format!("failed to spawn mkfs.ext4: {}", e)))?;
+
+        let status = child.wait().map_err(|e| {
+            PackError::AssetNotFound(format!("failed to wait for mkfs.ext4: {}", e))
+        })?;
+
+        if !status.success() {
+            return Err(PackError::AssetNotFound(
+                "mkfs.ext4 failed to format storage template".into(),
+            ));
+        }
+
+        // Get actual file size (sparse, so much smaller than 512MB)
+        let metadata = fs::metadata(&template_path)?;
+        self.inventory.storage_template = Some(AssetEntry {
+            path: TEMPLATE_NAME.to_string(),
             size: metadata.len(),
         });
 
@@ -266,7 +357,6 @@ pub fn crc32_file_range(path: &Path, offset: u64, size: u64) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn test_crc32_basic() {
@@ -287,7 +377,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let staging = temp_dir.path().join("staging");
 
-        let collector = AssetCollector::new(staging.clone()).unwrap();
+        let _collector = AssetCollector::new(staging.clone()).unwrap();
 
         assert!(staging.join("lib").exists());
         assert!(staging.join("layers").exists());

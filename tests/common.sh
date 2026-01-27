@@ -89,6 +89,9 @@ log_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
 }
 
+# Track failed test names for summary
+FAILED_TESTS=()
+
 # Run a test function
 run_test() {
     local test_name="$1"
@@ -102,6 +105,7 @@ run_test() {
         return 0
     else
         log_fail "$test_name"
+        FAILED_TESTS+=("$test_name")
         return 1
     fi
 }
@@ -118,6 +122,15 @@ print_summary() {
     echo "Tests run:    $TESTS_RUN"
     echo -e "Tests passed: ${GREEN}$TESTS_PASSED${NC}"
     echo -e "Tests failed: ${RED}$TESTS_FAILED${NC}"
+
+    if [[ $TESTS_FAILED -gt 0 ]] && [[ ${#FAILED_TESTS[@]} -gt 0 ]]; then
+        echo ""
+        echo -e "${RED}Failed tests:${NC}"
+        for test_name in "${FAILED_TESTS[@]}"; do
+            echo -e "  ${RED}✗${NC} $test_name"
+        done
+    fi
+
     echo ""
 
     if [[ $TESTS_FAILED -eq 0 ]]; then

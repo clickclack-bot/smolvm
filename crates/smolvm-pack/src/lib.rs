@@ -21,7 +21,7 @@
 //! +---------------------------+
 //! ```
 //!
-//! **Sidecar file (.smoldata):**
+//! **Sidecar file (.smolmachine):**
 //! ```text
 //! +---------------------------+
 //! | Assets Blob (zstd)        |  30-150MB

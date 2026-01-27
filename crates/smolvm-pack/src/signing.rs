@@ -3,13 +3,19 @@
 //! On macOS, executables that use Hypervisor.framework must be signed
 //! with the appropriate entitlements.
 
-use std::fs;
 use std::path::Path;
+
+#[cfg(target_os = "macos")]
+use std::fs;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
-use crate::{PackError, Result};
+#[cfg(target_os = "macos")]
+use crate::PackError;
+use crate::Result;
 
 /// Default entitlements for hypervisor access on macOS.
+#[cfg(target_os = "macos")]
 const HYPERVISOR_ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -162,6 +168,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn test_entitlements_format() {
         // Verify the entitlements XML is valid
         assert!(HYPERVISOR_ENTITLEMENTS.contains("com.apple.security.hypervisor"));

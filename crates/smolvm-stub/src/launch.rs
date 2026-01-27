@@ -229,10 +229,10 @@ pub fn launch_vm(config: LaunchConfig) -> Result<i32, String> {
     let runtime_dir = config.cache_dir.join("runtime");
     fs::create_dir_all(&runtime_dir).map_err(|e| format!("failed to create runtime dir: {}", e))?;
 
-    // Create storage disk
+    // Create storage disk (from template if available)
     let storage_path = runtime_dir.join("storage.ext4");
     if !storage_path.exists() {
-        create_storage_disk(&storage_path, 512 * 1024 * 1024)?; // 512MB
+        create_or_copy_storage_disk(&config.cache_dir, &config.manifest, &storage_path)?;
     }
 
     // Create vsock socket path
@@ -338,10 +338,10 @@ pub fn start_daemon(config: DaemonConfig) -> Result<(), String> {
     let runtime_dir = config.cache_dir.join("runtime");
     fs::create_dir_all(&runtime_dir).map_err(|e| format!("failed to create runtime dir: {}", e))?;
 
-    // Create storage disk
+    // Create storage disk (from template if available)
     let storage_path = runtime_dir.join("storage.ext4");
     if !storage_path.exists() {
-        create_storage_disk(&storage_path, 512 * 1024 * 1024)?; // 512MB
+        create_or_copy_storage_disk(&config.cache_dir, &config.manifest, &storage_path)?;
     }
 
     // Create vsock socket path
@@ -579,12 +579,34 @@ fn build_run_command_from_config(
     result
 }
 
-/// Create a storage disk file.
+/// Create a storage disk file (empty sparse file).
 fn create_storage_disk(path: &Path, size: u64) -> Result<(), String> {
     let file = File::create(path).map_err(|e| format!("failed to create storage disk: {}", e))?;
     file.set_len(size)
         .map_err(|e| format!("failed to set storage disk size: {}", e))?;
     Ok(())
+}
+
+/// Create or copy storage disk from template.
+///
+/// If a pre-formatted template exists in the cache, copy it.
+/// Otherwise, create an empty sparse file (will be formatted by agent on first boot).
+fn create_or_copy_storage_disk(
+    cache_dir: &Path,
+    manifest: &PackManifest,
+    storage_path: &Path,
+) -> Result<(), String> {
+    if let Some(ref template) = manifest.assets.storage_template {
+        let template_path = cache_dir.join(&template.path);
+        if template_path.exists() {
+            // Copy pre-formatted template
+            fs::copy(&template_path, storage_path)
+                .map_err(|e| format!("failed to copy storage template: {}", e))?;
+            return Ok(());
+        }
+    }
+    // Fallback: create empty sparse file (agent will format on first boot)
+    create_storage_disk(storage_path, 512 * 1024 * 1024)
 }
 
 /// Wait for the agent to become available.

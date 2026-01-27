@@ -16,6 +16,7 @@
 //! and overlay filesystem management.
 
 use crate::error::{Error, Result};
+use crate::platform::Os;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -205,7 +206,7 @@ impl StorageDisk {
                 }
             })
             .ok_or_else(|| {
-                let hint = if cfg!(target_os = "macos") {
+                let hint = if Os::current().is_macos() {
                     "On macOS, install with: brew install e2fsprogs"
                 } else {
                     "On Linux, install with: apt install e2fsprogs (or equivalent for your distro)"

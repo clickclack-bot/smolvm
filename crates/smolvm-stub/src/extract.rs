@@ -49,7 +49,7 @@ pub fn extract_to_cache(
     fs::create_dir_all(cache_dir)?;
 
     if is_sidecar_mode(footer) {
-        // Sidecar mode: read from .smoldata file
+        // Sidecar mode: read from .smolmachine file
         // Sidecar format: compressed_assets (assets_size) + manifest + footer
         let sidecar = sidecar_path_for(exe_path);
 
@@ -299,11 +299,14 @@ mod tests {
         // Paths with special characters
         let exe = Path::new("/path/with spaces/my-app");
         let sidecar = sidecar_path_for(exe);
-        assert_eq!(sidecar, PathBuf::from("/path/with spaces/my-app.smoldata"));
+        assert_eq!(
+            sidecar,
+            PathBuf::from("/path/with spaces/my-app.smolmachine")
+        );
 
         // Unicode in path
         let exe = Path::new("/путь/程序");
         let sidecar = sidecar_path_for(exe);
-        assert!(sidecar.to_string_lossy().ends_with(".smoldata"));
+        assert!(sidecar.to_string_lossy().ends_with(".smolmachine"));
     }
 }

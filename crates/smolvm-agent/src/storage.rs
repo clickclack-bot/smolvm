@@ -1130,7 +1130,7 @@ pub fn run_command(
 
     // Add virtiofs bind mounts to OCI spec
     for (tag, container_path, read_only) in mounts {
-        let virtiofs_mount = Path::new(VIRTIOFS_MOUNT_ROOT).join(tag);
+        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
         spec.add_bind_mount(
             &virtiofs_mount.to_string_lossy(),
             container_path,
@@ -1174,9 +1174,6 @@ pub fn setup_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Result<(
     Ok(())
 }
 
-/// Directory where virtiofs mounts are mounted in the guest.
-const VIRTIOFS_MOUNT_ROOT: &str = "/mnt/virtiofs";
-
 /// Setup volume mounts by mounting virtiofs and bind-mounting into the rootfs.
 fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Result<Vec<PathBuf>> {
     let mut mounted_paths = Vec::new();
@@ -1185,7 +1182,7 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
         debug!(tag = %tag, container_path = %container_path, read_only = %read_only, "setting up volume mount");
 
         // First, mount the virtiofs device at a staging location
-        let virtiofs_mount = Path::new(VIRTIOFS_MOUNT_ROOT).join(tag);
+        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
         std::fs::create_dir_all(&virtiofs_mount)?;
 
         // Check if already mounted

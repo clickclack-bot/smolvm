@@ -12,11 +12,11 @@ pub const MAGIC: &[u8; 8] = b"SMOLPACK";
 
 /// Current format version.
 /// Version 1: Assets appended to binary
-/// Version 2: Assets in sidecar file (.smoldata)
+/// Version 2: Assets in sidecar file (.smolmachine)
 pub const FORMAT_VERSION: u32 = 2;
 
 /// Extension for sidecar assets file.
-pub const SIDECAR_EXTENSION: &str = ".smoldata";
+pub const SIDECAR_EXTENSION: &str = ".smolmachine";
 
 /// Footer size in bytes (fixed).
 pub const FOOTER_SIZE: usize = 64;
@@ -155,6 +155,11 @@ pub struct AssetInventory {
 
     /// OCI layer tarballs.
     pub layers: Vec<LayerEntry>,
+
+    /// Pre-formatted storage disk template (optional).
+    /// When present, copied to cache on first run instead of formatting at runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_template: Option<AssetEntry>,
 }
 
 /// An asset file entry.
@@ -200,6 +205,7 @@ impl PackManifest {
                     size: 0,
                 },
                 layers: Vec::new(),
+                storage_template: None,
             },
         }
     }
