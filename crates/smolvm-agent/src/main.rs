@@ -1175,7 +1175,7 @@ fn test_tcp_syscall(target: &str) -> serde_json::Value {
                 let raw_fd = fd.as_raw_fd();
 
                 // Test lseek on the socket - this should return ESPIPE (29) for normal sockets
-                let (lseek_result, lseek_errno) = match lseek(&fd, 0, Whence::SeekCur) {
+                let (lseek_result, lseek_errno) = match lseek(raw_fd, 0, Whence::SeekCur) {
                     Ok(offset) => (offset, None),
                     Err(e) => (-1, Some((e as i32, e.desc().to_string()))),
                 };
