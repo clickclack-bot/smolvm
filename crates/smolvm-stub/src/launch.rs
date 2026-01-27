@@ -106,8 +106,14 @@ struct LibKrun {
     set_vm_config: unsafe extern "C" fn(u32, u8, u32) -> i32,
     set_root: unsafe extern "C" fn(u32, *const libc::c_char) -> i32,
     set_workdir: unsafe extern "C" fn(u32, *const libc::c_char) -> i32,
-    set_exec: unsafe extern "C" fn(u32, *const libc::c_char, *const *const libc::c_char, *const *const libc::c_char) -> i32,
-    add_disk2: unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u32, bool) -> i32,
+    set_exec: unsafe extern "C" fn(
+        u32,
+        *const libc::c_char,
+        *const *const libc::c_char,
+        *const *const libc::c_char,
+    ) -> i32,
+    add_disk2:
+        unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u32, bool) -> i32,
     add_vsock_port2: unsafe extern "C" fn(u32, u32, *const libc::c_char, bool) -> i32,
     add_virtiofs: unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char) -> i32,
     start_enter: unsafe extern "C" fn(u32) -> i32,
@@ -139,7 +145,11 @@ impl LibKrun {
             } else {
                 CStr::from_ptr(err).to_string_lossy().to_string()
             };
-            return Err(format!("failed to load {}: {}", fw_lib_path.display(), err_msg));
+            return Err(format!(
+                "failed to load {}: {}",
+                fw_lib_path.display(),
+                err_msg
+            ));
         }
         // Note: we intentionally don't close fw_handle - it needs to stay loaded
 
@@ -160,7 +170,11 @@ impl LibKrun {
             } else {
                 CStr::from_ptr(err).to_string_lossy().to_string()
             };
-            return Err(format!("failed to load {}: {}", lib_path.display(), err_msg));
+            return Err(format!(
+                "failed to load {}: {}",
+                lib_path.display(),
+                err_msg
+            ));
         }
 
         macro_rules! load_sym {
@@ -267,7 +281,8 @@ pub fn launch_vm(config: LaunchConfig) -> Result<i32, String> {
             let socket = wait_for_agent(&vsock_path, Duration::from_secs(30))?;
 
             // Build the command to run
-            let run_command = build_run_command_from_config(&config.manifest, config.command.as_deref());
+            let run_command =
+                build_run_command_from_config(&config.manifest, config.command.as_deref());
 
             if config.debug {
                 eprintln!("debug: running command: {:?}", run_command);
@@ -279,7 +294,10 @@ pub fn launch_vm(config: LaunchConfig) -> Result<i32, String> {
                 &config.manifest.image,
                 &run_command,
                 &config.env_vars,
-                config.workdir.as_deref().or(config.manifest.workdir.as_deref()),
+                config
+                    .workdir
+                    .as_deref()
+                    .or(config.manifest.workdir.as_deref()),
                 &config.mounts,
                 config.debug,
             )?;
@@ -440,7 +458,10 @@ pub fn exec_in_daemon(config: ExecConfig) -> Result<i32, String> {
         &config.manifest.image,
         &run_command,
         &config.env_vars,
-        config.workdir.as_deref().or(config.manifest.workdir.as_deref()),
+        config
+            .workdir
+            .as_deref()
+            .or(config.manifest.workdir.as_deref()),
         &config.mounts,
         config.debug,
     )
@@ -530,7 +551,10 @@ fn is_process_alive(pid: u32) -> bool {
 // ============================================================================
 
 /// Build the command to run from manifest and overrides.
-fn build_run_command_from_config(manifest: &PackManifest, command: Option<&[String]>) -> Vec<String> {
+fn build_run_command_from_config(
+    manifest: &PackManifest,
+    command: Option<&[String]>,
+) -> Vec<String> {
     if let Some(cmd) = command {
         return cmd.to_vec();
     }
@@ -576,12 +600,8 @@ fn wait_for_agent(socket_path: &Path, timeout: Duration) -> Result<UnixStream, S
         match UnixStream::connect(socket_path) {
             Ok(stream) => {
                 // Set timeouts
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(30)))
-                    .ok();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(30)))
-                    .ok();
+                stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+                stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
                 return Ok(stream);
             }
             Err(_) => {
@@ -1004,8 +1024,9 @@ mod tests {
         assert!(result.is_err());
 
         // Wrong types
-        let result: Result<DaemonState, _> =
-            serde_json::from_str("{\"pid\": \"not a number\", \"socket_path\": \"/tmp/x\", \"started_at\": 0}");
+        let result: Result<DaemonState, _> = serde_json::from_str(
+            "{\"pid\": \"not a number\", \"socket_path\": \"/tmp/x\", \"started_at\": 0}",
+        );
         assert!(result.is_err());
 
         // Missing fields

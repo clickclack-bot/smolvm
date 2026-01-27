@@ -93,7 +93,9 @@ pub fn init_packed_layers() -> Option<PathBuf> {
 
 /// Get the packed layers directory if available.
 pub fn get_packed_layers_dir() -> Option<&'static PathBuf> {
-    PACKED_LAYERS_DIR.get_or_init(|| init_packed_layers()).as_ref()
+    PACKED_LAYERS_DIR
+        .get_or_init(|| init_packed_layers())
+        .as_ref()
 }
 
 /// Create a synthetic ImageInfo from packed layers.
@@ -141,7 +143,7 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
 
     Ok(ImageInfo {
         reference: image.to_string(),
-        digest: "packed".to_string(),  // No real digest available for packed images
+        digest: "packed".to_string(), // No real digest available for packed images
         size: total_size,
         created: None,
         architecture,
@@ -622,13 +624,11 @@ pub fn export_layer(image_digest: &str, layer_index: usize) -> Result<PathBuf> {
             if let Some(config) = manifest.get("config") {
                 if let Some(digest) = config.get("digest").and_then(|d| d.as_str()) {
                     if digest == image_digest {
-                        layers = manifest["layers"]
-                            .as_array()
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|l| l["digest"].as_str().map(String::from))
-                                    .collect()
-                            });
+                        layers = manifest["layers"].as_array().map(|arr| {
+                            arr.iter()
+                                .filter_map(|l| l["digest"].as_str().map(String::from))
+                                .collect()
+                        });
                         break;
                     }
                 }
@@ -636,9 +636,8 @@ pub fn export_layer(image_digest: &str, layer_index: usize) -> Result<PathBuf> {
         }
     }
 
-    let layers = layers.ok_or_else(|| {
-        StorageError(format!("image with digest {} not found", image_digest))
-    })?;
+    let layers = layers
+        .ok_or_else(|| StorageError(format!("image with digest {} not found", image_digest)))?;
 
     if layer_index >= layers.len() {
         return Err(StorageError(format!(

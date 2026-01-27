@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/smolvm-agent", "crates/smolvm-protocol"]
+members = [".", "crates/smolvm-agent", "crates/smolvm-protocol", "crates/smolvm-pack", "crates/smolvm-stub"]
 resolver = "2"
 
 [package]
@@ -22,6 +22,7 @@ path = "src/main.rs"
 
 [dependencies]
 smolvm-protocol = { path = "crates/smolvm-protocol" }
+smolvm-pack = { path = "crates/smolvm-pack" }
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -32,6 +33,7 @@ dirs = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 humantime = "2"
+tempfile = "3"
 
 # HTTP API server
 tokio = { version = "1", features = ["full"] }

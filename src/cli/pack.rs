@@ -81,10 +81,7 @@ impl PackCmd {
         // Start agent to pull image and export layers
         println!("Starting agent VM...");
         let manager = AgentManager::new_default()?;
-        manager.start_with_config(
-            Vec::new(),
-            VmResources { cpus: 2, mem: 512 },
-        )?;
+        manager.start_with_config(Vec::new(), VmResources { cpus: 2, mem: 512 })?;
         let mut client = manager.connect()?;
 
         // Pull image
@@ -118,7 +115,12 @@ impl PackCmd {
         // Export and collect layers
         println!("Exporting {} layers...", image_info.layer_count);
         for (i, layer_digest) in image_info.layers.iter().enumerate() {
-            println!("  Layer {}/{}: {}...", i + 1, image_info.layer_count, &layer_digest[..19]);
+            println!(
+                "  Layer {}/{}: {}...",
+                i + 1,
+                image_info.layer_count,
+                &layer_digest[..19]
+            );
 
             // Export layer via agent
             let layer_data = self.export_layer(&mut client, &image_info.digest, i)?;
@@ -134,7 +136,8 @@ impl PackCmd {
 
         // Build manifest
         let platform = format!("{}/{}", image_info.os, image_info.architecture);
-        let mut manifest = PackManifest::new(self.image.clone(), image_info.digest.clone(), platform);
+        let mut manifest =
+            PackManifest::new(self.image.clone(), image_info.digest.clone(), platform);
         manifest.cpus = self.cpus;
         manifest.mem = self.mem;
 
@@ -150,8 +153,8 @@ impl PackCmd {
         manifest.assets = collector.into_inventory();
 
         // Recreate collector for compression (we consumed it above)
-        let collector = AssetCollector::new(staging_dir)
-            .map_err(|e| Error::AgentError(e.to_string()))?;
+        let collector =
+            AssetCollector::new(staging_dir).map_err(|e| Error::AgentError(e.to_string()))?;
 
         // Pack the binary
         println!("Assembling packed binary...");

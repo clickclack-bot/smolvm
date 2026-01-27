@@ -299,10 +299,7 @@ mod tests {
         // Paths with special characters
         let exe = Path::new("/path/with spaces/my-app");
         let sidecar = sidecar_path_for(exe);
-        assert_eq!(
-            sidecar,
-            PathBuf::from("/path/with spaces/my-app.smoldata")
-        );
+        assert_eq!(sidecar, PathBuf::from("/path/with spaces/my-app.smoldata"));
 
         // Unicode in path
         let exe = Path::new("/путь/程序");

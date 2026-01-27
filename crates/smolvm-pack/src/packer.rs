@@ -116,8 +116,8 @@ impl Packer {
 
         // 2d. Write footer to sidecar
         let footer = PackFooter {
-            stub_size: 0,               // Not used in sidecar mode
-            assets_offset: 0,           // Assets start at beginning of sidecar
+            stub_size: 0,     // Not used in sidecar mode
+            assets_offset: 0, // Assets start at beginning of sidecar
             assets_size,
             manifest_offset,
             manifest_size,
@@ -368,7 +368,9 @@ mod tests {
 
         // Pack with assets
         let output_path = temp_dir.path().join("packed");
-        let packer = Packer::new(manifest).with_stub(&stub_path).with_assets(collector);
+        let packer = Packer::new(manifest)
+            .with_stub(&stub_path)
+            .with_assets(collector);
         packer.pack(&output_path).unwrap();
 
         // Verify we can read the manifest with layer info

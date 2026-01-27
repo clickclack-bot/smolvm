@@ -42,7 +42,10 @@ pub mod packer;
 pub mod signing;
 
 pub use format::{PackFooter, PackManifest, FOOTER_SIZE, MAGIC, SIDECAR_EXTENSION};
-pub use packer::{read_footer, read_footer_from_sidecar, read_manifest, read_manifest_from_sidecar, sidecar_path_for, Packer};
+pub use packer::{
+    read_footer, read_footer_from_sidecar, read_manifest, read_manifest_from_sidecar,
+    sidecar_path_for, Packer,
+};
 
 use thiserror::Error;
 
