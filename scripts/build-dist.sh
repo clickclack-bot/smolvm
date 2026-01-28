@@ -48,9 +48,9 @@ chmod +x "$DIST_DIR/smolvm"
 # Copy libraries
 if [[ "$(uname -s)" == "Darwin" ]]; then
     cp "$LIB_DIR/libkrun.dylib" "$DIST_DIR/lib/"
-    cp "$LIB_DIR/libkrunfw.4.dylib" "$DIST_DIR/lib/"
+    cp "$LIB_DIR/libkrunfw.5.dylib" "$DIST_DIR/lib/"
     # Create symlink for compatibility
-    ln -sf libkrunfw.4.dylib "$DIST_DIR/lib/libkrunfw.dylib"
+    ln -sf libkrunfw.5.dylib "$DIST_DIR/lib/libkrunfw.dylib"
 else
     cp "$LIB_DIR/libkrun.so"* "$DIST_DIR/lib/"
     cp "$LIB_DIR/libkrunfw.so"* "$DIST_DIR/lib/"
@@ -74,30 +74,38 @@ INSTALLATION
 3. (Optional) Create a symlink:
    sudo ln -s /path/to/smolvm-directory/smolvm /usr/local/bin/smolvm
 
+PREREQUISITES
+=============
+
+macOS:
+  - macOS 11.0 (Big Sur) or later
+  - e2fsprogs for disk formatting: brew install e2fsprogs
+
+Linux:
+  - KVM support (/dev/kvm must exist)
+  - e2fsprogs (usually pre-installed)
+
 USAGE
 =====
 
 Run the 'smolvm' script (not smolvm-bin directly):
 
-  ./smolvm run alpine:latest echo "Hello World"
-  ./smolvm create --name myvm alpine:latest /bin/sh
-  ./smolvm start myvm
-  ./smolvm list
-  ./smolvm stop myvm
-  ./smolvm delete myvm
-
-REQUIREMENTS
-============
-
-- macOS 11.0+ (Apple Silicon or Intel) or Linux with KVM
-- buildah (for OCI image support): brew install buildah
+  ./smolvm sandbox run alpine:latest echo "Hello World"
+  ./smolvm microvm create --name myvm alpine:latest /bin/sh
+  ./smolvm microvm start myvm
+  ./smolvm microvm ls
+  ./smolvm microvm stop myvm
+  ./smolvm microvm delete myvm
 
 TROUBLESHOOTING
 ===============
 
-If you see "library not found" errors, make sure you're running the
-'smolvm' wrapper script, not 'smolvm-bin' directly. The wrapper sets
-up the library path automatically.
+"library not found" errors:
+  Make sure you're running the 'smolvm' wrapper script, not 'smolvm-bin'
+  directly. The wrapper sets up the library path automatically.
+
+"mkfs.ext4 not found" errors:
+  Install e2fsprogs (see Prerequisites above).
 
 For more information: https://github.com/smolvm/smolvm
 EOF
@@ -118,3 +126,6 @@ ls -la "$DIST_DIR"
 echo ""
 echo "To test locally:"
 echo "  cd $DIST_DIR && ./smolvm --help"
+echo ""
+echo "To install locally:"
+echo "  ./scripts/install-local.sh"
