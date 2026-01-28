@@ -256,7 +256,9 @@ install_smolvm() {
     checksums_url=$(get_checksum_url "$version")
     local tmp_dir
     tmp_dir=$(mktemp -d)
-    local archive="${tmp_dir}/smolvm.tar.gz"
+    local archive_name
+    archive_name=$(basename "$url")
+    local archive="${tmp_dir}/${archive_name}"
     local checksums="${tmp_dir}/checksums.txt"
 
     # Download archive

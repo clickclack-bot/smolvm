@@ -11,7 +11,7 @@ MicroVMs are used to power much of the internet by hyperscalers for services lik
 
 However, it is also inaccessible to the average developer's workflow due to setup and configuration complexity.
 
-smolVM works to make microVM more accessible for the general developer to take advantage of microVM's strong points in fast coldstarts <200ms, security, and isolation with generally good defaults.
+smolVM works to make microVM more accessible for the general developer to take advantage of microVM's strong points in fast coldstarts <250ms, security, and isolation with generally good defaults.
 
 ## What is smolVM?
 
@@ -47,8 +47,11 @@ smolVM is an microVM manager that orchestrates multiple components:
 ## Install
 
 ```bash
-# Quick install (macOS/Linux)
-curl -sSL https://smolmachines.com/install.sh | sh
+# Quick install (macOS Apple Silicon only for now)
+curl -sSL https://smolmachines.com/install.sh | bash
+
+# Uninstall
+curl -sSL https://smolmachines.com/install.sh | bash -s -- --uninstall
 
 # macOS (Homebrew) - WIP
 brew install smolvm/tap/smolvm
@@ -64,8 +67,27 @@ brew install smolvm/tap/smolvm
 - For disk formatting: `brew install e2fsprogs`
 
 **Linux:**
-- KVM support (`/dev/kvm` must exist)
+- Linux kernel 5.4+ with KVM support
+- User must have access to `/dev/kvm` (typically via `kvm` group)
 - e2fsprogs (usually pre-installed)
+
+**Linux KVM Setup:**
+```bash
+# Check if KVM is available
+ls -la /dev/kvm
+
+# If /dev/kvm doesn't exist, load the KVM modules:
+sudo modprobe kvm
+sudo modprobe kvm_intel  # For Intel CPUs
+# OR
+sudo modprobe kvm_amd    # For AMD CPUs
+
+# Grant your user access to KVM (re-login required):
+sudo usermod -aG kvm $USER
+
+# Verify after re-login:
+groups | grep kvm
+```
 
 ## Usage
 
@@ -129,7 +151,15 @@ smolvm pack python:3.12 -o ./py-sandbox --cpus 2 --mem 1024
 
 ## EXPERIMENTAL: Packed Binaries - Zero-Dependency Distribution
 
-Package your application into a **single executable** with the entire microVM environment embedded:
+Package your application into a **distributable binary** with the entire microVM environment embedded.
+No dependencies required on the target machine - no Docker, no smolvm, no e2fsprogs.
+
+**Output files:**
+```
+./my-app              # Executable stub (~1.7MB)
+./my-app.smolmachine  # Assets: libs, rootfs, layers (~15-75MB)
+```
+Keep both files together when distributing.
 
 
 **Pack command:**
@@ -160,12 +190,13 @@ smolvm pack python:3.12 -o ./my-python-sandbox
 ./my-python-sandbox -v ~/code:/workspace python /workspace/script.py
 ```
 
-**What's inside the packed binary:**
+**What's inside the .smolmachine sidecar:**
 - Linux microkernel (libkrunfw)
 - Hypervisor interface (libkrun)
 - Container runtime (crun)
 - Your OCI image layers
-- smolvm agent
+- smolvm agent rootfs
+- Pre-formatted storage disk (no mkfs.ext4 needed)
 
 **For coding agents - daemon mode with ~10-20ms exec:**
 
@@ -188,14 +219,34 @@ smolvm pack python:3.12 -o ./my-python-sandbox
 
 This is ideal for AI coding agents that need to execute many commands in isolated sandboxes with low latency.
 
-## Compared to existing tools
+## Comparison
 
-| Tool | Local Dev | Single Binary | No Daemon | Hardware Isolation |
-|------|-----------|---------------|-----------|-------------------|
-| smolvm | ✅ | ✅ (pack) | ✅ | ✅ (microVM) |
-| Docker | ✅ | ❌ | ❌ | ❌ (namespaces) |
-| Firecracker | ❌ (server) | ❌ | ❌ | ✅ |
-| gVisor | ✅ | ❌ | ❌ | ⚠️ (syscall filter) |
+|                     | Containers | QEMU (VM) | Firecracker | Kata | smolvm |
+|---------------------|------------|-----------|-------------|------|--------|
+| Kernel isolation    | Shared with host ¹ | Separate | Separate | Separate | Separate |
+| Boot time           | ~100ms ² | ~15-30s ³ | <125ms ⁴ | ~500ms ⁵ | <250ms |
+| Setup               | Easy | Complex | Complex | Complex | Easy |
+| Linux               | Yes | Yes | Yes | Yes | Yes |
+| macOS               | Via Docker VM | Yes | No ⁶ | No ⁷ | Yes |
+| Guest rootfs        | Layered images | Disk image | DIY ⁸ | Bundled + DIY | Bundled |
+| Embeddable          | No | No | No | No | Yes |
+| Distribution        | Daemon + CLI ⁹ | Multiple binaries | Binary + rootfs | Runtime stack ¹⁰ | Single binary |
+
+<details>
+<summary>References</summary>
+
+1. [Container isolation fundamentals](https://www.docker.com/blog/understanding-docker-container-escapes/)
+2. [containerd vs dockerd benchmark](https://github.com/containerd/containerd/issues/4482)
+3. [QEMU boot time](https://wiki.qemu.org/Features/TCG)
+4. [Firecracker website](https://firecracker-microvm.github.io/)
+5. [Kata boot time](https://github.com/kata-containers/kata-containers/issues/4292)
+6. [Firecracker requires KVM](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md)
+7. [Kata macOS support](https://github.com/kata-containers/kata-containers/issues/243)
+8. [Firecracker rootfs setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/rootfs-and-kernel-setup.md)
+9. [Docker daemon docs](https://docs.docker.com/config/daemon/)
+10. [Kata installation guide](https://github.com/kata-containers/kata-containers/blob/main/docs/install/README.md)
+
+</details>
 
 smolvm is designed for dev machines - easy setup, single binary distribution, hardware-level isolation.
 
@@ -204,13 +255,15 @@ smolvm is designed for dev machines - easy setup, single binary distribution, ha
 | Host | Guest | Status |
 |------|-------|--------|
 | macOS Apple Silicon | arm64 Linux | ✅ |
-| macOS Apple Silicon | x86_64 Linux | WIP (Rosetta 2, [experimental]) |
-| macOS Intel | x86_64 Linux | ? | No machine to test this.
-| Linux x86_64 | x86_64 Linux | WIP | My machine needs repairs.
+| macOS Apple Silicon | x86_64 Linux | WIP (Rosetta 2, experimental) |
+| macOS Intel | x86_64 Linux | Untested |
+| Linux x86_64 | x86_64 Linux | ✅ |
+| Linux aarch64 | aarch64 Linux | ✅ |
 
 ## Known Limitations
 
 - **Container rootfs writes**: Writes to container filesystem (`/tmp`, `/home`, etc.) fail with "Connection reset by network" due to a libkrun TSI bug with overlayfs. **Writes to mounted volumes work** - see below.
+- **Network: TCP/UDP only**: TSI (Transparent Socket Impersonation) only supports TCP and UDP sockets. ICMP (`ping`) and raw sockets do not work. Use `wget`, `curl`, or other TCP-based tools to test connectivity.
 - **Volume mounts**: Directories only (no single files)
 - **Rosetta 2**: Required for x86_64 images on Apple Silicon (`softwareupdate --install-rosetta`)
 - **macOS**: Binary must be signed with Hypervisor.framework entitlements
