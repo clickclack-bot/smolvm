@@ -93,42 +93,32 @@ groups | grep kvm
 
 ```bash
 # Quick sandbox (ephemeral)
-smolvm sandbox run alpine:latest echo "Hello"
-smolvm sandbox run -v ~/code:/code python:3.12 python /code/script.py
+smolvm sandbox run alpine:latest -- echo "Hello"
+smolvm sandbox run -v ~/code:/workspace alpine:latest -- ls /workspace
 
 # MicroVM management
-smolvm microvm run alpine:latest echo "Hello"      # Run and stop
-smolvm microvm exec echo "Fast"                     # Persistent (~50ms warm)
-smolvm microvm exec -it /bin/sh                     # Interactive shell
+smolvm microvm start                              # Start default VM
+smolvm microvm exec -- echo "Hello"               # Execute command
+smolvm microvm exec -- cat /etc/os-release        # Check OS
 smolvm microvm stop
 
 # Named VMs
-smolvm microvm create --name web --cpus 2 --mem 512 node:20
-smolvm microvm start web
-smolvm microvm stop web
-smolvm microvm ls
-smolvm microvm delete web
-
-# Containers inside VMs
-smolvm container create myvm alpine -- sleep 300
-smolvm container start myvm <id>
-smolvm container exec myvm <id> -- ps aux
-smolvm container stop myvm <id>
-smolvm container ls myvm
+smolvm microvm create myvm
+smolvm microvm start myvm
+smolvm microvm exec myvm -- echo "Hello"
+smolvm microvm stop myvm
+smolvm microvm delete myvm
 
 # Server mode (HTTP API)
 smolvm serve                          # localhost:8080
 smolvm serve --listen 0.0.0.0:9000    # Custom address
 
 # Pack into distributable binary
-smolvm pack alpine:latest -o ./my-app
-smolvm pack python:3.12 -o ./py-sandbox --cpus 2 --mem 1024
-
-# Run packed binary (no smolvm needed)
-./my-app echo "Hello"
-./py-sandbox start                    # Daemon mode
-./py-sandbox exec python script.py    # Fast exec (~10-20ms)
-./py-sandbox stop
+smolvm pack alpine:latest -o ./my-sandbox
+./my-sandbox echo "Hello"             # Run command
+./my-sandbox start                    # Start daemon
+./my-sandbox exec echo "Fast"         # Fast exec (~10-20ms)
+./my-sandbox stop                     # Stop daemon
 ```
 
 ## Options
@@ -183,11 +173,11 @@ Keep both files together when distributing.
 
 ```bash
 # Create a self-contained binary
-smolvm pack python:3.12 -o ./my-python-sandbox
+smolvm pack alpine:latest -o ./my-sandbox
 
 # Distribute to users - they just run it (no Docker, no smolvm install needed)
-./my-python-sandbox python -c "print('Hello from isolated microVM')"
-./my-python-sandbox -v ~/code:/workspace python /workspace/script.py
+./my-sandbox echo "Hello from isolated microVM"
+./my-sandbox -v ~/code:/workspace ls /workspace
 ```
 
 **What's inside the .smolmachine sidecar:**
@@ -202,19 +192,19 @@ smolvm pack python:3.12 -o ./my-python-sandbox
 
 ```bash
 # Start the VM daemon (boots once, stays running)
-./my-agent start
+./my-sandbox start
 
 # Fast repeated execution (~10-20ms each, not ~500ms)
-./my-agent exec python -c "x = 1"
-./my-agent exec python -c "print(x)"  # Fresh process, but VM is warm
-./my-agent exec ls /workspace
+./my-sandbox exec echo "command 1"
+./my-sandbox exec echo "command 2"
+./my-sandbox exec ls /
 
 # Check status
-./my-agent status
+./my-sandbox status
 # → Daemon running (pid: 12345, uptime: 60s)
 
 # Stop when done
-./my-agent stop
+./my-sandbox stop
 ```
 
 This is ideal for AI coding agents that need to execute many commands in isolated sandboxes with low latency.
@@ -272,16 +262,16 @@ smolvm is designed for dev machines - easy setup, single binary distribution, ha
 
 ```bash
 # Works: use top-level mount path like /workspace
-smolvm sandbox run -v ~/code:/workspace python:3.12 -- python -c "open('/workspace/out.py', 'w').write('hello')"
+smolvm sandbox run -v ~/code:/workspace alpine:latest -- sh -c "echo 'hello' > /workspace/out.txt"
 
 # Fails: nested mount paths like /mnt/code trigger the bug
-smolvm sandbox run -v ~/code:/mnt/code python:3.12 -- python -c "open('/mnt/code/out.py', 'w').write('hello')"
+smolvm sandbox run -v ~/code:/mnt/code alpine:latest -- sh -c "echo 'hello' > /mnt/code/out.txt"
 
 # Fails: write to container rootfs
-smolvm sandbox run python:3.12 -- python -c "open('/tmp/out.py', 'w').write('hello')"
+smolvm sandbox run alpine:latest -- sh -c "echo 'hello' > /tmp/out.txt"
 ```
 
-Use top-level mount paths (`/workspace`, `/code` ,`/documents/projectname`) - paths like `/mnt/host` which conflict with mounted paths alpine/your container will fail.
+Use top-level mount paths (`/workspace`, `/code`, `/data`) - nested paths like `/mnt/code` trigger a libkrun bug.
 
 ## Storage
 
@@ -329,18 +319,16 @@ cargo build --release
 codesign --sign - --entitlements entitlements.plist --force target/release/smolvm
 
 # Basic integration tests
-DYLD_LIBRARY_PATH=$PWD/lib ./target/release/smolvm microvm run alpine:latest echo "Hello from VM"
-DYLD_LIBRARY_PATH=$PWD/lib ./target/release/smolvm sandbox run alpine:latest -- ls /
+DYLD_LIBRARY_PATH=$PWD/lib ./target/release/smolvm sandbox run alpine:latest -- echo "Hello"
+DYLD_LIBRARY_PATH=$PWD/lib ./target/release/smolvm sandbox run alpine:latest -- cat /etc/os-release
 
 # Test with mounts
 DYLD_LIBRARY_PATH=$PWD/lib ./target/release/smolvm sandbox run -v /tmp:/workspace alpine:latest -- ls /workspace
 
-# Test container operations
-DYLD_LIBRARY_PATH=$PWD/lib ./target/release/smolvm microvm create --name test-vm
-DYLD_LIBRARY_PATH=$PWD/lib ./target/release/smolvm microvm start test-vm
-DYLD_LIBRARY_PATH=$PWD/lib ./target/release/smolvm microvm exec test-vm -- echo "Hello"
-DYLD_LIBRARY_PATH=$PWD/lib ./target/release/smolvm microvm stop test-vm
-DYLD_LIBRARY_PATH=$PWD/lib ./target/release/smolvm microvm delete test-vm
+# Test microvm lifecycle
+DYLD_LIBRARY_PATH=$PWD/lib ./target/release/smolvm microvm start
+DYLD_LIBRARY_PATH=$PWD/lib ./target/release/smolvm microvm exec -- echo "Hello"
+DYLD_LIBRARY_PATH=$PWD/lib ./target/release/smolvm microvm stop
 ```
 
 ## AI Usage disclosure
