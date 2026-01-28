@@ -94,7 +94,7 @@ groups | grep kvm
 ```bash
 # Quick sandbox (ephemeral)
 smolvm sandbox run alpine:latest -- echo "Hello"
-smolvm sandbox run -v ~/code:/workspace alpine:latest -- ls /workspace
+smolvm sandbox run -v /tmp:/workspace alpine:latest -- ls /workspace
 
 # MicroVM management
 smolvm microvm start                              # Start default VM
@@ -177,7 +177,7 @@ smolvm pack alpine:latest -o ./my-sandbox
 
 # Distribute to users - they just run it (no Docker, no smolvm install needed)
 ./my-sandbox echo "Hello from isolated microVM"
-./my-sandbox -v ~/code:/workspace ls /workspace
+./my-sandbox -v /tmp:/workspace ls /workspace
 ```
 
 **What's inside the .smolmachine sidecar:**
@@ -262,16 +262,16 @@ smolvm is designed for dev machines - easy setup, single binary distribution, ha
 
 ```bash
 # Works: use top-level mount path like /workspace
-smolvm sandbox run -v ~/code:/workspace alpine:latest -- sh -c "echo 'hello' > /workspace/out.txt"
+smolvm sandbox run -v /tmp:/workspace alpine:latest -- sh -c "echo 'hello' > /workspace/out.txt"
 
-# Fails: nested mount paths like /mnt/code trigger the bug
-smolvm sandbox run -v ~/code:/mnt/code alpine:latest -- sh -c "echo 'hello' > /mnt/code/out.txt"
+# Fails: nested mount paths like /mnt/data trigger the bug
+smolvm sandbox run -v /tmp:/mnt/data alpine:latest -- sh -c "echo 'hello' > /mnt/data/out.txt"
 
 # Fails: write to container rootfs
 smolvm sandbox run alpine:latest -- sh -c "echo 'hello' > /tmp/out.txt"
 ```
 
-Use top-level mount paths (`/workspace`, `/code`, `/data`) - nested paths like `/mnt/code` trigger a libkrun bug.
+Use top-level mount paths (`/workspace`, `/code`, `/data`) - nested paths like `/mnt/data` trigger a libkrun bug.
 
 ## Storage
 
