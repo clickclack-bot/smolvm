@@ -547,11 +547,18 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
     let os = config_json["os"].as_str().unwrap_or("linux").to_string();
     let created = config_json["created"].as_str().map(String::from);
 
-    // Calculate total size
+    // Verify all layers exist and calculate total size
     let mut total_size = 0u64;
     for layer_digest in &layers {
         let layer_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
         let layer_dir = root.join(LAYERS_DIR).join(layer_id);
+        if !layer_dir.exists() {
+            // Layer missing - image is incomplete, needs re-pull
+            // Clean up corrupt manifest to avoid repeated failures
+            warn!(layer = %layer_id, image = %image, "cached image has missing layer, cleaning up and will re-pull");
+            let _ = std::fs::remove_file(&manifest_path);
+            return Ok(None);
+        }
         if let Ok(size) = dir_size(&layer_dir) {
             total_size += size;
         }
