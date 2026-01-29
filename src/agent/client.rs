@@ -199,18 +199,73 @@ impl AgentClient {
     ///
     /// * `image` - Image reference (e.g., "alpine:latest")
     /// * `platform` - Optional platform (e.g., "linux/arm64")
+    ///
+    /// # Note
+    ///
+    /// This operation uses a 10-minute timeout to accommodate large images
+    /// that may take significant time to download and extract.
     pub fn pull(&mut self, image: &str, platform: Option<&str>) -> Result<ImageInfo> {
-        let resp = self.request(&AgentRequest::Pull {
+        self.pull_with_progress(image, platform, |_, _, _| {})
+    }
+
+    /// Pull an OCI image with progress callback.
+    ///
+    /// The callback receives (current_layer, total_layers, layer_id) for each layer.
+    pub fn pull_with_progress<F>(
+        &mut self,
+        image: &str,
+        platform: Option<&str>,
+        mut progress: F,
+    ) -> Result<ImageInfo>
+    where
+        F: FnMut(usize, usize, &str),
+    {
+        // Use a long timeout for pull - large images can take minutes to download/extract
+        self.set_read_timeout(Duration::from_secs(600))?; // 10 minutes
+
+        // Send the pull request
+        let data = encode_message(&AgentRequest::Pull {
             image: image.to_string(),
             platform: platform.map(String::from),
-        })?;
+        })
+        .map_err(|e| Error::AgentError(e.to_string()))?;
 
-        match resp {
-            AgentResponse::Ok { data: Some(data) } => {
-                serde_json::from_value(data).map_err(|e| Error::AgentError(e.to_string()))
+        self.stream
+            .write_all(&data)
+            .map_err(|e| Error::AgentError(format!("write failed: {}", e)))?;
+
+        // Read responses - loop until we get Ok or Error (skip Progress)
+        loop {
+            let resp = self.read_response();
+
+            // Reset timeout on final response
+            if !matches!(resp, Ok(AgentResponse::Progress { .. })) {
+                self.reset_read_timeout();
             }
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response".into())),
+
+            match resp? {
+                AgentResponse::Progress {
+                    percent,
+                    layer,
+                    message: _,
+                } => {
+                    // Extract current/total from percent or message
+                    let current = percent.unwrap_or(0) as usize;
+                    let total = 100;
+                    let layer_id = layer.as_deref().unwrap_or("");
+                    progress(current, total, layer_id);
+                }
+                AgentResponse::Ok { data: Some(data) } => {
+                    return serde_json::from_value(data)
+                        .map_err(|e| Error::AgentError(e.to_string()));
+                }
+                AgentResponse::Error { message, .. } => {
+                    return Err(Error::AgentError(message));
+                }
+                _ => {
+                    return Err(Error::AgentError("unexpected response".into()));
+                }
+            }
         }
     }
 

@@ -112,8 +112,34 @@ impl ContainerCreateCmd {
 
         // Pull image if needed
         if !std::path::Path::new(&self.image).exists() {
-            println!("Pulling image {}...", self.image);
-            client.pull(&self.image, None)?;
+            print!("Pulling image {}...", self.image);
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+
+            let image_name = self.image.clone();
+            let mut last_percent = 0u8;
+            client.pull_with_progress(&self.image, None, |percent, _total, _layer| {
+                let percent = percent as u8;
+                if percent != last_percent && percent <= 100 {
+                    print!("\rPulling image {}... [", image_name);
+                    let filled = (percent as usize) / 5;
+                    for i in 0..20 {
+                        if i < filled {
+                            print!("=");
+                        } else if i == filled {
+                            print!(">");
+                        } else {
+                            print!(" ");
+                        }
+                    }
+                    print!("] {}%", percent);
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    last_percent = percent;
+                }
+            })?;
+            println!(
+                "\rPulling image {}... done.                              ",
+                self.image
+            );
         }
 
         // Parse environment variables

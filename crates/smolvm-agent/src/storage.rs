@@ -504,6 +504,173 @@ pub fn pull_image(image: &str, platform: Option<&str>) -> Result<ImageInfo> {
     })
 }
 
+/// Pull an OCI image with progress callback.
+///
+/// The callback is called for each layer being pulled with (current, total, layer_id).
+pub fn pull_image_with_progress<F>(
+    image: &str,
+    platform: Option<&str>,
+    mut progress: F,
+) -> Result<ImageInfo>
+where
+    F: FnMut(usize, usize, &str),
+{
+    // Validate image reference before any operations
+    crate::oci::validate_image_reference(image).map_err(StorageError)?;
+
+    // If packed layers are available, return synthetic image info
+    if let Some(packed_dir) = get_packed_layers_dir() {
+        info!(image = %image, "using packed layers, skipping network pull");
+        return create_packed_image_info(image, packed_dir);
+    }
+
+    // Check if already cached - skip network call entirely
+    if let Ok(Some(info)) = query_image(image) {
+        debug!(image = %image, "image already cached, skipping pull");
+        return Ok(info);
+    }
+
+    let root = Path::new(STORAGE_ROOT);
+
+    // Determine platform - default to current architecture
+    let platform = platform.or({
+        #[cfg(target_arch = "aarch64")]
+        {
+            Some("linux/arm64")
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            Some("linux/amd64")
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            None
+        }
+    });
+
+    // Get manifest with platform specified
+    progress(0, 0, "fetching manifest");
+    info!(image = %image, platform = ?platform, "fetching manifest");
+    let manifest = crane_manifest(image, platform)?;
+
+    // Parse manifest to get config and layers
+    let manifest_json: serde_json::Value =
+        serde_json::from_str(&manifest).map_err(|e| StorageError(e.to_string()))?;
+
+    // Handle manifest list (multi-arch)
+    let config_digest = if manifest_json.get("config").is_some() {
+        manifest_json["config"]["digest"]
+            .as_str()
+            .ok_or_else(|| StorageError("missing config digest".into()))?
+    } else if manifest_json.get("manifests").is_some() {
+        return Err(StorageError(format!(
+            "got manifest list instead of image manifest - platform may not be available. \
+             manifests: {:?}",
+            manifest_json["manifests"].as_array().map(|arr| arr
+                .iter()
+                .filter_map(|m| m["platform"]["architecture"].as_str())
+                .collect::<Vec<_>>())
+        )));
+    } else {
+        return Err(StorageError("unknown manifest format".into()));
+    };
+
+    let layers: Vec<String> = manifest_json["layers"]
+        .as_array()
+        .ok_or_else(|| StorageError("missing layers".into()))?
+        .iter()
+        .filter_map(|l| l["digest"].as_str().map(String::from))
+        .collect();
+
+    let total_layers = layers.len();
+
+    // Save manifest
+    let manifest_path = root
+        .join(MANIFESTS_DIR)
+        .join(sanitize_image_name(image) + ".json");
+    std::fs::write(&manifest_path, &manifest)?;
+
+    // Fetch and save config
+    let config = crane_config(image, platform)?;
+    let config_id = config_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(config_digest);
+    let config_path = root.join(CONFIGS_DIR).join(format!("{}.json", config_id));
+    std::fs::write(&config_path, &config)?;
+
+    // Parse config for metadata
+    let config_json: serde_json::Value =
+        serde_json::from_str(&config).map_err(|e| StorageError(e.to_string()))?;
+
+    // Extract layers with progress updates
+    let mut total_size = 0u64;
+    for (i, layer_digest) in layers.iter().enumerate() {
+        let layer_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
+        let layer_dir = root.join(LAYERS_DIR).join(layer_id);
+
+        // Report progress
+        progress(i + 1, total_layers, layer_id);
+
+        if layer_dir.exists() {
+            info!(layer = %layer_id, "layer already cached");
+            continue;
+        }
+
+        info!(
+            layer = %layer_id,
+            progress = format!("{}/{}", i + 1, total_layers),
+            "extracting layer"
+        );
+
+        std::fs::create_dir_all(&layer_dir)?;
+
+        // Stream layer directly to tar extraction
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "crane blob '{}@{}' {} | tar -xzf - -C '{}'",
+                image,
+                layer_digest,
+                platform
+                    .map(|p| format!("--platform={}", p))
+                    .unwrap_or_default(),
+                layer_dir.display()
+            ))
+            .status()?;
+
+        if !status.success() {
+            let _ = std::fs::remove_dir_all(&layer_dir);
+            return Err(StorageError(format!(
+                "failed to extract layer {}",
+                layer_digest
+            )));
+        }
+
+        if let Ok(size) = dir_size(&layer_dir) {
+            total_size += size;
+        }
+    }
+
+    // Build ImageInfo
+    let architecture = config_json["architecture"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
+    let os = config_json["os"].as_str().unwrap_or("linux").to_string();
+    let created = config_json["created"].as_str().map(String::from);
+
+    Ok(ImageInfo {
+        reference: image.to_string(),
+        digest: config_digest.to_string(),
+        size: total_size,
+        created,
+        architecture,
+        os,
+        layer_count: layers.len(),
+        layers,
+    })
+}
+
 /// Query if an image exists locally.
 pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
     let root = Path::new(STORAGE_ROOT);
