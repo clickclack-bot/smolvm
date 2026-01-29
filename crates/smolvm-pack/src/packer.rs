@@ -37,10 +37,19 @@ impl Packer {
         self
     }
 
-    /// Set the asset collector.
+    /// Set the asset collector and update manifest with its inventory.
     pub fn with_assets(mut self, collector: AssetCollector) -> Self {
         // Update manifest with the collector's inventory
         self.manifest.assets = collector.inventory().clone();
+        self.asset_collector = Some(collector);
+        self
+    }
+
+    /// Set the asset collector without updating the manifest.
+    ///
+    /// Use this when the manifest already has the correct asset inventory
+    /// (e.g., when it was set from a different collector that was consumed).
+    pub fn with_asset_collector(mut self, collector: AssetCollector) -> Self {
         self.asset_collector = Some(collector);
         self
     }

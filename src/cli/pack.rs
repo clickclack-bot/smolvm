@@ -160,6 +160,8 @@ impl PackCmd {
         manifest.assets = collector.into_inventory();
 
         // Recreate collector for compression (we consumed it above)
+        // Note: We use with_asset_collector instead of with_assets to avoid
+        // overwriting the manifest.assets we just set (which includes storage_template)
         let collector =
             AssetCollector::new(staging_dir).map_err(|e| Error::AgentError(e.to_string()))?;
 
@@ -167,7 +169,7 @@ impl PackCmd {
         println!("Assembling packed binary...");
         let packer = Packer::new(manifest)
             .with_stub(&stub_path)
-            .with_assets(collector);
+            .with_asset_collector(collector);
 
         let info = packer
             .pack(&self.output)
