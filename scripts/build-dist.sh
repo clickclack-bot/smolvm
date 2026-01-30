@@ -91,6 +91,47 @@ chmod +x "$DIST_DIR/agent-rootfs/sbin/init"
 
 echo "Agent rootfs size: $(du -sh "$DIST_DIR/agent-rootfs" | cut -f1)"
 
+# Create pre-formatted storage template
+# This eliminates the e2fsprogs dependency for end users
+echo "Creating storage template..."
+TEMPLATE_SIZE=$((512 * 1024 * 1024))  # 512MB
+TEMPLATE_PATH="$DIST_DIR/storage-template.ext4"
+
+# Find mkfs.ext4
+MKFS_PATHS=(
+    "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4"
+    "/usr/local/opt/e2fsprogs/sbin/mkfs.ext4"
+    "/opt/homebrew/sbin/mkfs.ext4"
+    "/usr/local/sbin/mkfs.ext4"
+    "/sbin/mkfs.ext4"
+    "/usr/sbin/mkfs.ext4"
+)
+
+MKFS_BIN=""
+for path in "${MKFS_PATHS[@]}"; do
+    if [[ -x "$path" ]]; then
+        MKFS_BIN="$path"
+        break
+    fi
+done
+
+if [[ -z "$MKFS_BIN" ]] && command -v mkfs.ext4 &> /dev/null; then
+    MKFS_BIN="mkfs.ext4"
+fi
+
+if [[ -z "$MKFS_BIN" ]]; then
+    echo "Warning: mkfs.ext4 not found, skipping storage template creation"
+    echo "         Users will need e2fsprogs installed"
+else
+    # Create sparse file
+    dd if=/dev/zero of="$TEMPLATE_PATH" bs=1 count=0 seek=$TEMPLATE_SIZE 2>/dev/null
+
+    # Format with ext4
+    "$MKFS_BIN" -F -q -m 0 -L smolvm "$TEMPLATE_PATH"
+
+    echo "Storage template created: $(du -h "$TEMPLATE_PATH" | cut -f1) (sparse)"
+fi
+
 # Copy README
 cat > "$DIST_DIR/README.txt" << 'EOF'
 smolvm - OCI-native microVM runtime
@@ -114,11 +155,11 @@ PREREQUISITES
 
 macOS:
   - macOS 11.0 (Big Sur) or later
-  - e2fsprogs for disk formatting: brew install e2fsprogs
+  - Apple Silicon or Intel Mac
 
 Linux:
   - KVM support (/dev/kvm must exist)
-  - e2fsprogs (usually pre-installed)
+  - User must have access to /dev/kvm (typically via 'kvm' group)
 
 USAGE
 =====
@@ -139,8 +180,12 @@ TROUBLESHOOTING
   Make sure you're running the 'smolvm' wrapper script, not 'smolvm-bin'
   directly. The wrapper sets up the library path automatically.
 
-"mkfs.ext4 not found" errors:
-  Install e2fsprogs (see Prerequisites above).
+"agent did not become ready within 30 seconds":
+  This usually means the storage disk couldn't be formatted.
+  Check that the storage-template.ext4 file exists in ~/.smolvm/
+  If not, you may need to reinstall smolvm or install e2fsprogs:
+    macOS: brew install e2fsprogs
+    Linux: apt install e2fsprogs
 
 For more information: https://github.com/smolvm/smolvm
 EOF

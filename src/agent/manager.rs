@@ -426,10 +426,14 @@ impl AgentManager {
         }
 
         // Pre-format storage disk on host (much faster than in-VM formatting)
-        // This saves ~500-1000ms on first boot
+        // This tries: 1) copy from template (no deps), 2) mkfs.ext4 (requires e2fsprogs)
+        // If both fail, VM can still format the disk but it may be slower or timeout.
         if let Err(e) = self.storage_disk.ensure_formatted() {
-            tracing::warn!(error = %e, "failed to pre-format disk on host, will format in VM");
-            // Don't fail - VM can still format the disk (just slower)
+            tracing::warn!(
+                error = %e,
+                "failed to pre-format disk on host, will attempt format in VM. \
+                For faster startup, install storage template or e2fsprogs"
+            );
         }
 
         // Install SIGCHLD handler to automatically reap zombie children.

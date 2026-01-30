@@ -171,15 +171,102 @@ impl StorageDisk {
 
     /// Pre-format the disk with ext4 on the host.
     ///
-    /// This is much faster than formatting inside the VM (~500ms savings).
-    /// On macOS, requires e2fsprogs: `brew install e2fsprogs`
+    /// This tries multiple approaches in order:
+    /// 1. Copy from pre-formatted template (no dependencies, fastest)
+    /// 2. Format with mkfs.ext4 (requires e2fsprogs)
+    ///
+    /// The template approach eliminates the e2fsprogs dependency for end users.
     pub fn ensure_formatted(&self) -> Result<()> {
         if !self.needs_format() {
             tracing::debug!(path = %self.path.display(), "disk already formatted");
             return Ok(());
         }
 
-        tracing::info!(path = %self.path.display(), "pre-formatting disk on host");
+        // Try to copy from pre-formatted template first (no dependencies)
+        if let Some(template_path) = Self::find_storage_template() {
+            return self.copy_from_template(&template_path);
+        }
+
+        // Fall back to formatting with mkfs.ext4
+        self.format_with_mkfs()
+    }
+
+    /// Find the pre-formatted storage template.
+    ///
+    /// Searches in order:
+    /// 1. ~/.smolvm/storage-template.ext4 (installed location)
+    /// 2. Next to the current executable (development)
+    fn find_storage_template() -> Option<PathBuf> {
+        const TEMPLATE_FILENAME: &str = "storage-template.ext4";
+
+        // Check ~/.smolvm/ (installed location)
+        if let Some(home) = dirs::home_dir() {
+            let installed_path = home.join(".smolvm").join(TEMPLATE_FILENAME);
+            if installed_path.exists() {
+                tracing::debug!(path = %installed_path.display(), "found storage template");
+                return Some(installed_path);
+            }
+        }
+
+        // Check next to the current executable (development/testing)
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                let dev_path = exe_dir.join(TEMPLATE_FILENAME);
+                if dev_path.exists() {
+                    tracing::debug!(path = %dev_path.display(), "found storage template (dev)");
+                    return Some(dev_path);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Copy the storage disk from a pre-formatted template.
+    fn copy_from_template(&self, template_path: &Path) -> Result<()> {
+        tracing::info!(
+            template = %template_path.display(),
+            target = %self.path.display(),
+            "copying storage from template"
+        );
+
+        // Ensure parent directory exists
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::Storage(format!("failed to create storage directory: {}", e)))?;
+        }
+
+        // Copy the template file
+        std::fs::copy(template_path, &self.path)
+            .map_err(|e| Error::Storage(format!("failed to copy storage template: {}", e)))?;
+
+        // Resize to the desired size (template is 512MB, we want 20GB)
+        // This just extends the sparse file - doesn't use actual disk space
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .map_err(|e| Error::Storage(format!("failed to open storage for resize: {}", e)))?;
+
+        file.seek(SeekFrom::Start(self.size_bytes - 1))
+            .map_err(|e| Error::Storage(format!("failed to seek for resize: {}", e)))?;
+        file.write_all(&[0])
+            .map_err(|e| Error::Storage(format!("failed to extend storage: {}", e)))?;
+        file.sync_all()
+            .map_err(|e| Error::Storage(format!("failed to sync storage: {}", e)))?;
+
+        // Mark as formatted
+        self.mark_formatted()?;
+
+        tracing::info!(path = %self.path.display(), "storage copied from template");
+        Ok(())
+    }
+
+    /// Format the disk using mkfs.ext4.
+    ///
+    /// This requires e2fsprogs to be installed on the host.
+    fn format_with_mkfs(&self) -> Result<()> {
+        tracing::info!(path = %self.path.display(), "formatting disk with mkfs.ext4");
 
         // Find mkfs.ext4 binary
         let mkfs_paths = [
