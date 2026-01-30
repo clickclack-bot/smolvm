@@ -25,20 +25,3 @@ pub fn create_default() -> Result<Box<dyn VmBackend>> {
         "no available backend for this platform".into(),
     ))
 }
-
-/// List all available backends.
-pub fn available_backends() -> Vec<&'static str> {
-    let mut backends = Vec::new();
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        if LibkrunBackend::new()
-            .map(|b| b.is_available())
-            .unwrap_or(false)
-        {
-            backends.push("libkrun");
-        }
-    }
-
-    backends
-}

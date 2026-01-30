@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn test_storage_disk_create_and_delete() {
-        let temp_dir = std::env::temp_dir().join("smolvm_test");
+        let temp_dir = std::env::temp_dir().join("smolvm_test_basic");
         std::fs::create_dir_all(&temp_dir).unwrap();
         let disk_path = temp_dir.join("test_storage.raw");
 
@@ -483,9 +483,13 @@ mod tests {
         assert_eq!(disk.size_gb(), 1);
         assert!(disk.needs_format());
 
+        // Write ext4 magic bytes so the disk appears valid
+        // ext4 superblock is at offset 1024, magic (0xEF53) is at offset 56 within superblock
+        write_ext4_magic(&disk_path);
+
         // Mark as formatted
         disk.mark_formatted().unwrap();
-        assert!(!disk.needs_format());
+        assert!(!disk.needs_format()); // Should pass now that disk has ext4 magic
 
         // Delete disk
         disk.delete().unwrap();
@@ -493,5 +497,73 @@ mod tests {
 
         // Clean up temp dir
         let _ = std::fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_corruption_detection() {
+        let temp_dir = std::env::temp_dir().join("smolvm_test_corrupt");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let disk_path = temp_dir.join("corrupt_storage.raw");
+        let marker_path = disk_path.with_extension("formatted");
+
+        // Clean up any existing files
+        let _ = std::fs::remove_file(&disk_path);
+        let _ = std::fs::remove_file(&marker_path);
+
+        // Create disk and mark as formatted (simulating previous successful run)
+        let disk = StorageDisk::open_or_create_at(&disk_path, 1).unwrap();
+        write_ext4_magic(&disk_path);
+        disk.mark_formatted().unwrap();
+
+        // Verify it's recognized as valid
+        assert!(!disk.needs_format());
+        assert!(disk.appears_valid_ext4());
+
+        // Now corrupt the disk by zeroing the magic bytes
+        corrupt_ext4_magic(&disk_path);
+
+        // Create a new disk handle to check corruption detection
+        let disk2 = StorageDisk::open_or_create_at(&disk_path, 1).unwrap();
+
+        // Should detect corruption and need reformatting
+        assert!(!disk2.appears_valid_ext4());
+        assert!(disk2.needs_format()); // This should delete the corrupt disk
+
+        // Verify corrupt disk was deleted
+        assert!(!disk_path.exists());
+        assert!(!marker_path.exists());
+
+        // Clean up temp dir
+        let _ = std::fs::remove_dir(&temp_dir);
+    }
+
+    /// Write ext4 magic bytes to make `file` command recognize it as ext4.
+    /// ext4 superblock is at offset 1024, magic number 0xEF53 is at offset 56.
+    fn write_ext4_magic(path: &std::path::Path) {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap();
+
+        // Seek to superblock magic offset (1024 + 56 = 1080)
+        file.seek(SeekFrom::Start(1080)).unwrap();
+        // Write ext4 magic: 0xEF53 (little-endian: 0x53, 0xEF)
+        file.write_all(&[0x53, 0xEF]).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    /// Corrupt the ext4 magic bytes by zeroing them.
+    fn corrupt_ext4_magic(path: &std::path::Path) {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap();
+
+        // Seek to superblock magic offset and zero it
+        file.seek(SeekFrom::Start(1080)).unwrap();
+        file.write_all(&[0x00, 0x00]).unwrap();
+        file.sync_all().unwrap();
     }
 }

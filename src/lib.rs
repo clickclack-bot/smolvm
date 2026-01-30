@@ -71,7 +71,6 @@ pub mod mount;
 pub mod network;
 pub mod platform;
 pub mod process;
-pub mod rootfs;
 pub mod storage;
 pub mod util;
 pub mod vm;
