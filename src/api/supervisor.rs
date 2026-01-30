@@ -247,63 +247,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_should_restart_never() {
-        let config = RestartConfig {
-            policy: RestartPolicy::Never,
-            max_retries: 0,
-            restart_count: 0,
-            user_stopped: false,
-        };
-        assert!(!Supervisor::should_restart(&config));
-    }
+    fn test_should_restart() {
+        // (policy, max_retries, restart_count, user_stopped, expected, description)
+        let cases = [
+            (RestartPolicy::Never, 0, 0, false, false, "never policy"),
+            (RestartPolicy::Always, 0, 5, false, true, "always policy"),
+            (RestartPolicy::Always, 3, 3, false, false, "max retries reached"),
+            (RestartPolicy::Always, 3, 2, false, true, "under max retries"),
+            (RestartPolicy::UnlessStopped, 0, 0, false, true, "unless-stopped running"),
+            (RestartPolicy::UnlessStopped, 0, 0, true, false, "unless-stopped user stopped"),
+        ];
 
-    #[test]
-    fn test_should_restart_always() {
-        let config = RestartConfig {
-            policy: RestartPolicy::Always,
-            max_retries: 0,
-            restart_count: 5,
-            user_stopped: false,
-        };
-        assert!(Supervisor::should_restart(&config));
-    }
-
-    #[test]
-    fn test_should_restart_max_retries() {
-        let config = RestartConfig {
-            policy: RestartPolicy::Always,
-            max_retries: 3,
-            restart_count: 3,
-            user_stopped: false,
-        };
-        assert!(!Supervisor::should_restart(&config));
-
-        let config = RestartConfig {
-            policy: RestartPolicy::Always,
-            max_retries: 3,
-            restart_count: 2,
-            user_stopped: false,
-        };
-        assert!(Supervisor::should_restart(&config));
-    }
-
-    #[test]
-    fn test_should_restart_unless_stopped() {
-        let config = RestartConfig {
-            policy: RestartPolicy::UnlessStopped,
-            max_retries: 0,
-            restart_count: 0,
-            user_stopped: false,
-        };
-        assert!(Supervisor::should_restart(&config));
-
-        let config = RestartConfig {
-            policy: RestartPolicy::UnlessStopped,
-            max_retries: 0,
-            restart_count: 0,
-            user_stopped: true,
-        };
-        assert!(!Supervisor::should_restart(&config));
+        for (policy, max_retries, restart_count, user_stopped, expected, desc) in cases {
+            let config = RestartConfig {
+                policy,
+                max_retries,
+                restart_count,
+                user_stopped,
+            };
+            assert_eq!(
+                Supervisor::should_restart(&config),
+                expected,
+                "{}",
+                desc
+            );
+        }
     }
 
     #[test]
