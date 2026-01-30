@@ -232,8 +232,9 @@ impl StorageDisk {
 
         // Ensure parent directory exists
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::Storage(format!("failed to create storage directory: {}", e)))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                Error::Storage(format!("failed to create storage directory: {}", e))
+            })?;
         }
 
         // Copy the template file
@@ -346,12 +347,68 @@ impl StorageDisk {
     /// Check if the disk needs to be formatted.
     ///
     /// This checks for a marker file that's created after formatting.
-    /// The actual formatting happens inside the helper VM.
+    /// Also validates that the disk appears to be valid ext4.
     pub fn needs_format(&self) -> bool {
-        // We can't check inside the ext4 filesystem from the host.
-        // Instead, we use a sidecar file.
         let marker_path = self.marker_path();
-        !marker_path.exists()
+
+        // If marker doesn't exist, needs format
+        if !marker_path.exists() {
+            return true;
+        }
+
+        // If disk doesn't exist, needs format (and delete stale marker)
+        if !self.path.exists() {
+            let _ = std::fs::remove_file(&marker_path);
+            return true;
+        }
+
+        // Validate disk appears to be ext4 (detect corruption)
+        if !self.appears_valid_ext4() {
+            tracing::warn!(
+                path = %self.path.display(),
+                "storage disk appears corrupt, will recreate"
+            );
+            // Delete corrupt disk and marker so we start fresh
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(&marker_path);
+            return true;
+        }
+
+        false
+    }
+
+    /// Check if the disk file appears to be a valid ext4 filesystem.
+    ///
+    /// Uses the `file` command to check the magic bytes.
+    /// This helps detect corrupted disks that would cause mount failures.
+    fn appears_valid_ext4(&self) -> bool {
+        // Use `file` command to check filesystem type
+        let output = std::process::Command::new("file")
+            .arg("-b") // Brief output
+            .arg(&self.path)
+            .output();
+
+        match output {
+            Ok(output) if output.status.success() => {
+                let desc = String::from_utf8_lossy(&output.stdout);
+                // Valid ext4 should contain "ext4 filesystem" or similar
+                let is_ext4 =
+                    desc.contains("ext4") || desc.contains("ext2") || desc.contains("ext3");
+                if !is_ext4 {
+                    tracing::debug!(
+                        path = %self.path.display(),
+                        file_type = %desc.trim(),
+                        "storage disk is not ext4"
+                    );
+                }
+                is_ext4
+            }
+            _ => {
+                // If file command fails, assume it's okay (don't block on missing `file` command)
+                tracing::debug!(path = %self.path.display(), "could not verify disk type, assuming valid");
+                true
+            }
+        }
     }
 
     /// Mark the disk as formatted.
