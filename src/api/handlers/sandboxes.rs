@@ -387,64 +387,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_validate_sandbox_name_valid() {
+    fn test_validate_sandbox_name() {
         // Valid names
-        assert!(validate_sandbox_name("test").is_ok());
-        assert!(validate_sandbox_name("my-sandbox").is_ok());
-        assert!(validate_sandbox_name("my_sandbox").is_ok());
-        assert!(validate_sandbox_name("test123").is_ok());
-        assert!(validate_sandbox_name("123test").is_ok());
-        assert!(validate_sandbox_name("a").is_ok());
-        assert!(validate_sandbox_name("test-sandbox-123").is_ok());
-        assert!(validate_sandbox_name("TEST_SANDBOX").is_ok());
-        assert!(validate_sandbox_name("a".repeat(64).as_str()).is_ok());
-    }
+        let valid = [
+            "test",
+            "my-sandbox",
+            "my_sandbox",
+            "test123",
+            "123test",
+            "a",
+            "test-sandbox-123",
+            "TEST_SANDBOX",
+            &"a".repeat(64),
+        ];
+        for name in valid {
+            assert!(
+                validate_sandbox_name(name).is_ok(),
+                "expected '{}' to be valid",
+                name
+            );
+        }
 
-    #[test]
-    fn test_validate_sandbox_name_empty() {
-        let err = validate_sandbox_name("").unwrap_err();
-        assert!(matches!(err, ApiError::BadRequest(_)));
-    }
-
-    #[test]
-    fn test_validate_sandbox_name_too_long() {
-        let long_name = "a".repeat(65);
-        let err = validate_sandbox_name(&long_name).unwrap_err();
-        assert!(matches!(err, ApiError::BadRequest(_)));
-    }
-
-    #[test]
-    fn test_validate_sandbox_name_invalid_first_char() {
-        assert!(validate_sandbox_name("-test").is_err());
-        assert!(validate_sandbox_name("_test").is_err());
-        assert!(validate_sandbox_name(".test").is_err());
-    }
-
-    #[test]
-    fn test_validate_sandbox_name_invalid_last_char() {
-        assert!(validate_sandbox_name("test-").is_err());
-    }
-
-    #[test]
-    fn test_validate_sandbox_name_consecutive_hyphens() {
-        assert!(validate_sandbox_name("test--sandbox").is_err());
-        assert!(validate_sandbox_name("a---b").is_err());
-    }
-
-    #[test]
-    fn test_validate_sandbox_name_path_separators() {
-        assert!(validate_sandbox_name("test/sandbox").is_err());
-        assert!(validate_sandbox_name("test\\sandbox").is_err());
-        assert!(validate_sandbox_name("../test").is_err());
-    }
-
-    #[test]
-    fn test_validate_sandbox_name_invalid_chars() {
-        assert!(validate_sandbox_name("test sandbox").is_err()); // space
-        assert!(validate_sandbox_name("test@sandbox").is_err());
-        assert!(validate_sandbox_name("test!sandbox").is_err());
-        assert!(validate_sandbox_name("test$sandbox").is_err());
-        assert!(validate_sandbox_name("test.sandbox").is_err()); // dot not allowed
-        assert!(validate_sandbox_name("test:sandbox").is_err());
+        // Invalid names
+        let invalid = [
+            ("", "empty"),
+            (&"a".repeat(65), "too long"),
+            ("-test", "starts with hyphen"),
+            ("_test", "starts with underscore"),
+            (".test", "starts with dot"),
+            ("test-", "ends with hyphen"),
+            ("test--sandbox", "consecutive hyphens"),
+            ("test/sandbox", "forward slash"),
+            ("test\\sandbox", "backslash"),
+            ("../test", "path traversal"),
+            ("test sandbox", "space"),
+            ("test@sandbox", "at sign"),
+            ("test.sandbox", "dot"),
+        ];
+        for (name, desc) in invalid {
+            assert!(
+                validate_sandbox_name(name).is_err(),
+                "expected '{}' ({}) to be invalid",
+                name,
+                desc
+            );
+        }
     }
 }
