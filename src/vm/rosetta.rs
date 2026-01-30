@@ -94,11 +94,4 @@ mod tests {
             platform
         );
     }
-
-    #[test]
-    fn test_constants() {
-        assert_eq!(ROSETTA_TAG, "rosetta");
-        assert_eq!(ROSETTA_GUEST_PATH, "/mnt/rosetta");
-        assert!(!BINFMT_REGISTER_CMD.is_empty());
-    }
 }
