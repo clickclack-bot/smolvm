@@ -515,7 +515,12 @@ impl MachoFile {
 
     /// Write data into a section, expanding the binary as needed.
     /// This updates the section size and all relevant offsets.
-    pub fn write_section(&mut self, seg_name: &str, sect_name: &str, data: &[u8]) -> io::Result<()> {
+    pub fn write_section(
+        &mut self,
+        seg_name: &str,
+        sect_name: &str,
+        data: &[u8],
+    ) -> io::Result<()> {
         // Find the section
         let (section_offset, section_size, cmd_idx, sect_idx) = {
             let mut found = None;
@@ -523,7 +528,12 @@ impl MachoFile {
                 if let ParsedLoadCommand::Segment64 { sections, .. } = cmd {
                     for (sect_idx, section) in sections.iter().enumerate() {
                         if section.segment_name() == seg_name && section.name() == sect_name {
-                            found = Some((section.offset as usize, section.size as usize, cmd_idx, sect_idx));
+                            found = Some((
+                                section.offset as usize,
+                                section.size as usize,
+                                cmd_idx,
+                                sect_idx,
+                            ));
                             break;
                         }
                     }
@@ -557,7 +567,8 @@ impl MachoFile {
             // Need to expand
             let insert_pos = relative_offset + old_size;
             let extra = size_diff as usize;
-            self.file_data.splice(insert_pos..insert_pos, vec![0u8; extra]);
+            self.file_data
+                .splice(insert_pos..insert_pos, vec![0u8; extra]);
         } else if size_diff < 0 {
             // Need to shrink
             let remove_start = relative_offset + aligned_new_size;
@@ -573,7 +584,8 @@ impl MachoFile {
         }
 
         // Update the section size
-        if let ParsedLoadCommand::Segment64 { segment, sections } = &mut self.load_commands[cmd_idx] {
+        if let ParsedLoadCommand::Segment64 { segment, sections } = &mut self.load_commands[cmd_idx]
+        {
             sections[sect_idx].size = aligned_new_size as u64;
 
             // Update segment filesize and vmsize
@@ -650,7 +662,7 @@ impl MachoFile {
 
     /// Generate and embed an adhoc code signature
     pub fn sign_adhoc(&mut self) -> io::Result<()> {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
 
         // Remove existing code signature if present
         let mut cs_idx = None;
@@ -665,7 +677,9 @@ impl MachoFile {
         if let Some(idx) = cs_idx {
             if let ParsedLoadCommand::CodeSignature(old_cs) = &self.load_commands[idx] {
                 let sig_offset = old_cs.dataoff as usize;
-                if sig_offset >= self.data_offset && sig_offset < self.data_offset + self.file_data.len() {
+                if sig_offset >= self.data_offset
+                    && sig_offset < self.data_offset + self.file_data.len()
+                {
                     let relative = sig_offset - self.data_offset;
                     self.file_data.truncate(relative);
                 }
@@ -685,7 +699,7 @@ impl MachoFile {
 
         // Build the code signature parameters
         let identifier = b"smolvm-packed\0";
-        let num_pages = (code_size_aligned + CS_PAGE_SIZE - 1) / CS_PAGE_SIZE;
+        let num_pages = code_size_aligned.div_ceil(CS_PAGE_SIZE);
 
         // Calculate sizes (version 0x20100 format = 48 bytes header)
         let cd_hash_offset = 48; // CodeDirectory header size for version 0x20100
@@ -708,7 +722,8 @@ impl MachoFile {
         if let Some(idx) = cs_idx {
             self.load_commands[idx] = ParsedLoadCommand::CodeSignature(new_cs);
         } else {
-            self.load_commands.push(ParsedLoadCommand::CodeSignature(new_cs));
+            self.load_commands
+                .push(ParsedLoadCommand::CodeSignature(new_cs));
             self.header.ncmds += 1;
             self.header.sizeofcmds += LinkeditDataCommand::SIZE as u32;
         }
@@ -719,7 +734,8 @@ impl MachoFile {
                 if segment.name() == "__LINKEDIT" {
                     let linkedit_end = sig_offset + sig_size_aligned;
                     segment.filesize = (linkedit_end - segment.fileoff as usize) as u64;
-                    segment.vmsize = (segment.filesize + CS_PAGE_SIZE as u64 - 1) & !(CS_PAGE_SIZE as u64 - 1);
+                    segment.vmsize =
+                        (segment.filesize + CS_PAGE_SIZE as u64 - 1) & !(CS_PAGE_SIZE as u64 - 1);
                     break;
                 }
             }
@@ -907,7 +923,10 @@ mod tests {
     #[test]
     fn test_parse_stub() {
         // This test requires the actual stub binary
-        let stub_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/release/smolvm-stub");
+        let stub_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/release/smolvm-stub"
+        );
         if let Ok(data) = std::fs::read(stub_path) {
             let macho = MachoFile::parse(&data).expect("Failed to parse Mach-O");
             assert_eq!(macho.header.magic, MH_MAGIC_64);
@@ -933,7 +952,10 @@ mod tests {
     #[test]
     fn test_write_section_and_sign() {
         // This test requires the actual stub binary with the __smolvm section
-        let stub_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/release/smolvm-stub");
+        let stub_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/release/smolvm-stub"
+        );
         let data = match std::fs::read(stub_path) {
             Ok(d) => d,
             Err(_) => return, // Skip if stub not built

@@ -25,7 +25,7 @@ pub struct Packer {
 #[cfg(target_os = "macos")]
 enum PackedEmbeddedError {
     /// Not a valid Mach-O with required section, return Packer to try append mode.
-    NotMachO(Packer),
+    NotMachO(Box<Packer>),
     /// Other pack error.
     PackError(crate::PackError),
 }
@@ -170,12 +170,12 @@ impl Packer {
         {
             // Try Mach-O section mode first
             match self.try_pack_embedded_macho(output.as_ref()) {
-                Ok(info) => return Ok(info),
+                Ok(info) => Ok(info),
                 Err(PackedEmbeddedError::NotMachO(packer)) => {
                     // Not a valid Mach-O, fall back to append mode
-                    return packer.pack_embedded_append(output);
+                    packer.pack_embedded_append(output)
                 }
-                Err(PackedEmbeddedError::PackError(e)) => return Err(e),
+                Err(PackedEmbeddedError::PackError(e)) => Err(e),
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -189,16 +189,19 @@ impl Packer {
     /// Returns NotMachO with self if the stub isn't a valid Mach-O with
     /// the required __smolvm section, allowing fallback to append mode.
     #[cfg(target_os = "macos")]
-    fn try_pack_embedded_macho(self, output: &Path) -> std::result::Result<PackedInfo, PackedEmbeddedError> {
+    fn try_pack_embedded_macho(
+        self,
+        output: &Path,
+    ) -> std::result::Result<PackedInfo, PackedEmbeddedError> {
         use crate::macho::MachoFile;
 
         // Get stub path
         let stub_path = match self.stub_path.as_ref() {
             Some(p) => p,
             None => {
-                return Err(PackedEmbeddedError::PackError(crate::PackError::AssetNotFound(
-                    "stub executable".to_string(),
-                )))
+                return Err(PackedEmbeddedError::PackError(
+                    crate::PackError::AssetNotFound("stub executable".to_string()),
+                ))
             }
         };
 
@@ -211,12 +214,12 @@ impl Packer {
         // Try to parse as Mach-O
         let macho = match MachoFile::parse(&stub_data) {
             Ok(m) => m,
-            Err(_) => return Err(PackedEmbeddedError::NotMachO(self)), // Not a Mach-O, fall back
+            Err(_) => return Err(PackedEmbeddedError::NotMachO(Box::new(self))), // Not a Mach-O, fall back
         };
 
         // Check for __smolvm section
         if macho.find_section("__DATA", "__smolvm").is_none() {
-            return Err(PackedEmbeddedError::NotMachO(self)); // No section, fall back
+            return Err(PackedEmbeddedError::NotMachO(Box::new(self))); // No section, fall back
         }
 
         // Valid Mach-O with section, proceed with Mach-O packing
