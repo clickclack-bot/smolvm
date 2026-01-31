@@ -307,13 +307,12 @@ impl AgentClient {
 
             // Get credentials from config if not explicitly provided
             let auth = options.auth.or_else(|| {
-                registry_config.get_credentials(&registry).map(|creds| {
+                registry_config.get_credentials(&registry).inspect(|creds| {
                     tracing::debug!(
                         registry = %registry,
                         username = %creds.username,
                         "using configured registry credentials"
                     );
-                    creds
                 })
             });
 
@@ -430,7 +429,9 @@ impl AgentClient {
         platform: Option<&str>,
         progress: F,
     ) -> Result<ImageInfo> {
-        let mut opts = PullOptions::new().use_registry_config(true).progress(progress);
+        let mut opts = PullOptions::new()
+            .use_registry_config(true)
+            .progress(progress);
         if let Some(p) = platform {
             opts = opts.platform(p);
         }
