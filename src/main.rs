@@ -44,6 +44,10 @@ enum Commands {
 
     /// Package an OCI image into a self-contained executable
     Pack(cli::pack::PackCmd),
+
+    /// Manage smolvm configuration (registries, defaults)
+    #[command(subcommand)]
+    Config(cli::config::ConfigCmd),
 }
 
 fn main() {
@@ -61,6 +65,7 @@ fn main() {
         Commands::Container(cmd) => cmd.run(),
         Commands::Serve(cmd) => cmd.run(),
         Commands::Pack(cmd) => cmd.run(),
+        Commands::Config(cmd) => cmd.run(),
     };
 
     // Handle errors

@@ -68,12 +68,7 @@ pub fn read_embedded_section() -> Option<EmbeddedData> {
         let sectname = CStr::from_bytes_with_nul(b"__smolvm\0").unwrap();
         let mut size: usize = 0;
 
-        let data_ptr = getsectiondata(
-            header,
-            segname.as_ptr(),
-            sectname.as_ptr(),
-            &mut size,
-        );
+        let data_ptr = getsectiondata(header, segname.as_ptr(), sectname.as_ptr(), &mut size);
 
         if data_ptr.is_null() || size < SECTION_HEADER_SIZE {
             return None;

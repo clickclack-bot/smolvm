@@ -27,6 +27,9 @@ fn main() {
         f.write_all(&[0u8; 4]).unwrap();
 
         // Tell the linker to create a section with this content
-        println!("cargo:rustc-link-arg=-Wl,-sectcreate,__DATA,__smolvm,{}", placeholder_path);
+        println!(
+            "cargo:rustc-link-arg=-Wl,-sectcreate,__DATA,__smolvm,{}",
+            placeholder_path
+        );
     }
 }

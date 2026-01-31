@@ -6,11 +6,11 @@ use axum::{
 };
 use std::sync::Arc;
 
+use crate::agent::PullOptions;
 use crate::api::error::ApiError;
 use crate::api::state::{
     mount_spec_to_host_mount, port_spec_to_mapping, resource_spec_to_vm_resources, ApiState,
 };
-use crate::agent::PullOptions;
 use crate::api::types::{ImageInfo, ListImagesResponse, PullImageRequest, PullImageResponse};
 
 /// GET /api/v1/sandboxes/:id/images - List images in a sandbox.
