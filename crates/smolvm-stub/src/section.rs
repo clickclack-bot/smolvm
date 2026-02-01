@@ -64,8 +64,8 @@ pub fn read_embedded_section() -> Option<EmbeddedData> {
         }
 
         // Get section data from our custom segment
-        let segname = CStr::from_bytes_with_nul(b"__SMOLVM\0").unwrap();
-        let sectname = CStr::from_bytes_with_nul(b"__smolvm\0").unwrap();
+        let segname = CStr::from_bytes_with_nul(b"__SMOLVM\0").expect("static string");
+        let sectname = CStr::from_bytes_with_nul(b"__smolvm\0").expect("static string");
         let mut size: usize = 0;
 
         let data_ptr = getsectiondata(header, segname.as_ptr(), sectname.as_ptr(), &mut size);

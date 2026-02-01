@@ -1167,4 +1167,145 @@ mod tests {
         assert_eq!(header.cputype, parsed.cputype);
         assert_eq!(header.ncmds, parsed.ncmds);
     }
+
+    #[test]
+    fn test_page_align() {
+        // Test exact page boundaries
+        assert_eq!(MachoFile::page_align(0), 0);
+        assert_eq!(MachoFile::page_align(CS_PAGE_SIZE), CS_PAGE_SIZE);
+        assert_eq!(MachoFile::page_align(CS_PAGE_SIZE * 2), CS_PAGE_SIZE * 2);
+
+        // Test rounding up
+        assert_eq!(MachoFile::page_align(1), CS_PAGE_SIZE);
+        assert_eq!(MachoFile::page_align(100), CS_PAGE_SIZE);
+        assert_eq!(MachoFile::page_align(CS_PAGE_SIZE - 1), CS_PAGE_SIZE);
+        assert_eq!(MachoFile::page_align(CS_PAGE_SIZE + 1), CS_PAGE_SIZE * 2);
+    }
+
+    #[test]
+    fn test_shift_offset_if_after() {
+        // Test: offset is after threshold, should shift
+        let mut offset = 1000u32;
+        MachoFile::shift_offset_if_after(&mut offset, 500, 100);
+        assert_eq!(offset, 1100);
+
+        // Test: offset is before threshold, should not shift
+        let mut offset = 400u32;
+        MachoFile::shift_offset_if_after(&mut offset, 500, 100);
+        assert_eq!(offset, 400);
+
+        // Test: offset is zero, should not shift (zero means unused)
+        let mut offset = 0u32;
+        MachoFile::shift_offset_if_after(&mut offset, 0, 100);
+        assert_eq!(offset, 0);
+
+        // Test: negative delta (shrinking)
+        let mut offset = 1000u32;
+        MachoFile::shift_offset_if_after(&mut offset, 500, -100);
+        assert_eq!(offset, 900);
+    }
+
+    #[test]
+    fn test_segment_name() {
+        let mut segname = [0u8; 16];
+        segname[..8].copy_from_slice(b"__TEXT\0\0");
+
+        let segment = SegmentCommand64 {
+            cmd: LC_SEGMENT_64,
+            cmdsize: 72,
+            segname,
+            vmaddr: 0,
+            vmsize: 0,
+            fileoff: 0,
+            filesize: 0,
+            maxprot: 0,
+            initprot: 0,
+            nsects: 0,
+            flags: 0,
+        };
+
+        assert_eq!(segment.name(), "__TEXT");
+    }
+
+    #[test]
+    fn test_section_name() {
+        let mut sectname = [0u8; 16];
+        let mut segname = [0u8; 16];
+        sectname[..6].copy_from_slice(b"__text");
+        segname[..8].copy_from_slice(b"__TEXT\0\0");
+
+        let section = Section64 {
+            sectname,
+            segname,
+            addr: 0,
+            size: 0,
+            offset: 0,
+            align: 0,
+            reloff: 0,
+            nreloc: 0,
+            flags: 0,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        };
+
+        assert_eq!(section.name(), "__text");
+        assert_eq!(section.segment_name(), "__TEXT");
+    }
+
+    #[test]
+    fn test_load_command_roundtrip() {
+        let lc = LinkeditDataCommand {
+            cmd: LC_CODE_SIGNATURE,
+            cmdsize: 16,
+            dataoff: 12345,
+            datasize: 6789,
+        };
+
+        let mut buf = Vec::new();
+        lc.write(&mut buf).unwrap();
+
+        assert_eq!(buf.len(), LinkeditDataCommand::SIZE);
+
+        // Parse it back
+        let cmd = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let dataoff = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let datasize = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+
+        assert_eq!(cmd, LC_CODE_SIGNATURE);
+        assert_eq!(dataoff, 12345);
+        assert_eq!(datasize, 6789);
+    }
+
+    #[test]
+    fn test_segment_command_roundtrip() {
+        let mut segname = [0u8; 16];
+        segname[..8].copy_from_slice(b"__SMOLVM");
+
+        let segment = SegmentCommand64 {
+            cmd: LC_SEGMENT_64,
+            cmdsize: 72,
+            segname,
+            vmaddr: 0x100000000,
+            vmsize: 0x4000,
+            fileoff: 0x8000,
+            filesize: 0x1000,
+            maxprot: 7,
+            initprot: 3,
+            nsects: 1,
+            flags: 0,
+        };
+
+        let mut buf = Vec::new();
+        segment.write(&mut buf).unwrap();
+
+        assert_eq!(buf.len(), SegmentCommand64::SIZE);
+
+        // Verify segment name
+        assert_eq!(&buf[8..16], b"__SMOLVM");
+
+        // Verify vmaddr
+        let vmaddr = u64::from_le_bytes(buf[24..32].try_into().unwrap());
+        assert_eq!(vmaddr, 0x100000000);
+    }
 }

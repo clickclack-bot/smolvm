@@ -180,7 +180,7 @@ impl LibKrun {
 
         macro_rules! load_sym {
             ($name:ident) => {{
-                let sym_name = CString::new(stringify!($name)).unwrap();
+                let sym_name = CString::new(stringify!($name)).expect("symbol name is static");
                 let sym = libc::dlsym(handle, sym_name.as_ptr());
                 if sym.is_null() {
                     libc::dlclose(handle);
@@ -816,15 +816,15 @@ fn launch_vm_child(
         }
 
         // Set working directory
-        let workdir = CString::new("/").unwrap();
+        let workdir = CString::new("/").expect("static string");
         (krun.set_workdir)(ctx, workdir.as_ptr());
 
         // Build environment
         let mut env_strings = vec![
-            CString::new("HOME=/root").unwrap(),
+            CString::new("HOME=/root").expect("static string"),
             CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-                .unwrap(),
-            CString::new("TERM=xterm-256color").unwrap(),
+                .expect("static string"),
+            CString::new("TERM=xterm-256color").expect("static string"),
         ];
 
         // Tell agent about packed layers mount (tag:mount_point)

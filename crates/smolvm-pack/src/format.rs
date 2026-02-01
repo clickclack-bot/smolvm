@@ -99,9 +99,11 @@ impl SectionHeader {
         }
 
         Ok(Self {
-            manifest_size: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
-            assets_size: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
-            checksum: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
+            manifest_size: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
+            assets_size: u64::from_le_bytes([
+                buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+            ]),
+            checksum: u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]),
         })
     }
 }
@@ -181,12 +183,22 @@ impl PackFooter {
         }
 
         Ok(Self {
-            stub_size: u64::from_le_bytes(buf[12..20].try_into().unwrap()),
-            assets_offset: u64::from_le_bytes(buf[20..28].try_into().unwrap()),
-            assets_size: u64::from_le_bytes(buf[28..36].try_into().unwrap()),
-            manifest_offset: u64::from_le_bytes(buf[36..44].try_into().unwrap()),
-            manifest_size: u64::from_le_bytes(buf[44..52].try_into().unwrap()),
-            checksum: u32::from_le_bytes(buf[52..56].try_into().unwrap()),
+            stub_size: u64::from_le_bytes([
+                buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
+            ]),
+            assets_offset: u64::from_le_bytes([
+                buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26], buf[27],
+            ]),
+            assets_size: u64::from_le_bytes([
+                buf[28], buf[29], buf[30], buf[31], buf[32], buf[33], buf[34], buf[35],
+            ]),
+            manifest_offset: u64::from_le_bytes([
+                buf[36], buf[37], buf[38], buf[39], buf[40], buf[41], buf[42], buf[43],
+            ]),
+            manifest_size: u64::from_le_bytes([
+                buf[44], buf[45], buf[46], buf[47], buf[48], buf[49], buf[50], buf[51],
+            ]),
+            checksum: u32::from_le_bytes([buf[52], buf[53], buf[54], buf[55]]),
         })
     }
 }

@@ -402,7 +402,8 @@ pub fn validate_env_vars(env: &[(String, String)]) -> Result<(), String> {
         }
 
         // Key must start with letter or underscore
-        let first_char = key.chars().next().unwrap();
+        // SAFETY: empty keys are rejected above
+        let first_char = key.chars().next().expect("key is non-empty");
         if !first_char.is_ascii_alphabetic() && first_char != '_' {
             return Err(format!(
                 "environment variable key '{}' must start with a letter or underscore",
