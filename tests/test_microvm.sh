@@ -104,75 +104,6 @@ test_microvm_exec_exit_code() {
 }
 
 # =============================================================================
-# Volume Mounts (via sandbox run, since microvm doesn't have run command)
-# NOTE: These tests may fail due to a known libkrun TSI bug where virtiofs
-# operations are incorrectly intercepted as network calls, causing
-# "Connection reset by network" errors. See DESIGN.md for details.
-# =============================================================================
-
-test_volume_mount_read() {
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    echo "mount-test-content" > "$tmpdir/testfile.txt"
-
-    local output
-    output=$($SMOLVM sandbox run -v "$tmpdir:/hostmnt" alpine:latest -- cat /hostmnt/testfile.txt 2>&1)
-
-    rm -rf "$tmpdir"
-
-    # Check for known libkrun TSI bug
-    if [[ "$output" == *"Connection reset"* ]]; then
-        echo "SKIP: libkrun TSI bug (Connection reset)"
-        return 0
-    fi
-
-    [[ "$output" == *"mount-test-content"* ]]
-}
-
-test_volume_mount_write() {
-    local tmpdir
-    tmpdir=$(mktemp -d)
-
-    local output
-    output=$($SMOLVM sandbox run -v "$tmpdir:/hostmnt" alpine:latest -- sh -c "echo 'written-from-vm' > /hostmnt/written.txt" 2>&1)
-
-    # Check for known libkrun TSI bug
-    if [[ "$output" == *"Connection reset"* ]]; then
-        rm -rf "$tmpdir"
-        echo "SKIP: libkrun TSI bug (Connection reset)"
-        return 0
-    fi
-
-    local content
-    content=$(cat "$tmpdir/written.txt" 2>/dev/null)
-
-    rm -rf "$tmpdir"
-    [[ "$content" == *"written-from-vm"* ]]
-}
-
-test_volume_mount_readonly() {
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    echo "ro-content" > "$tmpdir/readonly.txt"
-
-    local output
-    output=$($SMOLVM sandbox run -v "$tmpdir:/hostmnt:ro" alpine:latest -- cat /hostmnt/readonly.txt 2>&1)
-
-    # Check for known libkrun TSI bug
-    if [[ "$output" == *"Connection reset"* ]]; then
-        rm -rf "$tmpdir"
-        echo "SKIP: libkrun TSI bug (Connection reset)"
-        return 0
-    fi
-
-    local write_exit=0
-    $SMOLVM sandbox run -v "$tmpdir:/hostmnt:ro" alpine:latest -- sh -c "echo 'fail' > /hostmnt/new.txt" 2>&1 || write_exit=$?
-
-    rm -rf "$tmpdir"
-    [[ "$output" == *"ro-content"* ]] && [[ $write_exit -ne 0 ]]
-}
-
-# =============================================================================
 # Named VMs
 # =============================================================================
 
@@ -218,6 +149,110 @@ test_microvm_exec_when_stopped() {
 }
 
 # =============================================================================
+# Database Persistence
+# =============================================================================
+
+test_db_persistence_across_restart() {
+    local vm_name="db-test-vm-$$"
+
+    # Clean up any existing
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Create a named VM with specific configuration
+    $SMOLVM microvm create "$vm_name" --cpus 2 --mem 1024 2>&1
+
+    # Verify it was created with correct config
+    local list_output
+    list_output=$($SMOLVM microvm ls --json 2>&1)
+    if [[ "$list_output" != *"$vm_name"* ]]; then
+        echo "VM was not created"
+        return 1
+    fi
+
+    if [[ "$list_output" != *'"cpus": 2'* ]] || [[ "$list_output" != *'"memory_mib": 1024'* ]]; then
+        echo "VM configuration not persisted correctly"
+        $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    fi
+
+    # Clean up
+    $SMOLVM microvm delete "$vm_name" -f 2>&1
+}
+
+test_db_vm_state_update() {
+    local vm_name="db-state-test-$$"
+
+    # Clean up any existing
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Create a named VM
+    $SMOLVM microvm create "$vm_name" 2>&1
+
+    # Check initial state is "created"
+    local initial_state
+    initial_state=$($SMOLVM microvm ls --json 2>&1)
+    if [[ "$initial_state" != *'"state": "created"'* ]]; then
+        echo "Initial state should be 'created'"
+        $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    fi
+
+    # Start the VM
+    $SMOLVM microvm start "$vm_name" 2>&1
+
+    # Check state changed to "running"
+    local running_state
+    running_state=$($SMOLVM microvm ls --json 2>&1)
+    if [[ "$running_state" != *'"state": "running"'* ]]; then
+        echo "State should be 'running' after start"
+        $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+        $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    fi
+
+    # Stop the VM
+    $SMOLVM microvm stop "$vm_name" 2>&1
+
+    # Check state changed to "stopped"
+    local stopped_state
+    stopped_state=$($SMOLVM microvm ls --json 2>&1)
+
+    # Clean up
+    $SMOLVM microvm delete "$vm_name" -f 2>&1
+
+    [[ "$stopped_state" == *'"state": "stopped"'* ]]
+}
+
+test_db_delete_removes_from_db() {
+    local vm_name="db-delete-test-$$"
+
+    # Clean up any existing
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Create a VM
+    $SMOLVM microvm create "$vm_name" 2>&1
+
+    # Verify it exists
+    local before_delete
+    before_delete=$($SMOLVM microvm ls --json 2>&1)
+    if [[ "$before_delete" != *"$vm_name"* ]]; then
+        echo "VM should exist before delete"
+        return 1
+    fi
+
+    # Delete it
+    $SMOLVM microvm delete "$vm_name" -f 2>&1
+
+    # Verify it's gone
+    local after_delete
+    after_delete=$($SMOLVM microvm ls --json 2>&1)
+
+    [[ "$after_delete" != *"$vm_name"* ]]
+}
+
+# =============================================================================
 # Run Tests
 # =============================================================================
 
@@ -229,10 +264,10 @@ run_test "Microvm start/stop cycle" test_microvm_start_stop_cycle || true
 run_test "Microvm exec" test_microvm_exec || true
 run_test "Microvm exec echo" test_microvm_exec_echo || true
 run_test "Microvm exec exit code" test_microvm_exec_exit_code || true
-run_test "Volume mount read" test_volume_mount_read || true
-run_test "Volume mount write" test_volume_mount_write || true
-run_test "Volume mount readonly" test_volume_mount_readonly || true
 run_test "Named microvm" test_microvm_named_vm || true
 run_test "Exec when stopped fails" test_microvm_exec_when_stopped || true
+run_test "DB persistence across restart" test_db_persistence_across_restart || true
+run_test "DB VM state update" test_db_vm_state_update || true
+run_test "DB delete removes from database" test_db_delete_removes_from_db || true
 
 print_summary "MicroVM Tests"

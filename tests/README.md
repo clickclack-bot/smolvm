@@ -1,16 +1,24 @@
-# smolvm Integration Tests
+# smolvm Tests
 
-This directory contains integration tests for smolvm, organized by functionality.
+Integration tests and performance benchmarks for smolvm.
 
-## Test Files
+## Test Suites
 
 | File | Description | Requires VM |
 |------|-------------|-------------|
-| `test_cli.sh` | Basic CLI tests (--version, --help) | No |
-| `test_sandbox.sh` | Sandbox run tests | Yes |
-| `test_microvm.sh` | MicroVM lifecycle tests | Yes |
-| `test_container.sh` | Container lifecycle tests | Yes |
-| `integration_test.sh` | Legacy combined test script | Yes |
+| `test_cli.sh` | Basic CLI tests (--version, --help, flags) | No |
+| `test_sandbox.sh` | Sandbox run tests (exec, env, volumes, TSI) | Yes |
+| `test_microvm.sh` | MicroVM lifecycle tests (start, stop, exec, DB) | Yes |
+| `test_container.sh` | Container lifecycle tests (create, exec, stop) | Yes |
+| `test_api.sh` | HTTP API tests (`smolvm serve`) | Yes |
+| `test_pack.sh` | Pack command tests (pack, run, daemon mode) | Yes |
+
+## Benchmarks
+
+| File | Description |
+|------|-------------|
+| `bench_vm_startup.sh` | Measures VM cold start time |
+| `bench_container.sh` | Measures container execution time (cold/warm) |
 
 ## Running Tests
 
@@ -27,6 +35,17 @@ This directory contains integration tests for smolvm, organized by functionality
 ./tests/run_all.sh sandbox    # Sandbox tests only
 ./tests/run_all.sh microvm    # MicroVM tests only
 ./tests/run_all.sh container  # Container tests only
+./tests/run_all.sh api        # HTTP API tests only
+./tests/run_all.sh pack       # Pack tests only
+./tests/run_all.sh pack-quick # Pack tests (skip large images)
+```
+
+### Run Benchmarks
+
+```bash
+./tests/run_all.sh bench           # All benchmarks
+./tests/run_all.sh bench-vm        # VM startup benchmark
+./tests/run_all.sh bench-container # Container benchmark
 ```
 
 ### Run Individual Test Files
@@ -34,8 +53,6 @@ This directory contains integration tests for smolvm, organized by functionality
 ```bash
 ./tests/test_cli.sh
 ./tests/test_sandbox.sh
-./tests/test_microvm.sh
-./tests/test_container.sh
 ```
 
 ### Use Specific Binary
@@ -46,23 +63,17 @@ SMOLVM=/path/to/smolvm ./tests/run_all.sh
 
 ## Unit Tests
 
-Unit tests are run via cargo:
+Unit tests are run via cargo (no VM required):
 
 ```bash
-# Protocol tests (no VM required)
-cargo test -p smolvm-protocol
-
-# Agent tests (no VM required)
-cargo test -p smolvm-agent
-
-# All unit tests
-cargo test -p smolvm-protocol -p smolvm-agent
+cargo test --lib
 ```
 
 ## Test Requirements
 
 - **CLI tests**: Only require the smolvm binary
-- **Sandbox/MicroVM/Container tests**: Require VM environment (macOS Hypervisor.framework or Linux KVM)
+- **All other tests**: Require VM environment (macOS Hypervisor.framework or Linux KVM)
+- **Benchmarks**: Require VM environment, best run on a quiet system
 
 ## Binary Discovery
 
@@ -79,7 +90,20 @@ The `common.sh` file provides shared test utilities:
 - `find_smolvm` - Locate the smolvm binary
 - `init_smolvm` - Initialize and validate the binary
 - `run_test` - Run a test function with pass/fail tracking
+- `print_summary` - Print test results summary
 - `ensure_microvm_running` - Start the default microvm
 - `cleanup_microvm` - Stop the default microvm
 - `extract_container_id` - Parse container ID from command output
 - `cleanup_container` - Force remove a container
+
+## Test Count
+
+| Suite | Tests |
+|-------|-------|
+| CLI | 13 |
+| Sandbox | 17 |
+| MicroVM | 13 |
+| Container | 10 |
+| API | 13 |
+| Pack | 16 |
+| **Total** | **82** |

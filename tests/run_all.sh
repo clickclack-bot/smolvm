@@ -11,6 +11,9 @@
 #   ./tests/run_all.sh api          # Run only HTTP API tests
 #   ./tests/run_all.sh pack         # Run only pack tests
 #   ./tests/run_all.sh pack-quick   # Run pack tests (quick mode, skips large images)
+#   ./tests/run_all.sh bench        # Run performance benchmarks
+#   ./tests/run_all.sh bench-vm     # Run VM startup benchmark only
+#   ./tests/run_all.sh bench-container # Run container benchmark only
 #
 # Environment:
 #   SMOLVM=/path/to/smolvm   # Use specific binary
@@ -33,19 +36,20 @@ SUITES_FAILED=0
 
 run_suite() {
     local name="$1"
-    local script="$2"
+    shift
+    local script_and_args=("$@")
 
     echo ""
     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${BLUE}  Running: $name${NC}"
     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
-    ((SUITES_RUN++))
+    ((SUITES_RUN++)) || true
 
-    if bash "$script"; then
-        ((SUITES_PASSED++))
+    if bash "${script_and_args[@]}"; then
+        ((SUITES_PASSED++)) || true
     else
-        ((SUITES_FAILED++))
+        ((SUITES_FAILED++)) || true
     fi
 }
 
@@ -81,7 +85,22 @@ case "$TESTS_TO_RUN" in
         run_suite "Pack Tests" "$SCRIPT_DIR/test_pack.sh"
         ;;
     pack-quick)
-        run_suite "Pack Tests (Quick)" "$SCRIPT_DIR/test_pack.sh --quick"
+        run_suite "Pack Tests (Quick)" "$SCRIPT_DIR/test_pack.sh" --quick
+        ;;
+    bench)
+        echo ""
+        echo "Running performance benchmarks (not pass/fail tests)..."
+        bash "$SCRIPT_DIR/bench_vm_startup.sh"
+        bash "$SCRIPT_DIR/bench_container.sh"
+        exit 0
+        ;;
+    bench-vm)
+        bash "$SCRIPT_DIR/bench_vm_startup.sh"
+        exit 0
+        ;;
+    bench-container)
+        bash "$SCRIPT_DIR/bench_container.sh"
+        exit 0
         ;;
     all)
         run_suite "CLI Tests" "$SCRIPT_DIR/test_cli.sh"
@@ -93,7 +112,7 @@ case "$TESTS_TO_RUN" in
         ;;
     *)
         echo "Unknown test suite: $TESTS_TO_RUN"
-        echo "Available: cli, sandbox, microvm, container, api, pack, pack-quick, all"
+        echo "Available: cli, sandbox, microvm, container, api, pack, pack-quick, bench, bench-vm, bench-container, all"
         exit 1
         ;;
 esac

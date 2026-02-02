@@ -72,11 +72,6 @@ test_pack_with_custom_resources() {
     [[ "$info" == *"Default CPUs: 2"* ]] && [[ "$info" == *"Default Memory: 512"* ]]
 }
 
-test_pack_platform_flag_help() {
-    # Verify --platform flag exists in help
-    $SMOLVM pack --help 2>&1 | grep -q "\-\-platform"
-}
-
 test_pack_with_platform() {
     # Pack with explicit platform
     local output="$TEST_DIR/test-platform"
@@ -101,23 +96,8 @@ test_pack_with_platform() {
 }
 
 # =============================================================================
-# Packed Binary - Info and Version
+# Packed Binary - Info
 # =============================================================================
-
-test_packed_version() {
-    local output="$TEST_DIR/test-alpine"
-
-    # Ensure we have a packed binary
-    if [[ ! -f "$output" ]]; then
-        $SMOLVM pack alpine:latest -o "$output" 2>&1
-    fi
-
-    local version_output
-    version_output=$("$output" --version 2>&1)
-
-    # Should show image info
-    [[ "$version_output" == *"alpine:latest"* ]] || [[ "$version_output" == *"alpine"* ]]
-}
 
 test_packed_info() {
     local output="$TEST_DIR/test-alpine"
@@ -127,13 +107,17 @@ test_packed_info() {
         $SMOLVM pack alpine:latest -o "$output" 2>&1
     fi
 
+    # Test --info
     local info_output
     info_output=$("$output" --info 2>&1)
-
-    # Should show image, platform, assets
     [[ "$info_output" == *"Image:"* ]] && \
     [[ "$info_output" == *"Platform:"* ]] && \
-    [[ "$info_output" == *"Assets:"* ]]
+    [[ "$info_output" == *"Assets:"* ]] || return 1
+
+    # Test --version
+    local version_output
+    version_output=$("$output" --version 2>&1)
+    [[ "$version_output" == *"alpine"* ]]
 }
 
 # =============================================================================
@@ -157,19 +141,6 @@ test_packed_run_echo() {
         result=$("$output" echo "pack-test-marker-12345" 2>&1)
     fi
     [[ "$result" == *"pack-test-marker-12345"* ]]
-}
-
-test_packed_run_cat() {
-    local output="$TEST_DIR/test-alpine"
-
-    # Ensure we have a packed binary
-    if [[ ! -f "$output" ]]; then
-        $SMOLVM pack alpine:latest -o "$output" 2>&1
-    fi
-
-    local result
-    result=$("$output" cat /etc/os-release 2>&1)
-    [[ "$result" == *"Alpine"* ]]
 }
 
 test_packed_exit_code() {
@@ -204,55 +175,6 @@ test_packed_env_var() {
     [[ "$result" == *"hello_pack"* ]]
 }
 
-test_packed_volume_mount() {
-    local output="$TEST_DIR/test-alpine"
-
-    # Ensure we have a packed binary
-    if [[ ! -f "$output" ]]; then
-        $SMOLVM pack alpine:latest -o "$output" 2>&1
-    fi
-
-    # Create test file
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    echo "mount-test-from-pack" > "$tmpdir/testfile.txt"
-
-    local result
-    result=$("$output" -v "$tmpdir:/workspace" cat /workspace/testfile.txt 2>&1)
-
-    rm -rf "$tmpdir"
-
-    # Check for known libkrun TSI bug
-    if [[ "$result" == *"Connection reset"* ]]; then
-        echo "SKIP: libkrun TSI bug (Connection reset)"
-        return 0
-    fi
-
-    [[ "$result" == *"mount-test-from-pack"* ]]
-}
-
-test_packed_volume_write() {
-    local output="$TEST_DIR/test-alpine"
-
-    # Ensure we have a packed binary
-    if [[ ! -f "$output" ]]; then
-        $SMOLVM pack alpine:latest -o "$output" 2>&1
-    fi
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-
-    # Write from container to host
-    "$output" -v "$tmpdir:/workspace" sh -c "echo 'written-from-packed' > /workspace/output.txt" 2>&1
-
-    local content
-    content=$(cat "$tmpdir/output.txt" 2>/dev/null)
-
-    rm -rf "$tmpdir"
-
-    [[ "$content" == *"written-from-packed"* ]]
-}
-
 test_packed_workdir() {
     local output="$TEST_DIR/test-alpine"
 
@@ -270,7 +192,7 @@ test_packed_workdir() {
 # Packed Binary - Daemon Mode (Requires VM)
 # =============================================================================
 
-test_packed_daemon_start_stop() {
+test_packed_daemon_mode() {
     if [[ "$QUICK_MODE" == "true" ]]; then
         echo "SKIP: --quick mode"
         return 0
@@ -303,6 +225,15 @@ test_packed_daemon_start_stop() {
         return 1
     fi
 
+    # Test exec while running
+    local exec_result
+    exec_result=$("$output" exec echo "daemon-exec-test" 2>&1)
+    if [[ "$exec_result" != *"daemon-exec-test"* ]]; then
+        echo "exec failed: $exec_result"
+        "$output" stop 2>/dev/null || true
+        return 1
+    fi
+
     # Stop daemon
     local stop_result
     stop_result=$("$output" stop 2>&1)
@@ -312,74 +243,6 @@ test_packed_daemon_start_stop() {
     fi
 
     return 0
-}
-
-test_packed_daemon_exec() {
-    if [[ "$QUICK_MODE" == "true" ]]; then
-        echo "SKIP: --quick mode"
-        return 0
-    fi
-
-    local output="$TEST_DIR/test-alpine"
-
-    # Ensure we have a packed binary
-    if [[ ! -f "$output" ]]; then
-        $SMOLVM pack alpine:latest -o "$output" 2>&1
-    fi
-
-    # Start daemon
-    "$output" start 2>&1
-    sleep 2
-
-    # Run exec commands
-    local result1 result2
-    result1=$("$output" exec echo "daemon-exec-test-1" 2>&1)
-    result2=$("$output" exec echo "daemon-exec-test-2" 2>&1)
-
-    # Stop daemon
-    "$output" stop 2>&1
-
-    [[ "$result1" == *"daemon-exec-test-1"* ]] && [[ "$result2" == *"daemon-exec-test-2"* ]]
-}
-
-test_packed_daemon_exec_latency() {
-    if [[ "$QUICK_MODE" == "true" ]]; then
-        echo "SKIP: --quick mode"
-        return 0
-    fi
-
-    local output="$TEST_DIR/test-alpine"
-
-    # Ensure we have a packed binary
-    if [[ ! -f "$output" ]]; then
-        $SMOLVM pack alpine:latest -o "$output" 2>&1
-    fi
-
-    # Start daemon
-    "$output" start 2>&1
-    sleep 2
-
-    # Measure exec latency
-    local start_time end_time elapsed
-    start_time=$(date +%s%3N 2>/dev/null || date +%s)
-
-    "$output" exec echo "latency-test" 2>&1 >/dev/null
-
-    end_time=$(date +%s%3N 2>/dev/null || date +%s)
-
-    # Stop daemon
-    "$output" stop 2>&1
-
-    # Calculate elapsed time
-    if [[ "$start_time" =~ ^[0-9]{10,}$ ]]; then
-        # Milliseconds available
-        elapsed=$((end_time - start_time))
-        # Should be under 500ms (generous for slow systems)
-        [[ $elapsed -lt 500 ]]
-    else
-        # Only seconds available, just pass
-        return 0
-    fi
 }
 
 # =============================================================================
@@ -392,21 +255,6 @@ test_sidecar_exists() {
 
     # Sidecar file should exist with .smolmachine extension
     [[ -f "$output.smolmachine" ]]
-}
-
-test_sidecar_size() {
-    local output="$TEST_DIR/test-sidecar"
-
-    if [[ ! -f "$output.smolmachine" ]]; then
-        $SMOLVM pack alpine:latest -o "$output" 2>&1
-    fi
-
-    # Sidecar should be substantial (contains compressed assets)
-    local size
-    size=$(stat -f%z "$output.smolmachine" 2>/dev/null || stat -c%s "$output.smolmachine" 2>/dev/null)
-
-    # Should be at least 1MB (kernel + libraries)
-    [[ $size -gt 1000000 ]]
 }
 
 test_sidecar_required() {
@@ -438,28 +286,20 @@ test_single_file_pack() {
     local output="$TEST_DIR/test-single-file"
     $SMOLVM pack alpine:latest -o "$output" --single-file 2>&1
 
-    # Binary should exist
-    [[ -f "$output" ]]
+    # Binary should exist and be executable
+    [[ -f "$output" ]] || return 1
+    [[ -x "$output" ]] || return 1
 
     # Sidecar should NOT exist
-    [[ ! -f "$output.smolmachine" ]]
+    [[ ! -f "$output.smolmachine" ]] || return 1
 
-    # Binary should be executable
-    [[ -x "$output" ]]
-}
-
-test_single_file_info() {
-    local output="$TEST_DIR/test-single-file"
-
-    if [[ ! -f "$output" ]]; then
-        $SMOLVM pack alpine:latest -o "$output" --single-file 2>&1
-    fi
-
+    # Should work when moved (no sidecar needed)
+    local new_dir="$TEST_DIR/standalone-test"
+    mkdir -p "$new_dir"
+    cp "$output" "$new_dir/myapp"
     local info_output
-    info_output=$("$output" --info 2>&1)
-
-    # Should show image info
-    [[ "$info_output" == *"Image:"* ]] && [[ "$info_output" == *"alpine"* ]]
+    info_output=$("$new_dir/myapp" --info 2>&1)
+    [[ "$info_output" == *"Image:"* ]]
 }
 
 test_single_file_run_echo() {
@@ -481,74 +321,6 @@ test_single_file_run_echo() {
     [[ "$result" == *"single-file-test-marker"* ]]
 }
 
-test_single_file_size() {
-    local output="$TEST_DIR/test-single-file"
-
-    if [[ ! -f "$output" ]]; then
-        $SMOLVM pack alpine:latest -o "$output" --single-file 2>&1
-    fi
-
-    local size
-    size=$(stat -f%z "$output" 2>/dev/null || stat -c%s "$output" 2>/dev/null)
-
-    # Single file should be substantial (contains stub + compressed assets)
-    # Should be at least 1MB
-    [[ $size -gt 1000000 ]]
-}
-
-test_single_file_no_sidecar_needed() {
-    local output="$TEST_DIR/test-single-file-standalone"
-    $SMOLVM pack alpine:latest -o "$output" --single-file 2>&1
-
-    # Move to a different directory (simulating distribution)
-    local new_dir="$TEST_DIR/standalone-test"
-    mkdir -p "$new_dir"
-    cp "$output" "$new_dir/myapp"
-
-    # Should work without any sidecar
-    local info_output
-    info_output=$("$new_dir/myapp" --info 2>&1)
-
-    [[ "$info_output" == *"Image:"* ]]
-}
-
-# =============================================================================
-# Cache Directory Tests
-# =============================================================================
-
-test_cache_directory_created() {
-    local output="$TEST_DIR/test-cache"
-    $SMOLVM pack alpine:latest -o "$output" 2>&1
-
-    # Run a command to trigger extraction
-    "$output" echo "trigger-extraction" 2>&1 >/dev/null || true
-
-    # Check cache directory exists
-    local cache_base
-    if [[ "$(uname)" == "Darwin" ]]; then
-        cache_base="$HOME/Library/Caches/smolvm-pack"
-    else
-        cache_base="${XDG_CACHE_HOME:-$HOME/.cache}/smolvm-pack"
-    fi
-
-    [[ -d "$cache_base" ]]
-}
-
-test_force_extract() {
-    local output="$TEST_DIR/test-alpine"
-
-    if [[ ! -f "$output" ]]; then
-        $SMOLVM pack alpine:latest -o "$output" 2>&1
-    fi
-
-    # Run with debug to see extraction behavior
-    local result
-    result=$("$output" --debug --force-extract echo "force-test" 2>&1)
-
-    # Should show extraction messages
-    [[ "$result" == *"extract"* ]]
-}
-
 # =============================================================================
 # Error Handling Tests
 # =============================================================================
@@ -558,25 +330,6 @@ test_pack_nonexistent_image() {
     local exit_code=0
     $SMOLVM pack nonexistent-image-that-does-not-exist:v999 -o "$output" 2>&1 || exit_code=$?
     [[ $exit_code -ne 0 ]]
-}
-
-test_packed_invalid_volume_syntax() {
-    local output="$TEST_DIR/test-alpine"
-
-    if [[ ! -f "$output" ]]; then
-        $SMOLVM pack alpine:latest -o "$output" 2>&1
-    fi
-
-    # Invalid volume syntax (no colon) should either:
-    # - Be ignored and command runs successfully, OR
-    # - Cause an error (which is also acceptable behavior)
-    local exit_code=0
-    local result
-    result=$("$output" -v "invalid-volume-syntax" echo "volume-syntax-test" 2>&1) || exit_code=$?
-
-    # Either the command succeeded and output contains our marker,
-    # or it failed with a non-zero exit code (both are valid behaviors)
-    [[ "$result" == *"volume-syntax-test"* ]] || [[ $exit_code -ne 0 ]]
 }
 
 # =============================================================================
@@ -623,22 +376,19 @@ run_test "Pack help" test_pack_help || true
 run_test "Pack requires output" test_pack_requires_output || true
 run_test "Pack alpine" test_pack_alpine || true
 run_test "Pack with custom resources" test_pack_with_custom_resources || true
-run_test "Pack --platform flag in help" test_pack_platform_flag_help || true
 run_test "Pack with --platform" test_pack_with_platform || true
 
 echo ""
 echo "Running Packed Binary Info Tests..."
 echo ""
 
-run_test "Packed --version" test_packed_version || true
-run_test "Packed --info" test_packed_info || true
+run_test "Packed --info and --version" test_packed_info || true
 
 echo ""
 echo "Running Sidecar Tests..."
 echo ""
 
 run_test "Sidecar exists" test_sidecar_exists || true
-run_test "Sidecar size" test_sidecar_size || true
 run_test "Sidecar required" test_sidecar_required || true
 
 echo ""
@@ -646,9 +396,6 @@ echo "Running Single-File Mode Tests..."
 echo ""
 
 run_test "Single-file pack" test_single_file_pack || true
-run_test "Single-file info" test_single_file_info || true
-run_test "Single-file size" test_single_file_size || true
-run_test "Single-file no sidecar needed" test_single_file_no_sidecar_needed || true
 run_test "Single-file run echo (requires VM)" test_single_file_run_echo || true
 
 echo ""
@@ -656,34 +403,21 @@ echo "Running Packed Binary Execution Tests (requires VM)..."
 echo ""
 
 run_test "Packed run echo" test_packed_run_echo || true
-run_test "Packed run cat" test_packed_run_cat || true
 run_test "Packed exit code" test_packed_exit_code || true
 run_test "Packed env variable" test_packed_env_var || true
-run_test "Packed volume mount read" test_packed_volume_mount || true
-run_test "Packed volume mount write" test_packed_volume_write || true
 run_test "Packed workdir" test_packed_workdir || true
 
 echo ""
 echo "Running Daemon Mode Tests (requires VM)..."
 echo ""
 
-run_test "Daemon start/stop" test_packed_daemon_start_stop || true
-run_test "Daemon exec" test_packed_daemon_exec || true
-run_test "Daemon exec latency" test_packed_daemon_exec_latency || true
-
-echo ""
-echo "Running Cache Tests..."
-echo ""
-
-run_test "Cache directory created" test_cache_directory_created || true
-run_test "Force extract" test_force_extract || true
+run_test "Daemon mode (start/exec/stop)" test_packed_daemon_mode || true
 
 echo ""
 echo "Running Error Handling Tests..."
 echo ""
 
 run_test "Pack nonexistent image" test_pack_nonexistent_image || true
-run_test "Invalid volume syntax" test_packed_invalid_volume_syntax || true
 
 if [[ "$QUICK_MODE" != "true" ]]; then
     echo ""

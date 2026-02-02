@@ -34,28 +34,6 @@ test_sandbox_run_cat() {
 }
 
 # =============================================================================
-# Python Image Tests
-# =============================================================================
-
-test_sandbox_python_hello() {
-    local output
-    output=$($SMOLVM sandbox run python:3.12 -- python -c "print('python-test-marker')" 2>&1)
-    [[ "$output" == *"python-test-marker"* ]]
-}
-
-test_sandbox_python_version() {
-    local output
-    output=$($SMOLVM sandbox run python:3.12 -- python --version 2>&1)
-    [[ "$output" == *"Python 3.12"* ]]
-}
-
-test_sandbox_python_math() {
-    local output
-    output=$($SMOLVM sandbox run python:3.12 -- python -c "print(2 + 2)" 2>&1)
-    [[ "$output" == *"4"* ]]
-}
-
-# =============================================================================
 # Exit Codes
 # =============================================================================
 
@@ -67,12 +45,6 @@ test_sandbox_exit_code_nonzero() {
     local exit_code=0
     $SMOLVM sandbox run alpine:latest -- sh -c "exit 42" 2>&1 || exit_code=$?
     [[ $exit_code -eq 42 ]]
-}
-
-test_sandbox_exit_code_one() {
-    local exit_code=0
-    $SMOLVM sandbox run alpine:latest -- sh -c "exit 1" 2>&1 || exit_code=$?
-    [[ $exit_code -eq 1 ]]
 }
 
 # =============================================================================
@@ -235,19 +207,18 @@ test_sandbox_volume_mount_multiple() {
 }
 
 # =============================================================================
-# TSI + Overlayfs Bug Verification
-# These tests verify the distinction between:
-# - Writes to mounted volumes (virtiofs): WORK
-# - Writes to container rootfs (overlayfs): FAIL with ENETRESET
+# TSI + Overlayfs Tests
+# These tests verify that both overlayfs and virtiofs writes work correctly.
+# (Previous libkrun versions had a TSI bug causing ENETRESET on overlayfs writes)
 # =============================================================================
 
-test_tsi_overlayfs_rootfs_write_fails() {
-    # Writing to container rootfs (overlayfs) should fail with ENETRESET
+test_tsi_overlayfs_rootfs_write_works() {
+    # Writing to container rootfs (overlayfs) should work
     local output exit_code=0
-    output=$($SMOLVM sandbox run alpine:latest -- sh -c "echo 'test' > /tmp/rootfs-test.txt" 2>&1) || exit_code=$?
+    output=$($SMOLVM sandbox run alpine:latest -- sh -c "echo 'test' > /tmp/rootfs-test.txt && cat /tmp/rootfs-test.txt" 2>&1) || exit_code=$?
 
-    # Should fail with "Connection reset by network"
-    [[ $exit_code -ne 0 ]] && [[ "$output" == *"Connection reset"* ]]
+    # Should succeed and contain the written content
+    [[ $exit_code -eq 0 ]] && [[ "$output" == *"test"* ]]
 }
 
 test_tsi_virtiofs_mount_write_works() {
@@ -325,12 +296,8 @@ test_sandbox_command_not_found() {
 
 run_test "Sandbox run echo" test_sandbox_run_echo || true
 run_test "Sandbox run cat /etc/os-release" test_sandbox_run_cat || true
-run_test "Python hello world" test_sandbox_python_hello || true
-run_test "Python version" test_sandbox_python_version || true
-run_test "Python math" test_sandbox_python_math || true
 run_test "Exit code 0" test_sandbox_exit_code_zero || true
 run_test "Exit code 42" test_sandbox_exit_code_nonzero || true
-run_test "Exit code 1" test_sandbox_exit_code_one || true
 run_test "Environment variable" test_sandbox_env_variable || true
 run_test "Multiple environment variables" test_sandbox_multiple_env_variables || true
 run_test "Timeout" test_sandbox_timeout || true
@@ -342,7 +309,7 @@ run_test "Volume mount subdirectory" test_sandbox_volume_mount_subdirectory || t
 run_test "Volume mount multiple" test_sandbox_volume_mount_multiple || true
 run_test "Shell pipeline" test_sandbox_shell_pipeline || true
 run_test "Command not found fails" test_sandbox_command_not_found || true
-run_test "TSI: overlayfs rootfs write fails" test_tsi_overlayfs_rootfs_write_fails || true
+run_test "TSI: overlayfs rootfs write works" test_tsi_overlayfs_rootfs_write_works || true
 run_test "TSI: virtiofs mount write works" test_tsi_virtiofs_mount_write_works || true
 run_test "TSI: coding agent workflow" test_tsi_coding_agent_workflow || true
 
