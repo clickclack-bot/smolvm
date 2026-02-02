@@ -347,3 +347,80 @@ pub struct HealthResponse {
     /// Server version.
     pub version: &'static str,
 }
+
+// ============================================================================
+// MicroVM Types
+// ============================================================================
+
+fn default_cpus() -> u8 {
+    1
+}
+
+fn default_mem() -> u32 {
+    512
+}
+
+/// Request to create a new microvm.
+#[derive(Debug, Deserialize)]
+pub struct CreateMicrovmRequest {
+    /// Unique name for the microvm.
+    pub name: String,
+    /// Number of vCPUs.
+    #[serde(default = "default_cpus")]
+    pub cpus: u8,
+    /// Memory in MiB.
+    #[serde(default = "default_mem", rename = "memoryMb")]
+    pub mem: u32,
+    /// Host mounts to attach.
+    #[serde(default)]
+    pub mounts: Vec<MountSpec>,
+    /// Port mappings (host:guest).
+    #[serde(default)]
+    pub ports: Vec<PortSpec>,
+}
+
+/// Request to execute a command in a microvm.
+#[derive(Debug, Deserialize)]
+pub struct MicrovmExecRequest {
+    /// Command and arguments.
+    pub command: Vec<String>,
+    /// Environment variables.
+    #[serde(default)]
+    pub env: Vec<EnvVar>,
+    /// Working directory.
+    #[serde(default)]
+    pub workdir: Option<String>,
+    /// Timeout in seconds.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// MicroVM status information.
+#[derive(Debug, Serialize)]
+pub struct MicrovmInfo {
+    /// MicroVM name.
+    pub name: String,
+    /// Current state ("created", "running", "stopped").
+    pub state: String,
+    /// Number of vCPUs.
+    pub cpus: u8,
+    /// Memory in MiB.
+    #[serde(rename = "memoryMb")]
+    pub mem: u32,
+    /// Process ID (if running).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    /// Number of configured mounts.
+    pub mounts: usize,
+    /// Number of configured ports.
+    pub ports: usize,
+    /// Creation timestamp.
+    pub created_at: String,
+}
+
+/// List microvms response.
+#[derive(Debug, Serialize)]
+pub struct ListMicrovmsResponse {
+    /// List of microvms.
+    pub microvms: Vec<MicrovmInfo>,
+}

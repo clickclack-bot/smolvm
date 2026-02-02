@@ -85,8 +85,21 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .merge(logs_route)
         .merge(sandbox_routes_with_timeout);
 
+    // MicroVM routes
+    let microvm_routes = Router::new()
+        .route("/", post(handlers::microvms::create_microvm))
+        .route("/", get(handlers::microvms::list_microvms))
+        .route("/:name", get(handlers::microvms::get_microvm))
+        .route("/:name/start", post(handlers::microvms::start_microvm))
+        .route("/:name/stop", post(handlers::microvms::stop_microvm))
+        .route("/:name", delete(handlers::microvms::delete_microvm))
+        .route("/:name/exec", post(handlers::microvms::exec_microvm))
+        .layer(TimeoutLayer::new(std::time::Duration::from_secs(300)));
+
     // API v1 routes
-    let api_v1 = Router::new().nest("/sandboxes", sandbox_routes);
+    let api_v1 = Router::new()
+        .nest("/sandboxes", sandbox_routes)
+        .nest("/microvms", microvm_routes);
 
     // CORS: Allow localhost origins only by default for security.
     // Production deployments should configure their own CORS policy.
