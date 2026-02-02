@@ -14,6 +14,41 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
+// ============================================================================
+// Socket Timeout Constants
+// ============================================================================
+//
+// These timeouts control how long the client waits for various operations.
+// They balance between allowing slow operations to complete and failing fast
+// when the agent is unresponsive.
+
+/// Default socket read timeout (30 seconds).
+/// Used for most request/response operations. Long enough for the agent to
+/// process requests, short enough to detect hung connections.
+const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
+
+/// Default socket write timeout (10 seconds).
+/// Writes should complete quickly - if they don't, the connection is likely broken.
+const DEFAULT_WRITE_TIMEOUT_SECS: u64 = 10;
+
+/// Read timeout for image pull operations (10 minutes).
+/// Image pulls can take a long time for large images over slow connections.
+const IMAGE_PULL_TIMEOUT_SECS: u64 = 600;
+
+/// Read timeout for interactive/long-running sessions (1 hour).
+/// Used for exec, run, and container exec operations where the user may be
+/// running long commands or interactive shells.
+const INTERACTIVE_TIMEOUT_SECS: u64 = 3600;
+
+/// Buffer time added to user-specified timeouts (5 seconds).
+/// When users specify a command timeout, we add this buffer to the socket
+/// timeout to allow for protocol overhead and response transmission.
+const TIMEOUT_BUFFER_SECS: u64 = 5;
+
+/// Short read timeout for status checks (5 seconds).
+/// Used when checking agent status where we want to fail fast.
+const STATUS_CHECK_TIMEOUT_SECS: u64 = 5;
+
 /// Configuration for running a command interactively.
 #[derive(Debug, Clone)]
 pub struct RunConfig {
@@ -175,11 +210,14 @@ impl AgentClient {
         })
     }
 
-    /// Reset socket read timeout to the default value (30 seconds).
+    /// Reset socket read timeout to the default value.
     ///
     /// Logs a warning if resetting fails, as we're already past the critical operation.
     fn reset_read_timeout(&self) {
-        if let Err(e) = self.stream.set_read_timeout(Some(Duration::from_secs(30))) {
+        if let Err(e) = self
+            .stream
+            .set_read_timeout(Some(Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS)))
+        {
             tracing::warn!(error = %e, "failed to reset socket read timeout to default");
         }
     }
@@ -196,12 +234,44 @@ impl AgentClient {
     /// - Connection to the socket fails
     /// - Socket timeouts cannot be configured (prevents indefinite hangs)
     pub fn connect(socket_path: impl AsRef<Path>) -> Result<Self> {
-        let stream = UnixStream::connect(socket_path.as_ref())
+        Self::connect_once(socket_path.as_ref())
+    }
+
+    /// Connect to the agent with retry logic for transient failures.
+    ///
+    /// This is useful when the agent might be temporarily unavailable
+    /// (e.g., during high load or brief network issues).
+    pub fn connect_with_retry(socket_path: impl AsRef<Path>) -> Result<Self> {
+        use crate::util::{retry_with_backoff, RetryConfig};
+
+        let path = socket_path.as_ref();
+
+        retry_with_backoff(
+            RetryConfig::for_connection(),
+            "agent connect",
+            || Self::connect_once(path),
+            |e| {
+                // Check if this is a transient error worth retrying
+                let error_msg = e.to_string();
+                // Connection refused/reset are transient during VM startup
+                error_msg.contains("Connection refused")
+                    || error_msg.contains("connection refused")
+                    || error_msg.contains("Connection reset")
+                    || error_msg.contains("connection reset")
+                    || error_msg.contains("Broken pipe")
+                    || error_msg.contains("Resource temporarily unavailable")
+            },
+        )
+    }
+
+    /// Internal connect implementation (single attempt).
+    fn connect_once(socket_path: &Path) -> Result<Self> {
+        let stream = UnixStream::connect(socket_path)
             .map_err(|e| Error::AgentError(format!("failed to connect to agent: {}", e)))?;
 
         // Set timeouts - fail early if we can't set them to prevent indefinite hangs
         stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
+            .set_read_timeout(Some(Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS)))
             .map_err(|e| {
                 Error::AgentError(format!(
                     "failed to set socket read timeout: {} (prevents indefinite hangs)",
@@ -210,7 +280,7 @@ impl AgentClient {
             })?;
 
         stream
-            .set_write_timeout(Some(Duration::from_secs(10)))
+            .set_write_timeout(Some(Duration::from_secs(DEFAULT_WRITE_TIMEOUT_SECS)))
             .map_err(|e| {
                 Error::AgentError(format!(
                     "failed to set socket write timeout: {} (prevents indefinite hangs)",
@@ -352,7 +422,7 @@ impl AgentClient {
         mut progress: Option<F>,
     ) -> Result<ImageInfo> {
         // Use a long timeout for pull - large images can take minutes to download/extract
-        self.set_read_timeout(Duration::from_secs(600))?; // 10 minutes
+        self.set_read_timeout(Duration::from_secs(IMAGE_PULL_TIMEOUT_SECS))?;
 
         // Send the pull request
         let data = encode_message(&AgentRequest::Pull {
@@ -573,7 +643,7 @@ impl AgentClient {
         // The agent just needs to call sync() which is fast
         let _ = self
             .stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            .set_read_timeout(Some(Duration::from_secs(STATUS_CHECK_TIMEOUT_SECS)));
 
         let data = encode_message(&AgentRequest::Shutdown)
             .map_err(|e| Error::AgentError(e.to_string()))?;
@@ -623,8 +693,8 @@ impl AgentClient {
     ) -> Result<(i32, String, String)> {
         // Set socket read timeout based on command timeout (with buffer for response)
         let socket_timeout = match timeout {
-            Some(t) => t + Duration::from_secs(5),
-            None => Duration::from_secs(3600),
+            Some(t) => t + Duration::from_secs(TIMEOUT_BUFFER_SECS),
+            None => Duration::from_secs(INTERACTIVE_TIMEOUT_SECS),
         };
         self.set_read_timeout(socket_timeout)?;
 
@@ -680,7 +750,7 @@ impl AgentClient {
         use std::io::{stderr, stdout, Write};
 
         // Set long socket timeout for interactive sessions
-        self.set_read_timeout(Duration::from_secs(3600))?;
+        self.set_read_timeout(Duration::from_secs(INTERACTIVE_TIMEOUT_SECS))?;
 
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
 
@@ -803,8 +873,8 @@ impl AgentClient {
     ) -> Result<(i32, String, String)> {
         // Set socket read timeout based on command timeout (with buffer for response)
         let socket_timeout = match timeout {
-            Some(t) => t + Duration::from_secs(5), // Add buffer for response
-            None => Duration::from_secs(3600),     // Default 1 hour
+            Some(t) => t + Duration::from_secs(TIMEOUT_BUFFER_SECS),
+            None => Duration::from_secs(INTERACTIVE_TIMEOUT_SECS),
         };
         self.set_read_timeout(socket_timeout)?;
 
@@ -852,7 +922,7 @@ impl AgentClient {
         use std::io::{stderr, stdout, Write};
 
         // Set long socket timeout for interactive sessions
-        self.set_read_timeout(Duration::from_secs(3600))?;
+        self.set_read_timeout(Duration::from_secs(INTERACTIVE_TIMEOUT_SECS))?;
 
         // Convert timeout to milliseconds for protocol
         let timeout_ms = config.timeout.map(|t| t.as_millis() as u64);
@@ -1053,8 +1123,8 @@ impl AgentClient {
     ) -> Result<(i32, String, String)> {
         // Set socket read timeout based on command timeout (with buffer for response)
         let socket_timeout = match timeout {
-            Some(t) => t + Duration::from_secs(5),
-            None => Duration::from_secs(3600),
+            Some(t) => t + Duration::from_secs(TIMEOUT_BUFFER_SECS),
+            None => Duration::from_secs(INTERACTIVE_TIMEOUT_SECS),
         };
         self.set_read_timeout(socket_timeout)?;
 
@@ -1113,7 +1183,7 @@ impl AgentClient {
         use std::io::{stderr, stdout, Write};
 
         // Set long socket timeout for interactive sessions
-        self.set_read_timeout(Duration::from_secs(3600))?;
+        self.set_read_timeout(Duration::from_secs(INTERACTIVE_TIMEOUT_SECS))?;
 
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
 

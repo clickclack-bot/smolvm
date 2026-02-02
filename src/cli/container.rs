@@ -108,7 +108,7 @@ impl ContainerCreateCmd {
         let manager = ensure_microvm(&self.microvm)?;
 
         // Connect to agent
-        let mut client = AgentClient::connect(manager.vsock_socket())?;
+        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         // Pull image if needed
         if !std::path::Path::new(&self.image).exists() {
@@ -196,7 +196,7 @@ pub struct ContainerStartCmd {
 impl ContainerStartCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let manager = ensure_microvm(&self.microvm)?;
-        let mut client = AgentClient::connect(manager.vsock_socket())?;
+        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         client.start_container(&self.container_id)?;
         println!("Started container: {}", self.container_id);
@@ -233,7 +233,7 @@ pub struct ContainerStopCmd {
 impl ContainerStopCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let manager = ensure_microvm(&self.microvm)?;
-        let mut client = AgentClient::connect(manager.vsock_socket())?;
+        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         let timeout_secs = self.timeout.map(|d| d.as_secs());
         client.stop_container(&self.container_id, timeout_secs)?;
@@ -271,7 +271,7 @@ pub struct ContainerRemoveCmd {
 impl ContainerRemoveCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let manager = ensure_microvm(&self.microvm)?;
-        let mut client = AgentClient::connect(manager.vsock_socket())?;
+        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         client.delete_container(&self.container_id, self.force)?;
         println!("Removed container: {}", self.container_id);
@@ -323,7 +323,7 @@ impl ContainerListCmd {
             return Ok(());
         }
 
-        let mut client = AgentClient::connect(manager.vsock_socket())?;
+        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
         let containers = client.list_containers()?;
 
         if self.quiet {
@@ -406,7 +406,7 @@ pub struct ContainerExecCmd {
 impl ContainerExecCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let manager = ensure_microvm(&self.microvm)?;
-        let mut client = AgentClient::connect(manager.vsock_socket())?;
+        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         // Parse environment variables
         let env = parse_env_list(&self.env);

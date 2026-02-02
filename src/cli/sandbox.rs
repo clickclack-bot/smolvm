@@ -97,7 +97,7 @@ impl ExecCmd {
             ));
         }
 
-        let mut client = AgentClient::connect(manager.vsock_socket())?;
+        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         // Find the container in the sandbox
         let containers = client.list_containers()?;
@@ -366,7 +366,7 @@ impl RunCmd {
             .map_err(|e| Error::AgentError(format!("failed to start sandbox: {}", e)))?;
 
         // Connect to agent
-        let mut client = AgentClient::connect(manager.vsock_socket())?;
+        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         // Pull image with progress display
         // Use registry config for automatic credential lookup
@@ -512,11 +512,11 @@ impl ImagesCmd {
 
         // Start VM if not running (needed to query storage)
         let mut client = if manager.try_connect_existing().is_some() {
-            AgentClient::connect(manager.vsock_socket())?
+            AgentClient::connect_with_retry(manager.vsock_socket())?
         } else {
             println!("Starting sandbox VM to query storage...");
             manager.start()?;
-            AgentClient::connect(manager.vsock_socket())?
+            AgentClient::connect_with_retry(manager.vsock_socket())?
         };
 
         // Get storage status
@@ -607,11 +607,11 @@ impl PruneCmd {
 
         // Start VM if not running
         let mut client = if manager.try_connect_existing().is_some() {
-            AgentClient::connect(manager.vsock_socket())?
+            AgentClient::connect_with_retry(manager.vsock_socket())?
         } else {
             println!("Starting sandbox VM...");
             manager.start()?;
-            AgentClient::connect(manager.vsock_socket())?
+            AgentClient::connect_with_retry(manager.vsock_socket())?
         };
 
         if self.all {

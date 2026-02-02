@@ -87,46 +87,61 @@ pub fn is_alive(pid: libc::pid_t) -> bool {
 /// Wait for a process to exit (non-blocking check).
 ///
 /// Returns `Some(exit_code)` if the process has exited, `None` if still running.
+/// Handles EINTR by retrying the waitpid call.
 pub fn try_wait(pid: libc::pid_t) -> Option<i32> {
-    let mut status: libc::c_int = 0;
-    let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    loop {
+        let mut status: libc::c_int = 0;
+        let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
 
-    if result == pid {
-        // Process exited
-        let exit_code = if libc::WIFEXITED(status) {
+        if result == pid {
+            // Process exited
+            let exit_code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else if libc::WIFSIGNALED(status) {
+                128 + libc::WTERMSIG(status)
+            } else {
+                -1
+            };
+            return Some(exit_code);
+        } else if result < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                // EINTR - interrupted by signal, retry
+                continue;
+            }
+            // Other error (process doesn't exist or not our child)
+            return Some(-1);
+        } else {
+            // Still running
+            return None;
+        }
+    }
+}
+
+/// Wait for a process to exit (blocking).
+///
+/// Returns the exit code. Handles EINTR by retrying the waitpid call.
+pub fn wait(pid: libc::pid_t) -> i32 {
+    loop {
+        let mut status: libc::c_int = 0;
+        let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        if result < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                // EINTR - interrupted by signal, retry
+                continue;
+            }
+            return -1;
+        }
+
+        return if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
         } else if libc::WIFSIGNALED(status) {
             128 + libc::WTERMSIG(status)
         } else {
             -1
         };
-        Some(exit_code)
-    } else if result < 0 {
-        // Error (process doesn't exist or not our child)
-        Some(-1)
-    } else {
-        // Still running
-        None
-    }
-}
-
-/// Wait for a process to exit (blocking).
-///
-/// Returns the exit code.
-pub fn wait(pid: libc::pid_t) -> i32 {
-    let mut status: libc::c_int = 0;
-    let result = unsafe { libc::waitpid(pid, &mut status, 0) };
-
-    if result < 0 {
-        return -1;
-    }
-
-    if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else if libc::WIFSIGNALED(status) {
-        128 + libc::WTERMSIG(status)
-    } else {
-        -1
     }
 }
 

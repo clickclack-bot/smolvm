@@ -121,7 +121,7 @@ impl ExecCmd {
         }
 
         // Connect to agent
-        let mut client = AgentClient::connect(manager.vsock_socket())?;
+        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         // Parse environment variables
         let env: Vec<(String, String)> =

@@ -306,8 +306,10 @@ impl AgentManager {
     }
 
     /// Connect to the running agent and return a client.
+    ///
+    /// Uses retry logic to handle transient connection failures.
     pub fn connect(&self) -> crate::error::Result<super::AgentClient> {
-        super::AgentClient::connect(&self.vsock_socket)
+        super::AgentClient::connect_with_retry(&self.vsock_socket)
     }
 
     /// Get the currently configured mounts.

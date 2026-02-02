@@ -26,9 +26,16 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
 use state::ApiState;
+
+/// Default timeout for API requests (5 minutes).
+/// Most operations (start, stop, exec) complete within this time.
+/// Long-running operations like image pulls may need longer, but this
+/// provides a reasonable upper bound for most requests.
+const API_REQUEST_TIMEOUT_SECS: u64 = 300;
 
 /// Create the API router with all endpoints.
 pub fn create_router(state: Arc<ApiState>) -> Router {
@@ -78,7 +85,9 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .route("/:id/images", get(handlers::images::list_images))
         .route("/:id/images/pull", post(handlers::images::pull_image))
         // Apply timeout only to these routes
-        .layer(TimeoutLayer::new(std::time::Duration::from_secs(300)));
+        .layer(TimeoutLayer::new(Duration::from_secs(
+            API_REQUEST_TIMEOUT_SECS,
+        )));
 
     // Combine sandbox routes (with and without timeout)
     let sandbox_routes = Router::new()
@@ -94,7 +103,9 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .route("/:name/stop", post(handlers::microvms::stop_microvm))
         .route("/:name", delete(handlers::microvms::delete_microvm))
         .route("/:name/exec", post(handlers::microvms::exec_microvm))
-        .layer(TimeoutLayer::new(std::time::Duration::from_secs(300)));
+        .layer(TimeoutLayer::new(Duration::from_secs(
+            API_REQUEST_TIMEOUT_SECS,
+        )));
 
     // API v1 routes
     let api_v1 = Router::new()
