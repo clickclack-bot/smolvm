@@ -1323,7 +1323,10 @@ fn get_crun_state(container_id: &str) -> Result<String, StorageError> {
     state_json["status"]
         .as_str()
         .map(String::from)
-        .ok_or_else(|| StorageError("missing status in crun state".into()))
+        .ok_or_else(|| StorageError::MissingField {
+            context: "crun state".into(),
+            field: "status".into(),
+        })
 }
 
 /// Read exit code from the exit file for a container.

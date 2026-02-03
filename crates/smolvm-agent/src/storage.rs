@@ -105,10 +105,10 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
     let mut layer_dirs: Vec<String> = Vec::new();
 
     let entries = std::fs::read_dir(packed_dir)
-        .map_err(|e| StorageError(format!("failed to read packed layers directory: {}", e)))?;
+        .map_err(|e| StorageError::read_error(packed_dir.display().to_string(), e))?;
 
     for entry in entries {
-        let entry = entry?;
+        let entry: std::fs::DirEntry = entry?;
         let path = entry.path();
         if path.is_dir() {
             let name = entry.file_name().to_string_lossy().to_string();
@@ -155,18 +155,271 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
 
 /// Error type for storage operations.
 #[derive(Debug)]
-pub struct StorageError(pub(crate) String);
+pub enum StorageError {
+    // ========================================================================
+    // I/O Errors
+    // ========================================================================
+    /// Failed to create a directory.
+    CreateDir { path: String, cause: String },
+    /// Failed to remove a directory.
+    RemoveDir { path: String, cause: String },
+    /// Failed to read a file or directory.
+    ReadFile { path: String, cause: String },
+    /// Failed to write a file.
+    WriteFile { path: String, cause: String },
+    /// Failed to create a symlink.
+    Symlink {
+        source: String,
+        target: String,
+        cause: String,
+    },
+    /// Path conversion error.
+    InvalidPath { path: String },
+
+    // ========================================================================
+    // Image Errors
+    // ========================================================================
+    /// Image not found locally.
+    ImageNotFound { image: String },
+    /// Failed to pull image from registry.
+    ImagePullFailed { image: String, cause: String },
+    /// Invalid image reference format.
+    InvalidImageReference { reference: String, reason: String },
+
+    // ========================================================================
+    // Layer Errors
+    // ========================================================================
+    /// Layer not found.
+    LayerNotFound { digest: String },
+    /// Failed to extract layer.
+    LayerExtractionFailed { digest: String, cause: String },
+    /// Layer index out of bounds.
+    LayerIndexOutOfBounds {
+        image: String,
+        index: usize,
+        total: usize,
+    },
+
+    // ========================================================================
+    // Manifest/Config Errors
+    // ========================================================================
+    /// Failed to parse manifest or config JSON.
+    ParseError { context: String, cause: String },
+    /// Missing required field in manifest/config.
+    MissingField { context: String, field: String },
+    /// Unsupported manifest format.
+    UnsupportedManifest { media_type: String },
+
+    // ========================================================================
+    // Mount Errors
+    // ========================================================================
+    /// Failed to mount overlay filesystem.
+    OverlayMountFailed { path: String, cause: String },
+    /// Failed to unmount filesystem.
+    UnmountFailed { path: String, cause: String },
+
+    // ========================================================================
+    // Command Execution Errors
+    // ========================================================================
+    /// External command (crane, crun, etc.) failed.
+    CommandFailed {
+        command: String,
+        exit_code: Option<i32>,
+        stderr: String,
+    },
+    /// Failed to spawn external command.
+    SpawnFailed { command: String, cause: String },
+
+    // ========================================================================
+    // Validation Errors
+    // ========================================================================
+    /// Input validation failed.
+    ValidationFailed { context: String, reason: String },
+
+    // ========================================================================
+    // Storage State Errors
+    // ========================================================================
+    /// Storage not formatted/initialized.
+    StorageNotReady { reason: String },
+    /// No images found in storage.
+    NoImagesFound,
+
+    // ========================================================================
+    // Generic
+    // ========================================================================
+    /// Internal error with message (fallback for complex cases).
+    Internal { message: String },
+}
 
 impl StorageError {
-    /// Create a new storage error with the given message.
+    /// Create a new internal error with the given message.
+    /// Use this as a fallback when no specific variant fits.
     pub fn new(message: impl Into<String>) -> Self {
-        StorageError(message.into())
+        StorageError::Internal {
+            message: message.into(),
+        }
+    }
+
+    /// Create an I/O read error.
+    pub fn read_error(path: impl Into<String>, cause: impl std::fmt::Display) -> Self {
+        StorageError::ReadFile {
+            path: path.into(),
+            cause: cause.to_string(),
+        }
+    }
+
+    /// Create an I/O write error.
+    pub fn write_error(path: impl Into<String>, cause: impl std::fmt::Display) -> Self {
+        StorageError::WriteFile {
+            path: path.into(),
+            cause: cause.to_string(),
+        }
+    }
+
+    /// Create a directory creation error.
+    pub fn create_dir_error(path: impl Into<String>, cause: impl std::fmt::Display) -> Self {
+        StorageError::CreateDir {
+            path: path.into(),
+            cause: cause.to_string(),
+        }
+    }
+
+    /// Create a parse error.
+    pub fn parse_error(context: impl Into<String>, cause: impl std::fmt::Display) -> Self {
+        StorageError::ParseError {
+            context: context.into(),
+            cause: cause.to_string(),
+        }
+    }
+
+    /// Create a command failed error.
+    pub fn command_failed(
+        command: impl Into<String>,
+        exit_code: Option<i32>,
+        stderr: impl Into<String>,
+    ) -> Self {
+        StorageError::CommandFailed {
+            command: command.into(),
+            exit_code,
+            stderr: stderr.into(),
+        }
     }
 }
 
 impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        match self {
+            // I/O errors
+            StorageError::CreateDir { path, cause } => {
+                write!(f, "failed to create directory '{}': {}", path, cause)
+            }
+            StorageError::RemoveDir { path, cause } => {
+                write!(f, "failed to remove directory '{}': {}", path, cause)
+            }
+            StorageError::ReadFile { path, cause } => {
+                write!(f, "failed to read '{}': {}", path, cause)
+            }
+            StorageError::WriteFile { path, cause } => {
+                write!(f, "failed to write '{}': {}", path, cause)
+            }
+            StorageError::Symlink {
+                source,
+                target,
+                cause,
+            } => {
+                write!(
+                    f,
+                    "failed to create symlink '{}' -> '{}': {}",
+                    source, target, cause
+                )
+            }
+            StorageError::InvalidPath { path } => {
+                write!(f, "invalid path: {}", path)
+            }
+
+            // Image errors
+            StorageError::ImageNotFound { image } => {
+                write!(f, "image not found: {}", image)
+            }
+            StorageError::ImagePullFailed { image, cause } => {
+                write!(f, "failed to pull image '{}': {}", image, cause)
+            }
+            StorageError::InvalidImageReference { reference, reason } => {
+                write!(f, "invalid image reference '{}': {}", reference, reason)
+            }
+
+            // Layer errors
+            StorageError::LayerNotFound { digest } => {
+                write!(f, "layer not found: {}", digest)
+            }
+            StorageError::LayerExtractionFailed { digest, cause } => {
+                write!(f, "failed to extract layer '{}': {}", digest, cause)
+            }
+            StorageError::LayerIndexOutOfBounds {
+                image,
+                index,
+                total,
+            } => {
+                write!(
+                    f,
+                    "layer index {} out of bounds for image '{}' (has {} layers)",
+                    index, image, total
+                )
+            }
+
+            // Manifest/config errors
+            StorageError::ParseError { context, cause } => {
+                write!(f, "failed to parse {}: {}", context, cause)
+            }
+            StorageError::MissingField { context, field } => {
+                write!(f, "missing '{}' in {}", field, context)
+            }
+            StorageError::UnsupportedManifest { media_type } => {
+                write!(f, "unsupported manifest format: {}", media_type)
+            }
+
+            // Mount errors
+            StorageError::OverlayMountFailed { path, cause } => {
+                write!(f, "overlay mount failed at '{}': {}", path, cause)
+            }
+            StorageError::UnmountFailed { path, cause } => {
+                write!(f, "failed to unmount '{}': {}", path, cause)
+            }
+
+            // Command errors
+            StorageError::CommandFailed {
+                command,
+                exit_code,
+                stderr,
+            } => {
+                if let Some(code) = exit_code {
+                    write!(f, "{} failed (exit {}): {}", command, code, stderr)
+                } else {
+                    write!(f, "{} failed: {}", command, stderr)
+                }
+            }
+            StorageError::SpawnFailed { command, cause } => {
+                write!(f, "failed to spawn '{}': {}", command, cause)
+            }
+
+            // Validation errors
+            StorageError::ValidationFailed { context, reason } => {
+                write!(f, "{}: {}", context, reason)
+            }
+
+            // Storage state errors
+            StorageError::StorageNotReady { reason } => {
+                write!(f, "storage not ready: {}", reason)
+            }
+            StorageError::NoImagesFound => {
+                write!(f, "no images found")
+            }
+
+            // Generic
+            StorageError::Internal { message } => {
+                write!(f, "{}", message)
+            }
+        }
     }
 }
 
@@ -174,7 +427,9 @@ impl std::error::Error for StorageError {}
 
 impl From<std::io::Error> for StorageError {
     fn from(e: std::io::Error) -> Self {
-        StorageError(e.to_string())
+        StorageError::Internal {
+            message: e.to_string(),
+        }
     }
 }
 
@@ -376,7 +631,12 @@ pub fn pull_image_with_auth(
     auth: Option<&RegistryAuth>,
 ) -> Result<ImageInfo> {
     // Validate image reference before any operations
-    crate::oci::validate_image_reference(image).map_err(StorageError)?;
+    crate::oci::validate_image_reference(image).map_err(|e| {
+        StorageError::InvalidImageReference {
+            reference: image.to_string(),
+            reason: e,
+        }
+    })?;
 
     // If packed layers are available, return synthetic image info
     // The layers are already present from the packed binary
@@ -442,16 +702,19 @@ pub fn pull_image_with_auth(
 
     // Parse manifest to get config and layers
     let manifest_json: serde_json::Value =
-        serde_json::from_str(&manifest).map_err(|e| StorageError(e.to_string()))?;
+        serde_json::from_str(&manifest).map_err(|e| StorageError::parse_error("manifest", e))?;
 
     // Handle manifest list (multi-arch) - this shouldn't happen with --platform but just in case
     let config_digest = if manifest_json.get("config").is_some() {
         manifest_json["config"]["digest"]
             .as_str()
-            .ok_or_else(|| StorageError("missing config digest".into()))?
+            .ok_or_else(|| StorageError::MissingField {
+                context: "manifest".into(),
+                field: "config digest".into(),
+            })?
     } else if manifest_json.get("manifests").is_some() {
         // This is a manifest list, need to fetch platform-specific manifest
-        return Err(StorageError(format!(
+        return Err(StorageError::new(format!(
             "got manifest list instead of image manifest - platform may not be available. \
              manifests: {:?}",
             manifest_json["manifests"].as_array().map(|arr| arr
@@ -460,12 +723,17 @@ pub fn pull_image_with_auth(
                 .collect::<Vec<_>>())
         )));
     } else {
-        return Err(StorageError("unknown manifest format".into()));
+        return Err(StorageError::UnsupportedManifest {
+            media_type: "unknown".into(),
+        });
     };
 
     let layers: Vec<String> = manifest_json["layers"]
         .as_array()
-        .ok_or_else(|| StorageError("missing layers".into()))?
+        .ok_or_else(|| StorageError::MissingField {
+            context: "manifest".into(),
+            field: "layers".into(),
+        })?
         .iter()
         .filter_map(|l| l["digest"].as_str().map(String::from))
         .collect();
@@ -486,7 +754,7 @@ pub fn pull_image_with_auth(
 
     // Parse config for metadata
     let config_json: serde_json::Value =
-        serde_json::from_str(&config).map_err(|e| StorageError(e.to_string()))?;
+        serde_json::from_str(&config).map_err(|e| StorageError::parse_error("config", e))?;
 
     // Extract layers with retry logic for transient failures
     let mut total_size = 0u64;
@@ -577,7 +845,12 @@ where
     F: FnMut(usize, usize, &str),
 {
     // Validate image reference before any operations
-    crate::oci::validate_image_reference(image).map_err(StorageError)?;
+    crate::oci::validate_image_reference(image).map_err(|e| {
+        StorageError::InvalidImageReference {
+            reference: image.to_string(),
+            reason: e,
+        }
+    })?;
 
     // If packed layers are available, return synthetic image info
     if let Some(packed_dir) = get_packed_layers_dir() {
@@ -643,15 +916,18 @@ where
 
     // Parse manifest to get config and layers
     let manifest_json: serde_json::Value =
-        serde_json::from_str(&manifest).map_err(|e| StorageError(e.to_string()))?;
+        serde_json::from_str(&manifest).map_err(|e| StorageError::parse_error("manifest", e))?;
 
     // Handle manifest list (multi-arch)
     let config_digest = if manifest_json.get("config").is_some() {
         manifest_json["config"]["digest"]
             .as_str()
-            .ok_or_else(|| StorageError("missing config digest".into()))?
+            .ok_or_else(|| StorageError::MissingField {
+                context: "manifest".into(),
+                field: "config digest".into(),
+            })?
     } else if manifest_json.get("manifests").is_some() {
-        return Err(StorageError(format!(
+        return Err(StorageError::new(format!(
             "got manifest list instead of image manifest - platform may not be available. \
              manifests: {:?}",
             manifest_json["manifests"].as_array().map(|arr| arr
@@ -660,12 +936,17 @@ where
                 .collect::<Vec<_>>())
         )));
     } else {
-        return Err(StorageError("unknown manifest format".into()));
+        return Err(StorageError::UnsupportedManifest {
+            media_type: "unknown".into(),
+        });
     };
 
     let layers: Vec<String> = manifest_json["layers"]
         .as_array()
-        .ok_or_else(|| StorageError("missing layers".into()))?
+        .ok_or_else(|| StorageError::MissingField {
+            context: "manifest".into(),
+            field: "layers".into(),
+        })?
         .iter()
         .filter_map(|l| l["digest"].as_str().map(String::from))
         .collect();
@@ -688,7 +969,7 @@ where
 
     // Parse config for metadata
     let config_json: serde_json::Value =
-        serde_json::from_str(&config).map_err(|e| StorageError(e.to_string()))?;
+        serde_json::from_str(&config).map_err(|e| StorageError::parse_error("config", e))?;
 
     // Extract layers with progress updates
     let mut total_size = 0u64;
@@ -755,7 +1036,7 @@ where
             if let Err(e) = std::fs::remove_dir_all(&layer_dir) {
                 warn!(layer = %layer_id, error = %e, "failed to clean up layer directory after extraction failure");
             }
-            return Err(StorageError(format!(
+            return Err(StorageError::new(format!(
                 "failed to extract layer {}",
                 layer_digest
             )));
@@ -812,15 +1093,22 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
     // Read and parse manifest
     let manifest = std::fs::read_to_string(&manifest_path)?;
     let manifest_json: serde_json::Value =
-        serde_json::from_str(&manifest).map_err(|e| StorageError(e.to_string()))?;
+        serde_json::from_str(&manifest).map_err(|e| StorageError::parse_error("manifest", e))?;
 
-    let config_digest = manifest_json["config"]["digest"]
-        .as_str()
-        .ok_or_else(|| StorageError("missing config digest".into()))?;
+    let config_digest =
+        manifest_json["config"]["digest"]
+            .as_str()
+            .ok_or_else(|| StorageError::MissingField {
+                context: "manifest".into(),
+                field: "config digest".into(),
+            })?;
 
     let layers: Vec<String> = manifest_json["layers"]
         .as_array()
-        .ok_or_else(|| StorageError("missing layers".into()))?
+        .ok_or_else(|| StorageError::MissingField {
+            context: "manifest".into(),
+            field: "layers".into(),
+        })?
         .iter()
         .filter_map(|l| l["digest"].as_str().map(String::from))
         .collect();
@@ -832,7 +1120,7 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
     let config_path = root.join(CONFIGS_DIR).join(format!("{}.json", config_id));
     let config = std::fs::read_to_string(&config_path)?;
     let config_json: serde_json::Value =
-        serde_json::from_str(&config).map_err(|e| StorageError(e.to_string()))?;
+        serde_json::from_str(&config).map_err(|e| StorageError::parse_error("config", e))?;
 
     let architecture = config_json["architecture"]
         .as_str()
@@ -882,7 +1170,7 @@ pub fn list_images() -> Result<Vec<ImageInfo>> {
     let mut images = Vec::new();
 
     for entry in std::fs::read_dir(&manifests_dir)? {
-        let entry = entry?;
+        let entry: std::fs::DirEntry = entry?;
         let path = entry.path();
 
         if path.extension().map(|e| e == "json").unwrap_or(false) {
@@ -912,7 +1200,7 @@ pub fn export_layer(image_digest: &str, layer_index: usize) -> Result<PathBuf> {
     // Find image by digest - need to scan manifests
     let manifests_dir = root.join(MANIFESTS_DIR);
     if !manifests_dir.exists() {
-        return Err(StorageError("no images found".into()));
+        return Err(StorageError::NoImagesFound);
     }
 
     // Find manifest with matching digest
@@ -937,11 +1225,12 @@ pub fn export_layer(image_digest: &str, layer_index: usize) -> Result<PathBuf> {
         }
     }
 
-    let layers = layers
-        .ok_or_else(|| StorageError(format!("image with digest {} not found", image_digest)))?;
+    let layers = layers.ok_or_else(|| {
+        StorageError::new(format!("image with digest {} not found", image_digest))
+    })?;
 
     if layer_index >= layers.len() {
-        return Err(StorageError(format!(
+        return Err(StorageError::new(format!(
             "layer index {} out of bounds (image has {} layers)",
             layer_index,
             layers.len()
@@ -953,7 +1242,7 @@ pub fn export_layer(image_digest: &str, layer_index: usize) -> Result<PathBuf> {
     let layer_dir = root.join(LAYERS_DIR).join(layer_id);
 
     if !layer_dir.exists() {
-        return Err(StorageError(format!(
+        return Err(StorageError::new(format!(
             "layer directory not found: {}",
             layer_dir.display()
         )));
@@ -979,7 +1268,7 @@ pub fn export_layer(image_digest: &str, layer_index: usize) -> Result<PathBuf> {
         .status()?;
 
     if !status.success() {
-        return Err(StorageError(format!(
+        return Err(StorageError::new(format!(
             "failed to create tar archive for layer {}",
             layer_id
         )));
@@ -994,7 +1283,7 @@ pub fn get_layer_digest(image_digest: &str, layer_index: usize) -> Result<String
     let manifests_dir = root.join(MANIFESTS_DIR);
 
     if !manifests_dir.exists() {
-        return Err(StorageError("no images found".into()));
+        return Err(StorageError::NoImagesFound);
     }
 
     for entry in std::fs::read_dir(&manifests_dir)? {
@@ -1017,7 +1306,7 @@ pub fn get_layer_digest(image_digest: &str, layer_index: usize) -> Result<String
         }
     }
 
-    Err(StorageError(format!(
+    Err(StorageError::new(format!(
         "layer {} not found for image {}",
         layer_index, image_digest
     )))
@@ -1146,7 +1435,7 @@ impl OverlaySetup {
         for layer_path in lowerdirs {
             let path = Path::new(layer_path);
             if !path.exists() {
-                return Err(StorageError(format!(
+                return Err(StorageError::new(format!(
                     "layer path does not exist: {}",
                     layer_path
                 )));
@@ -1228,8 +1517,9 @@ impl OverlaySetup {
         // Create symlink: bundle/rootfs -> ../merged
         let rootfs_link = bundle_path.join("rootfs");
         if !rootfs_link.exists() {
-            std::os::unix::fs::symlink("../merged", &rootfs_link)
-                .map_err(|e| StorageError(format!("failed to create rootfs symlink: {}", e)))?;
+            std::os::unix::fs::symlink("../merged", &rootfs_link).map_err(|e| {
+                StorageError::new(format!("failed to create rootfs symlink: {}", e))
+            })?;
         }
 
         debug!(bundle = %bundle_path.display(), "OCI bundle directory created");
@@ -1269,8 +1559,8 @@ pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
     }
 
     // Ensure image exists
-    let info =
-        query_image(image)?.ok_or_else(|| StorageError(format!("image not found: {}", image)))?;
+    let info = query_image(image)?
+        .ok_or_else(|| StorageError::new(format!("image not found: {}", image)))?;
 
     // Build lowerdir from layers (reversed for overlay order - top layer first)
     let root = Path::new(STORAGE_ROOT);
@@ -1302,10 +1592,10 @@ fn prepare_overlay_from_packed(
     let mut layer_dirs: Vec<PathBuf> = Vec::new();
 
     let entries = std::fs::read_dir(packed_dir)
-        .map_err(|e| StorageError(format!("failed to read packed layers directory: {}", e)))?;
+        .map_err(|e| StorageError::read_error(packed_dir.display().to_string(), e))?;
 
     for entry in entries {
-        let entry = entry?;
+        let entry: std::fs::DirEntry = entry?;
         let path = entry.path();
         if path.is_dir() {
             let name = entry.file_name().to_string_lossy().to_string();
@@ -1317,7 +1607,7 @@ fn prepare_overlay_from_packed(
     }
 
     if layer_dirs.is_empty() {
-        return Err(StorageError(format!(
+        return Err(StorageError::new(format!(
             "no layer directories found in {}",
             packed_dir.display()
         )));
@@ -1425,7 +1715,7 @@ pub fn run_command(
 
     // Write config.json to bundle
     spec.write_to(&bundle_path)
-        .map_err(|e| StorageError(format!("failed to write OCI spec: {}", e)))?;
+        .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;
 
     // Generate unique container ID for this execution
     let container_id = generate_container_id();
@@ -1570,7 +1860,7 @@ fn run_with_crun(
         .capture_output()
         .spawn()
         .map_err(|e| {
-            StorageError(format!(
+            StorageError::new(format!(
                 "failed to spawn crun: {}. Is crun installed at {}?",
                 e,
                 paths::CRUN_PATH
@@ -1660,7 +1950,7 @@ fn try_mount_overlay_multi_lower(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(StorageError(format!(
+        return Err(StorageError::new(format!(
             "multi-lowerdir overlay mount failed: {}",
             stderr
         )));
@@ -1706,7 +1996,10 @@ fn mount_overlay_sequential(
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(StorageError(format!("overlay mount failed: {}", stderr)));
+            return Err(StorageError::new(format!(
+                "overlay mount failed: {}",
+                stderr
+            )));
         }
         return Ok(());
     }
@@ -1783,7 +2076,7 @@ fn mount_overlay_sequential(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(StorageError(format!(
+        return Err(StorageError::new(format!(
             "overlay mount on merged layers failed: {}",
             stderr
         )));
@@ -1929,7 +2222,7 @@ fn run_crane_once(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(StorageError(format!(
+        return Err(StorageError::new(format!(
             "crane {} failed: {}",
             operation, stderr
         )));
@@ -1976,8 +2269,11 @@ fn get_disk_usage(path: &Path) -> Result<(u64, u64)> {
         use std::ffi::CString;
         use std::mem::MaybeUninit;
 
-        let path_cstr = CString::new(path.to_string_lossy().as_bytes())
-            .map_err(|_| StorageError("invalid path".into()))?;
+        let path_cstr = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
+            StorageError::InvalidPath {
+                path: "overlay path".into(),
+            }
+        })?;
 
         unsafe {
             let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
@@ -2036,7 +2332,7 @@ fn dir_size(path: &Path) -> Result<u64> {
     }
 
     for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
+        let entry: std::fs::DirEntry = entry?;
         let path = entry.path();
 
         if path.is_file() {
@@ -2110,7 +2406,7 @@ fn extract_layer_with_retry(
                 // Clean up failed layer
                 let _ = std::fs::remove_dir_all(layer_dir);
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(StorageError(format!(
+                return Err(StorageError::new(format!(
                     "failed to extract layer {}: {}",
                     layer_digest, stderr
                 )));
@@ -2119,7 +2415,7 @@ fn extract_layer_with_retry(
             // Verify extraction succeeded (directory is not empty)
             if !is_layer_cached(layer_dir) {
                 let _ = std::fs::remove_dir_all(layer_dir);
-                return Err(StorageError(format!(
+                return Err(StorageError::new(format!(
                     "layer extraction produced empty directory: {}",
                     layer_digest
                 )));
