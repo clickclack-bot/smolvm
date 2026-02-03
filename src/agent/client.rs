@@ -651,14 +651,29 @@ impl AgentClient {
             .write_all(&data)
             .map_err(|e| Error::AgentError(format!("failed to send shutdown: {}", e)))?;
 
-        // Wait for acknowledgment - this confirms sync() completed
-        // If the agent crashes or times out, we proceed anyway
+        // Wait for acknowledgment - this confirms sync() completed.
+        // If the agent crashes or times out, we proceed anyway since
+        // the sync() happens before the response is sent.
+        //
+        // Note: EAGAIN (os error 35) is common here because the VM may be
+        // torn down before the response arrives - this is benign since
+        // sync() has already completed by that point.
         match self.read_response() {
             Ok(_) => {
                 tracing::debug!("agent acknowledged shutdown (sync complete)");
             }
             Err(e) => {
-                tracing::warn!(error = %e, "shutdown acknowledgment failed, proceeding anyway");
+                // Check if this is EAGAIN/EWOULDBLOCK - a common benign race
+                let error_str = e.to_string();
+                if error_str.contains("os error 35")
+                    || error_str.contains("temporarily unavailable")
+                {
+                    tracing::debug!(
+                        "shutdown ack not received (connection closed) - sync likely completed"
+                    );
+                } else {
+                    tracing::warn!(error = %e, "shutdown acknowledgment failed, proceeding anyway");
+                }
             }
         }
 
