@@ -12,11 +12,25 @@ use crate::api::state::{
     mount_spec_to_host_mount, port_spec_to_mapping, resource_spec_to_vm_resources, ApiState,
 };
 use crate::api::types::{
-    ContainerExecRequest, ContainerInfo, CreateContainerRequest, DeleteContainerRequest,
-    ExecResponse, ListContainersResponse, StopContainerRequest,
+    ApiErrorResponse, ContainerExecRequest, ContainerInfo, CreateContainerRequest,
+    DeleteContainerRequest, ExecResponse, ListContainersResponse, StopContainerRequest,
 };
 
-/// POST /api/v1/sandboxes/:id/containers - Create a container.
+/// Create a container in a sandbox.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sandboxes/{id}/containers",
+    tag = "Containers",
+    params(
+        ("id" = String, Path, description = "Sandbox name")
+    ),
+    request_body = CreateContainerRequest,
+    responses(
+        (status = 200, description = "Container created", body = ContainerInfo),
+        (status = 404, description = "Sandbox not found", body = ApiErrorResponse),
+        (status = 500, description = "Failed to create container", body = ApiErrorResponse)
+    )
+)]
 pub async fn create_container(
     State(state): State<Arc<ApiState>>,
     Path(sandbox_id): Path<String>,
@@ -33,7 +47,7 @@ pub async fn create_container(
                 entry.mounts.iter().map(mount_spec_to_host_mount).collect();
             let mounts = mounts_result?;
             let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
-            let resources = resource_spec_to_vm_resources(&entry.resources);
+            let resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
 
             entry
                 .manager
@@ -81,7 +95,19 @@ pub async fn create_container(
     }))
 }
 
-/// GET /api/v1/sandboxes/:id/containers - List containers.
+/// List containers in a sandbox.
+#[utoipa::path(
+    get,
+    path = "/api/v1/sandboxes/{id}/containers",
+    tag = "Containers",
+    params(
+        ("id" = String, Path, description = "Sandbox name")
+    ),
+    responses(
+        (status = 200, description = "List of containers", body = ListContainersResponse),
+        (status = 404, description = "Sandbox not found", body = ApiErrorResponse)
+    )
+)]
 pub async fn list_containers(
     State(state): State<Arc<ApiState>>,
     Path(sandbox_id): Path<String>,
@@ -122,7 +148,21 @@ pub async fn list_containers(
     Ok(Json(ListContainersResponse { containers }))
 }
 
-/// POST /api/v1/sandboxes/:id/containers/:cid/start - Start a container.
+/// Start a container.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sandboxes/{id}/containers/{cid}/start",
+    tag = "Containers",
+    params(
+        ("id" = String, Path, description = "Sandbox name"),
+        ("cid" = String, Path, description = "Container ID")
+    ),
+    responses(
+        (status = 200, description = "Container started"),
+        (status = 404, description = "Sandbox or container not found", body = ApiErrorResponse),
+        (status = 500, description = "Failed to start container", body = ApiErrorResponse)
+    )
+)]
 pub async fn start_container(
     State(state): State<Arc<ApiState>>,
     Path((sandbox_id, container_id)): Path<(String, String)>,
@@ -147,7 +187,22 @@ pub async fn start_container(
     })))
 }
 
-/// POST /api/v1/sandboxes/:id/containers/:cid/stop - Stop a container.
+/// Stop a container.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sandboxes/{id}/containers/{cid}/stop",
+    tag = "Containers",
+    params(
+        ("id" = String, Path, description = "Sandbox name"),
+        ("cid" = String, Path, description = "Container ID")
+    ),
+    request_body = StopContainerRequest,
+    responses(
+        (status = 200, description = "Container stopped"),
+        (status = 404, description = "Sandbox or container not found", body = ApiErrorResponse),
+        (status = 500, description = "Failed to stop container", body = ApiErrorResponse)
+    )
+)]
 pub async fn stop_container(
     State(state): State<Arc<ApiState>>,
     Path((sandbox_id, container_id)): Path<(String, String)>,
@@ -175,7 +230,22 @@ pub async fn stop_container(
     })))
 }
 
-/// DELETE /api/v1/sandboxes/:id/containers/:cid - Delete a container.
+/// Delete a container.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/sandboxes/{id}/containers/{cid}",
+    tag = "Containers",
+    params(
+        ("id" = String, Path, description = "Sandbox name"),
+        ("cid" = String, Path, description = "Container ID")
+    ),
+    request_body = DeleteContainerRequest,
+    responses(
+        (status = 200, description = "Container deleted"),
+        (status = 404, description = "Sandbox or container not found", body = ApiErrorResponse),
+        (status = 500, description = "Failed to delete container", body = ApiErrorResponse)
+    )
+)]
 pub async fn delete_container(
     State(state): State<Arc<ApiState>>,
     Path((sandbox_id, container_id)): Path<(String, String)>,
@@ -203,7 +273,23 @@ pub async fn delete_container(
     })))
 }
 
-/// POST /api/v1/sandboxes/:id/containers/:cid/exec - Execute in a container.
+/// Execute a command in a container.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sandboxes/{id}/containers/{cid}/exec",
+    tag = "Containers",
+    params(
+        ("id" = String, Path, description = "Sandbox name"),
+        ("cid" = String, Path, description = "Container ID")
+    ),
+    request_body = ContainerExecRequest,
+    responses(
+        (status = 200, description = "Command executed", body = ExecResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 404, description = "Sandbox or container not found", body = ApiErrorResponse),
+        (status = 500, description = "Execution failed", body = ApiErrorResponse)
+    )
+)]
 pub async fn exec_in_container(
     State(state): State<Arc<ApiState>>,
     Path((sandbox_id, container_id)): Path<(String, String)>,

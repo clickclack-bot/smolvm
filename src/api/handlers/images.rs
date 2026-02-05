@@ -11,9 +11,23 @@ use crate::api::error::ApiError;
 use crate::api::state::{
     mount_spec_to_host_mount, port_spec_to_mapping, resource_spec_to_vm_resources, ApiState,
 };
-use crate::api::types::{ImageInfo, ListImagesResponse, PullImageRequest, PullImageResponse};
+use crate::api::types::{
+    ApiErrorResponse, ImageInfo, ListImagesResponse, PullImageRequest, PullImageResponse,
+};
 
-/// GET /api/v1/sandboxes/:id/images - List images in a sandbox.
+/// List images in a sandbox.
+#[utoipa::path(
+    get,
+    path = "/api/v1/sandboxes/{id}/images",
+    tag = "Images",
+    params(
+        ("id" = String, Path, description = "Sandbox name")
+    ),
+    responses(
+        (status = 200, description = "List of images", body = ListImagesResponse),
+        (status = 404, description = "Sandbox not found", body = ApiErrorResponse)
+    )
+)]
 pub async fn list_images(
     State(state): State<Arc<ApiState>>,
     Path(sandbox_id): Path<String>,
@@ -53,7 +67,22 @@ pub async fn list_images(
     Ok(Json(ListImagesResponse { images }))
 }
 
-/// POST /api/v1/sandboxes/:id/images/pull - Pull an image.
+/// Pull an image into a sandbox.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sandboxes/{id}/images/pull",
+    tag = "Images",
+    params(
+        ("id" = String, Path, description = "Sandbox name")
+    ),
+    request_body = PullImageRequest,
+    responses(
+        (status = 200, description = "Image pulled", body = PullImageResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 404, description = "Sandbox not found", body = ApiErrorResponse),
+        (status = 500, description = "Failed to pull image", body = ApiErrorResponse)
+    )
+)]
 pub async fn pull_image(
     State(state): State<Arc<ApiState>>,
     Path(sandbox_id): Path<String>,
@@ -76,7 +105,7 @@ pub async fn pull_image(
                 entry.mounts.iter().map(mount_spec_to_host_mount).collect();
             let mounts = mounts_result?;
             let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
-            let resources = resource_spec_to_vm_resources(&entry.resources);
+            let resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
 
             entry
                 .manager

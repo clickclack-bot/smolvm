@@ -48,6 +48,9 @@ enum Commands {
     /// Manage smolvm configuration (registries, defaults)
     #[command(subcommand)]
     Config(cli::config::ConfigCmd),
+
+    /// Export OpenAPI specification for SDK generation
+    Openapi(cli::openapi::OpenapiCmd),
 }
 
 fn main() {
@@ -66,6 +69,7 @@ fn main() {
         Commands::Serve(cmd) => cmd.run(),
         Commands::Pack(cmd) => cmd.run(),
         Commands::Config(cmd) => cmd.run(),
+        Commands::Openapi(cmd) => cmd.run(),
     };
 
     // Handle errors

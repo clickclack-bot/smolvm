@@ -28,8 +28,100 @@ use axum::{
 use std::sync::Arc;
 use std::time::Duration;
 use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 use state::ApiState;
+
+/// OpenAPI documentation for the smolvm API.
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "smolvm API",
+        version = "0.1.4",
+        description = "OCI-native microVM runtime API for managing sandboxes, containers, images, and microvms.",
+        license(name = "Apache-2.0", url = "https://www.apache.org/licenses/LICENSE-2.0")
+    ),
+    tags(
+        (name = "Health", description = "Health check endpoints"),
+        (name = "Sandboxes", description = "Sandbox lifecycle management"),
+        (name = "Execution", description = "Command execution in sandboxes"),
+        (name = "Logs", description = "Log streaming"),
+        (name = "Containers", description = "Container management within sandboxes"),
+        (name = "Images", description = "OCI image management"),
+        (name = "MicroVMs", description = "Persistent microVM management")
+    ),
+    paths(
+        // Health
+        handlers::health::health,
+        // Sandboxes
+        handlers::sandboxes::create_sandbox,
+        handlers::sandboxes::list_sandboxes,
+        handlers::sandboxes::get_sandbox,
+        handlers::sandboxes::start_sandbox,
+        handlers::sandboxes::stop_sandbox,
+        handlers::sandboxes::delete_sandbox,
+        // Execution
+        handlers::exec::exec_command,
+        handlers::exec::run_command,
+        handlers::exec::stream_logs,
+        // Containers
+        handlers::containers::create_container,
+        handlers::containers::list_containers,
+        handlers::containers::start_container,
+        handlers::containers::stop_container,
+        handlers::containers::delete_container,
+        handlers::containers::exec_in_container,
+        // Images
+        handlers::images::list_images,
+        handlers::images::pull_image,
+        // MicroVMs
+        handlers::microvms::create_microvm,
+        handlers::microvms::list_microvms,
+        handlers::microvms::get_microvm,
+        handlers::microvms::start_microvm,
+        handlers::microvms::stop_microvm,
+        handlers::microvms::delete_microvm,
+        handlers::microvms::exec_microvm,
+    ),
+    components(schemas(
+        // Request types
+        types::CreateSandboxRequest,
+        types::RestartSpec,
+        types::MountSpec,
+        types::PortSpec,
+        types::ResourceSpec,
+        types::ExecRequest,
+        types::RunRequest,
+        types::EnvVar,
+        types::CreateContainerRequest,
+        types::ContainerMountSpec,
+        types::ContainerExecRequest,
+        types::StopContainerRequest,
+        types::DeleteContainerRequest,
+        types::PullImageRequest,
+        types::DeleteQuery,
+        types::LogsQuery,
+        types::CreateMicrovmRequest,
+        types::MicrovmExecRequest,
+        // Response types
+        types::HealthResponse,
+        types::SandboxInfo,
+        types::MountInfo,
+        types::ListSandboxesResponse,
+        types::ExecResponse,
+        types::ContainerInfo,
+        types::ListContainersResponse,
+        types::ImageInfo,
+        types::ListImagesResponse,
+        types::PullImageResponse,
+        types::MicrovmInfo,
+        types::ListMicrovmsResponse,
+        types::DeleteResponse,
+        types::ApiErrorResponse,
+    ))
+)]
+pub struct ApiDoc;
 
 /// Default timeout for API requests (5 minutes).
 /// Most operations (start, stop, exec) complete within this time.
@@ -132,6 +224,7 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
     Router::new()
         .merge(health_route)
         .nest("/api/v1", api_v1)
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)

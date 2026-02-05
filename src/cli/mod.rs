@@ -3,6 +3,7 @@
 pub mod config;
 pub mod container;
 pub mod microvm;
+pub mod openapi;
 pub mod pack;
 pub mod parsers;
 pub mod sandbox;

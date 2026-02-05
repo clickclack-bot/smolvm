@@ -13,8 +13,8 @@ use crate::api::state::{
     restart_spec_to_config, ApiState, DbCloseGuard, ReservationGuard,
 };
 use crate::api::types::{
-    CreateSandboxRequest, DeleteQuery, ListSandboxesResponse, MountInfo, MountSpec, ResourceSpec,
-    SandboxInfo,
+    ApiErrorResponse, CreateSandboxRequest, DeleteQuery, DeleteResponse, ListSandboxesResponse,
+    MountInfo, MountSpec, ResourceSpec, SandboxInfo,
 };
 use crate::config::RecordState;
 
@@ -106,7 +106,18 @@ fn validate_sandbox_name(name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// POST /api/v1/sandboxes - Create a new sandbox.
+/// Create a new sandbox.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sandboxes",
+    tag = "Sandboxes",
+    request_body = CreateSandboxRequest,
+    responses(
+        (status = 200, description = "Sandbox created", body = SandboxInfo),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 409, description = "Sandbox already exists", body = ApiErrorResponse)
+    )
+)]
 pub async fn create_sandbox(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<CreateSandboxRequest>,
@@ -122,7 +133,11 @@ pub async fn create_sandbox(
     let resources = req.resources.clone().unwrap_or(ResourceSpec {
         cpus: None,
         memory_mb: None,
+        network: None,
     });
+
+    // Get network setting from resources (default to false)
+    let network = resources.network.unwrap_or(false);
 
     // Parse restart configuration
     let restart_config = restart_spec_to_config(req.restart.as_ref());
@@ -152,6 +167,7 @@ pub async fn create_sandbox(
         req.ports.clone(),
         resources.clone(),
         restart_config,
+        network,
     )?;
 
     Ok(Json(SandboxInfo {
@@ -161,17 +177,38 @@ pub async fn create_sandbox(
         mounts: mounts_to_info(&req.mounts),
         ports: req.ports,
         resources,
+        network,
         restart_count: None,
     }))
 }
 
-/// GET /api/v1/sandboxes - List all sandboxes.
+/// List all sandboxes.
+#[utoipa::path(
+    get,
+    path = "/api/v1/sandboxes",
+    tag = "Sandboxes",
+    responses(
+        (status = 200, description = "List of sandboxes", body = ListSandboxesResponse)
+    )
+)]
 pub async fn list_sandboxes(State(state): State<Arc<ApiState>>) -> Json<ListSandboxesResponse> {
     let sandboxes = state.list_sandboxes();
     Json(ListSandboxesResponse { sandboxes })
 }
 
-/// GET /api/v1/sandboxes/:id - Get sandbox status.
+/// Get sandbox status.
+#[utoipa::path(
+    get,
+    path = "/api/v1/sandboxes/{id}",
+    tag = "Sandboxes",
+    params(
+        ("id" = String, Path, description = "Sandbox name")
+    ),
+    responses(
+        (status = 200, description = "Sandbox details", body = SandboxInfo),
+        (status = 404, description = "Sandbox not found", body = ApiErrorResponse)
+    )
+)]
 pub async fn get_sandbox(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -194,11 +231,25 @@ pub async fn get_sandbox(
         mounts: mounts_to_info(&entry.mounts),
         ports: entry.ports.clone(),
         resources: entry.resources.clone(),
+        network: entry.network,
         restart_count,
     }))
 }
 
-/// POST /api/v1/sandboxes/:id/start - Start a sandbox.
+/// Start a sandbox.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sandboxes/{id}/start",
+    tag = "Sandboxes",
+    params(
+        ("id" = String, Path, description = "Sandbox name")
+    ),
+    responses(
+        (status = 200, description = "Sandbox started", body = SandboxInfo),
+        (status = 404, description = "Sandbox not found", body = ApiErrorResponse),
+        (status = 500, description = "Failed to start", body = ApiErrorResponse)
+    )
+)]
 pub async fn start_sandbox(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -206,13 +257,13 @@ pub async fn start_sandbox(
     let entry = state.get_sandbox(&id)?;
 
     // Get configuration from entry
-    let (mounts, ports, resources, mounts_spec, ports_spec, resources_spec) = {
+    let (mounts, ports, resources, mounts_spec, ports_spec, resources_spec, network) = {
         let entry = entry.lock();
         let mounts_result: Result<Vec<_>, _> =
             entry.mounts.iter().map(mount_spec_to_host_mount).collect();
         let mounts = mounts_result.map_err(|e| ApiError::Internal(e.to_string()))?;
         let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
-        let resources = resource_spec_to_vm_resources(&entry.resources);
+        let resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
         (
             mounts,
             ports,
@@ -220,6 +271,7 @@ pub async fn start_sandbox(
             entry.mounts.clone(),
             entry.ports.clone(),
             entry.resources.clone(),
+            entry.network,
         )
     };
 
@@ -267,11 +319,25 @@ pub async fn start_sandbox(
         mounts: mounts_to_info(&mounts_spec),
         ports: ports_spec,
         resources: resources_spec,
+        network,
         restart_count: None, // Just reset
     }))
 }
 
-/// POST /api/v1/sandboxes/:id/stop - Stop a sandbox.
+/// Stop a sandbox.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sandboxes/{id}/stop",
+    tag = "Sandboxes",
+    params(
+        ("id" = String, Path, description = "Sandbox name")
+    ),
+    responses(
+        (status = 200, description = "Sandbox stopped", body = SandboxInfo),
+        (status = 404, description = "Sandbox not found", body = ApiErrorResponse),
+        (status = 500, description = "Failed to stop", body = ApiErrorResponse)
+    )
+)]
 pub async fn stop_sandbox(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -279,12 +345,13 @@ pub async fn stop_sandbox(
     let entry = state.get_sandbox(&id)?;
 
     // Get config for response
-    let (mounts_spec, ports_spec, resources_spec, restart_count) = {
+    let (mounts_spec, ports_spec, resources_spec, network, restart_count) = {
         let entry = entry.lock();
         (
             entry.mounts.clone(),
             entry.ports.clone(),
             entry.resources.clone(),
+            entry.network,
             if entry.restart.restart_count > 0 {
                 Some(entry.restart.restart_count)
             } else {
@@ -323,14 +390,26 @@ pub async fn stop_sandbox(
         mounts: mounts_to_info(&mounts_spec),
         ports: ports_spec,
         resources: resources_spec,
+        network,
         restart_count,
     }))
 }
 
-/// DELETE /api/v1/sandboxes/:id - Delete a sandbox.
-///
-/// Query parameters:
-/// - `force`: If true, delete even if stop fails and VM is still running (may orphan VM)
+/// Delete a sandbox.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/sandboxes/{id}",
+    tag = "Sandboxes",
+    params(
+        ("id" = String, Path, description = "Sandbox name"),
+        ("force" = Option<bool>, Query, description = "Force delete even if VM is still running")
+    ),
+    responses(
+        (status = 200, description = "Sandbox deleted", body = DeleteResponse),
+        (status = 404, description = "Sandbox not found", body = ApiErrorResponse),
+        (status = 409, description = "VM still running, use force=true", body = ApiErrorResponse)
+    )
+)]
 pub async fn delete_sandbox(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,

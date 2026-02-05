@@ -33,7 +33,8 @@ use crate::agent::{AgentManager, HostMount, PortMapping, VmResources};
 use crate::api::error::ApiError;
 use crate::api::state::ApiState;
 use crate::api::types::{
-    CreateMicrovmRequest, ExecResponse, ListMicrovmsResponse, MicrovmExecRequest, MicrovmInfo,
+    ApiErrorResponse, CreateMicrovmRequest, DeleteResponse, ExecResponse, ListMicrovmsResponse,
+    MicrovmExecRequest, MicrovmInfo,
 };
 use crate::config::{RecordState, VmRecord};
 
@@ -121,11 +122,23 @@ fn record_to_info(name: &str, record: &VmRecord) -> MicrovmInfo {
         pid: record.pid,
         mounts: record.mounts.len(),
         ports: record.ports.len(),
+        network: record.network,
         created_at: record.created_at.clone(),
     }
 }
 
-/// POST /api/v1/microvms - Create a new microvm.
+/// Create a new microvm.
+#[utoipa::path(
+    post,
+    path = "/api/v1/microvms",
+    tag = "MicroVMs",
+    request_body = CreateMicrovmRequest,
+    responses(
+        (status = 200, description = "MicroVM created", body = MicrovmInfo),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 409, description = "MicroVM already exists", body = ApiErrorResponse)
+    )
+)]
 pub async fn create_microvm(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<CreateMicrovmRequest>,
@@ -147,8 +160,8 @@ pub async fn create_microvm(
     // Convert ports to storage format
     let ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
 
-    // Create record (enable network by default for API-created microvms)
-    let record = VmRecord::new(name.clone(), cpus, mem, mounts, ports, true);
+    // Create record with requested network setting
+    let record = VmRecord::new(name.clone(), cpus, mem, mounts, ports, req.network);
 
     // Use atomic insert to detect conflicts
     let db = state.db();
@@ -162,7 +175,16 @@ pub async fn create_microvm(
     }
 }
 
-/// GET /api/v1/microvms - List all microvms.
+/// List all microvms.
+#[utoipa::path(
+    get,
+    path = "/api/v1/microvms",
+    tag = "MicroVMs",
+    responses(
+        (status = 200, description = "List of microvms", body = ListMicrovmsResponse),
+        (status = 500, description = "Database error", body = ApiErrorResponse)
+    )
+)]
 pub async fn list_microvms(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ListMicrovmsResponse>, ApiError> {
@@ -179,7 +201,19 @@ pub async fn list_microvms(
     Ok(Json(ListMicrovmsResponse { microvms }))
 }
 
-/// GET /api/v1/microvms/:name - Get microvm status.
+/// Get microvm status.
+#[utoipa::path(
+    get,
+    path = "/api/v1/microvms/{name}",
+    tag = "MicroVMs",
+    params(
+        ("name" = String, Path, description = "MicroVM name")
+    ),
+    responses(
+        (status = 200, description = "MicroVM details", body = MicrovmInfo),
+        (status = 404, description = "MicroVM not found", body = ApiErrorResponse)
+    )
+)]
 pub async fn get_microvm(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
@@ -193,7 +227,20 @@ pub async fn get_microvm(
     Ok(Json(record_to_info(&name, &record)))
 }
 
-/// POST /api/v1/microvms/:name/start - Start a microvm.
+/// Start a microvm.
+#[utoipa::path(
+    post,
+    path = "/api/v1/microvms/{name}/start",
+    tag = "MicroVMs",
+    params(
+        ("name" = String, Path, description = "MicroVM name")
+    ),
+    responses(
+        (status = 200, description = "MicroVM started", body = MicrovmInfo),
+        (status = 404, description = "MicroVM not found", body = ApiErrorResponse),
+        (status = 500, description = "Failed to start", body = ApiErrorResponse)
+    )
+)]
 pub async fn start_microvm(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
@@ -272,7 +319,20 @@ pub async fn start_microvm(
     }
 }
 
-/// POST /api/v1/microvms/:name/stop - Stop a microvm.
+/// Stop a microvm.
+#[utoipa::path(
+    post,
+    path = "/api/v1/microvms/{name}/stop",
+    tag = "MicroVMs",
+    params(
+        ("name" = String, Path, description = "MicroVM name")
+    ),
+    responses(
+        (status = 200, description = "MicroVM stopped", body = MicrovmInfo),
+        (status = 404, description = "MicroVM not found", body = ApiErrorResponse),
+        (status = 500, description = "Failed to stop", body = ApiErrorResponse)
+    )
+)]
 pub async fn stop_microvm(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
@@ -336,7 +396,20 @@ pub async fn stop_microvm(
     Ok(Json(record_to_info(&name, &record)))
 }
 
-/// DELETE /api/v1/microvms/:name - Delete a microvm.
+/// Delete a microvm.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/microvms/{name}",
+    tag = "MicroVMs",
+    params(
+        ("name" = String, Path, description = "MicroVM name")
+    ),
+    responses(
+        (status = 200, description = "MicroVM deleted", body = DeleteResponse),
+        (status = 404, description = "MicroVM not found", body = ApiErrorResponse),
+        (status = 500, description = "Failed to delete", body = ApiErrorResponse)
+    )
+)]
 pub async fn delete_microvm(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
@@ -385,7 +458,23 @@ pub async fn delete_microvm(
     })))
 }
 
-/// POST /api/v1/microvms/:name/exec - Execute a command in a microvm.
+/// Execute a command in a microvm.
+#[utoipa::path(
+    post,
+    path = "/api/v1/microvms/{name}/exec",
+    tag = "MicroVMs",
+    params(
+        ("name" = String, Path, description = "MicroVM name")
+    ),
+    request_body = MicrovmExecRequest,
+    responses(
+        (status = 200, description = "Command executed", body = ExecResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 404, description = "MicroVM not found", body = ApiErrorResponse),
+        (status = 409, description = "MicroVM not running", body = ApiErrorResponse),
+        (status = 500, description = "Execution failed", body = ApiErrorResponse)
+    )
+)]
 pub async fn exec_microvm(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
@@ -525,6 +614,7 @@ mod tests {
         assert_eq!(info.mem, 1024);
         assert_eq!(info.mounts, 2);
         assert_eq!(info.ports, 2);
+        assert!(!info.network);
         assert!(info.pid.is_none());
     }
 
@@ -557,8 +647,19 @@ mod tests {
         assert_eq!(info.mem, 512);
         assert_eq!(info.mounts, 0);
         assert_eq!(info.ports, 0);
+        assert!(!info.network);
         assert!(info.pid.is_none());
         assert!(!info.created_at.is_empty());
+    }
+
+    #[test]
+    fn test_record_to_info_with_network() {
+        let record = VmRecord::new("network-vm".to_string(), 1, 512, vec![], vec![], true);
+
+        let info = record_to_info("network-vm", &record);
+
+        assert_eq!(info.name, "network-vm");
+        assert!(info.network);
     }
 
     #[test]

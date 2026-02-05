@@ -15,11 +15,26 @@ use crate::api::error::ApiError;
 use crate::api::state::{
     mount_spec_to_host_mount, port_spec_to_mapping, resource_spec_to_vm_resources, ApiState,
 };
-use crate::api::types::{ExecRequest, ExecResponse, LogsQuery, RunRequest};
+use crate::api::types::{ApiErrorResponse, ExecRequest, ExecResponse, LogsQuery, RunRequest};
 
-/// POST /api/v1/sandboxes/:id/exec - Execute a command in a sandbox.
+/// Execute a command in a sandbox.
 ///
 /// This executes directly in the VM (not in a container).
+#[utoipa::path(
+    post,
+    path = "/api/v1/sandboxes/{id}/exec",
+    tag = "Execution",
+    params(
+        ("id" = String, Path, description = "Sandbox name")
+    ),
+    request_body = ExecRequest,
+    responses(
+        (status = 200, description = "Command executed", body = ExecResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 404, description = "Sandbox not found", body = ApiErrorResponse),
+        (status = 500, description = "Execution failed", body = ApiErrorResponse)
+    )
+)]
 pub async fn exec_command(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -40,7 +55,7 @@ pub async fn exec_command(
                 entry.mounts.iter().map(mount_spec_to_host_mount).collect();
             let mounts = mounts_result?;
             let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
-            let resources = resource_spec_to_vm_resources(&entry.resources);
+            let resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
 
             entry
                 .manager
@@ -77,9 +92,24 @@ pub async fn exec_command(
     }))
 }
 
-/// POST /api/v1/sandboxes/:id/run - Run a command in an image.
+/// Run a command in an image.
 ///
 /// This creates a temporary overlay from the image and runs the command.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sandboxes/{id}/run",
+    tag = "Execution",
+    params(
+        ("id" = String, Path, description = "Sandbox name")
+    ),
+    request_body = RunRequest,
+    responses(
+        (status = 200, description = "Command executed", body = ExecResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 404, description = "Sandbox not found", body = ApiErrorResponse),
+        (status = 500, description = "Execution failed", body = ApiErrorResponse)
+    )
+)]
 pub async fn run_command(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -100,7 +130,7 @@ pub async fn run_command(
                 entry.mounts.iter().map(mount_spec_to_host_mount).collect();
             let mounts = mounts_result?;
             let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
-            let resources = resource_spec_to_vm_resources(&entry.resources);
+            let resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
 
             entry
                 .manager
@@ -153,11 +183,21 @@ pub async fn run_command(
     }))
 }
 
-/// GET /api/v1/sandboxes/:id/logs - Stream sandbox console logs via SSE.
-///
-/// Query parameters:
-/// - `follow`: If true, keep streaming new logs (like tail -f)
-/// - `tail`: Number of lines to show from the end
+/// Stream sandbox console logs via SSE.
+#[utoipa::path(
+    get,
+    path = "/api/v1/sandboxes/{id}/logs",
+    tag = "Logs",
+    params(
+        ("id" = String, Path, description = "Sandbox name"),
+        ("follow" = Option<bool>, Query, description = "Follow the logs (like tail -f)"),
+        ("tail" = Option<usize>, Query, description = "Number of lines to show from the end")
+    ),
+    responses(
+        (status = 200, description = "Log stream (SSE)", content_type = "text/event-stream"),
+        (status = 404, description = "Sandbox or log file not found", body = ApiErrorResponse)
+    )
+)]
 pub async fn stream_logs(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,

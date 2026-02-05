@@ -78,6 +78,7 @@ pub mod vm;
 
 // Re-export main types for convenience
 pub use agent::{AgentClient, AgentManager};
+pub use api::ApiDoc;
 pub use config::{RecordState, RestartConfig, RestartPolicy, SmolvmConfig, VmRecord};
 pub use db::SmolvmDb;
 pub use error::{Error, Result};

@@ -33,6 +33,8 @@ pub struct SandboxEntry {
     pub resources: ResourceSpec,
     /// Restart configuration for this sandbox.
     pub restart: RestartConfig,
+    /// Whether outbound network access is enabled.
+    pub network: bool,
 }
 
 /// RAII guard for sandbox name reservation.
@@ -83,6 +85,7 @@ impl<'a> ReservationGuard<'a> {
         ports: Vec<PortSpec>,
         resources: ResourceSpec,
         restart: RestartConfig,
+        network: bool,
     ) -> Result<(), ApiError> {
         // Mark as completed before calling complete_sandbox_registration
         // (which will remove from reservations internally)
@@ -94,6 +97,7 @@ impl<'a> ReservationGuard<'a> {
             ports,
             resources,
             restart,
+            network,
         )
     }
 }
@@ -217,6 +221,7 @@ impl ApiState {
             let resources = ResourceSpec {
                 cpus: Some(record.cpus),
                 memory_mb: Some(record.mem),
+                network: Some(record.network),
             };
 
             // Create AgentManager and try to reconnect
@@ -233,6 +238,7 @@ impl ApiState {
                                 ports,
                                 resources,
                                 restart: record.restart.clone(),
+                                network: record.network,
                             })),
                         );
                         loaded.push(name.clone());
@@ -259,6 +265,7 @@ impl ApiState {
         ports: Vec<PortSpec>,
         resources: ResourceSpec,
         restart: RestartConfig,
+        network: bool,
     ) -> Result<(), ApiError> {
         // Check for conflicts
         {
@@ -283,7 +290,7 @@ impl ApiState {
                 .map(|m| (m.source.clone(), m.target.clone(), m.readonly))
                 .collect(),
             ports.iter().map(|p| (p.host, p.guest)).collect(),
-            true, // Enable network for sandboxes
+            network,
             restart.clone(),
         );
 
@@ -301,6 +308,7 @@ impl ApiState {
                 ports,
                 resources,
                 restart,
+                network,
             })),
         );
         Ok(())
@@ -382,6 +390,7 @@ impl ApiState {
                     mounts,
                     ports: entry.ports.clone(),
                     resources: entry.resources.clone(),
+                    network: entry.network,
                     restart_count,
                 }
             })
@@ -475,6 +484,7 @@ impl ApiState {
         ports: Vec<PortSpec>,
         resources: ResourceSpec,
         restart: RestartConfig,
+        network: bool,
     ) -> Result<(), ApiError> {
         // Remove from reservations
         {
@@ -497,7 +507,7 @@ impl ApiState {
                 .map(|m| (m.source.clone(), m.target.clone(), m.readonly))
                 .collect(),
             ports.iter().map(|p| (p.host, p.guest)).collect(),
-            true, // Enable network for sandboxes
+            network,
             restart.clone(),
         );
 
@@ -514,6 +524,7 @@ impl ApiState {
                         ports,
                         resources,
                         restart,
+                        network,
                     })),
                 );
                 Ok(())
@@ -703,11 +714,11 @@ pub fn port_spec_to_mapping(spec: &PortSpec) -> PortMapping {
 }
 
 /// Convert ResourceSpec to VmResources.
-pub fn resource_spec_to_vm_resources(spec: &ResourceSpec) -> VmResources {
+pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmResources {
     VmResources {
         cpus: spec.cpus.unwrap_or(crate::agent::DEFAULT_CPUS),
         mem: spec.memory_mb.unwrap_or(crate::agent::DEFAULT_MEMORY_MIB),
-        network: false, // TODO: Add network to ResourceSpec if needed
+        network,
     }
 }
 
@@ -716,6 +727,7 @@ pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
     ResourceSpec {
         cpus: Some(res.cpus),
         memory_mb: Some(res.mem),
+        network: Some(res.network),
     }
 }
 
@@ -792,10 +804,16 @@ mod tests {
         let spec = ResourceSpec {
             cpus: None,
             memory_mb: None,
+            network: None,
         };
-        let res = resource_spec_to_vm_resources(&spec);
+        let res = resource_spec_to_vm_resources(&spec, false);
         assert_eq!(res.cpus, crate::agent::DEFAULT_CPUS);
         assert_eq!(res.mem, crate::agent::DEFAULT_MEMORY_MIB);
+        assert!(!res.network);
+
+        // Test with network enabled
+        let res = resource_spec_to_vm_resources(&spec, true);
+        assert!(res.network);
     }
 
     #[test]
