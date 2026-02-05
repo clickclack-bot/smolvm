@@ -10,9 +10,6 @@ Run microVMs locally to sandbox workloads.
 # install (macOS only, Linux coming soon)
 curl -sSL https://smolmachines.com/install.sh | bash
 
-# uninstall
-curl -sSL https://smolmachines.com/install.sh | bash -s -- --uninstall
-
 # sandbox - ephemeral isolated environments
 smolvm sandbox run alpine:latest -- echo "hello"
 smolvm sandbox run -v /tmp:/workspace alpine:latest -- ls /workspace
@@ -24,12 +21,17 @@ smolvm microvm start
 smolvm microvm exec -- echo "hello"
 smolvm microvm stop
 
-# pack - portable executable container-in-VM
-smolvm pack alpine:latest -o ./my-sandbox
+# pack - portable, executable virtual machine
+smolvm pack alpine:latest -o ./my-sandbox        # creates ./my-sandbox + ./my-sandbox.smolmachine
+smolvm pack alpine:latest -o ./my-sandbox --single-file  # single executable, no sidecar
+
 ./my-sandbox echo "hello"
 
 smolvm pack python:3.12-alpine -o ./my-pythonvm
 ./my-pythonvm python3 -c "import sys; print(sys.version)"
+
+# uninstall
+curl -sSL https://smolmachines.com/install.sh | bash -s -- --uninstall
 ```
 
 ## about
