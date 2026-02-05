@@ -21,6 +21,8 @@ mod crun;
 mod oci;
 mod paths;
 mod process;
+#[cfg(target_os = "linux")]
+mod pty;
 mod retry;
 mod storage;
 mod vsock;
@@ -1033,7 +1035,10 @@ fn run_interactive_loop(
         if let Some(request) = try_read_request(stream)? {
             match request {
                 AgentRequest::Stdin { data } => {
-                    if let Some(ref mut stdin) = child_stdin {
+                    if data.is_empty() {
+                        // Empty data signals EOF - close child's stdin
+                        drop(child_stdin.take());
+                    } else if let Some(ref mut stdin) = child_stdin {
                         let _ = stdin.write_all(&data);
                         let _ = stdin.flush();
                     }
@@ -1044,6 +1049,146 @@ fn run_interactive_loop(
                 }
                 _ => {
                     warn!("unexpected request during interactive session");
+                }
+            }
+        }
+    }
+}
+
+/// Run the interactive I/O loop for PTY-based sessions.
+///
+/// Unlike `run_interactive_loop`, this polls a single PTY master fd
+/// (PTY merges stdout and stderr) and supports terminal resize.
+#[cfg(target_os = "linux")]
+fn run_interactive_loop_pty(
+    stream: &mut impl ReadWrite,
+    child: &mut Child,
+    pty_master: pty::PtyMaster,
+    timeout_ms: Option<u64>,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    let deadline = timeout_ms.map(|ms| start + Duration::from_millis(ms));
+
+    // Set the master fd to non-blocking so we can poll it.
+    if !set_nonblocking(pty_master.as_raw_fd()) {
+        warn!("failed to set PTY master to non-blocking mode");
+    }
+
+    let mut buf = [0u8; IO_BUFFER_SIZE];
+
+    loop {
+        // Check if child has exited.
+        if let Some(status) = child.try_wait()? {
+            // Drain remaining PTY output.
+            loop {
+                match pty_master.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        send_response(
+                            stream,
+                            &AgentResponse::Stdout {
+                                data: buf[..n].to_vec(),
+                            },
+                        )?;
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.raw_os_error() == Some(libc::EIO) =>
+                    {
+                        // EIO is expected when the slave side is closed.
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            return Ok(status.code().unwrap_or(-1));
+        }
+
+        // Check timeout.
+        if let Some(deadline) = deadline {
+            if Instant::now() >= deadline {
+                warn!("interactive PTY command timed out, killing process");
+                if let Err(e) = child.kill() {
+                    warn!(error = %e, "failed to kill timed out process");
+                }
+                if let Err(e) = child.wait() {
+                    warn!(error = %e, "failed to wait for killed process");
+                }
+                return Ok(124);
+            }
+        }
+
+        // Poll the PTY master fd for readable data.
+        let poll_timeout_ms = match deadline {
+            Some(dl) => {
+                let remaining = dl.saturating_duration_since(Instant::now());
+                remaining
+                    .as_millis()
+                    .min(INTERACTIVE_POLL_TIMEOUT_MS as u128) as i32
+            }
+            None => INTERACTIVE_POLL_TIMEOUT_MS,
+        };
+
+        let mut poll_fds = [libc::pollfd {
+            fd: pty_master.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+
+        let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), 1, poll_timeout_ms) };
+
+        if poll_result < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                debug!(error = %err, "poll error on PTY master");
+            }
+            continue;
+        }
+
+        // Read available data from PTY master.
+        if poll_fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            loop {
+                match pty_master.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        send_response(
+                            stream,
+                            &AgentResponse::Stdout {
+                                data: buf[..n].to_vec(),
+                            },
+                        )?;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.raw_os_error() == Some(libc::EIO) => {
+                        // Slave side closed — child is exiting.
+                        break;
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "PTY master read error");
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Check for incoming requests from the host (stdin data, resize).
+        if let Some(request) = try_read_request(stream)? {
+            match request {
+                AgentRequest::Stdin { data } => {
+                    // For PTY, empty stdin is not EOF (Ctrl+D is a byte).
+                    if !data.is_empty() {
+                        let _ = pty_master.write_all(&data);
+                    }
+                }
+                AgentRequest::Resize { cols, rows } => {
+                    if let Err(e) = pty_master.set_window_size(cols, rows) {
+                        debug!(error = %e, cols, rows, "failed to set PTY window size");
+                    }
+                }
+                _ => {
+                    warn!("unexpected request during interactive PTY session");
                 }
             }
         }
@@ -1099,17 +1244,57 @@ fn drain_remaining_output(
 
 /// Try to read a request with a very short timeout.
 fn try_read_request(
-    _stream: &mut impl ReadWrite,
+    stream: &mut impl ReadWrite,
 ) -> Result<Option<AgentRequest>, Box<dyn std::error::Error>> {
-    // For now, use a simple non-blocking approach
-    // In a production implementation, we'd use poll/select
+    let fd = stream.as_raw_fd();
 
-    // This is a simplified version - we'll check if data is available
-    // by trying to peek or using non-blocking read
+    // Set non-blocking mode
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let was_blocking = (flags & libc::O_NONBLOCK) == 0;
 
-    // For the initial implementation, we'll skip stdin forwarding
-    // and just focus on output streaming
-    Ok(None)
+    if was_blocking {
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+
+    // Try to read length header (4 bytes)
+    let mut len_buf = [0u8; 4];
+    let result = match stream.read_exact(&mut len_buf) {
+        Ok(()) => {
+            let len = u32::from_be_bytes(len_buf) as usize;
+            if len > MAX_MESSAGE_SIZE {
+                return Err(format!("message too large: {} bytes", len).into());
+            }
+
+            // We have the length - must read the full payload now
+            // Restore blocking mode for the payload read
+            if was_blocking {
+                unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+            }
+
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf)?;
+
+            let request: AgentRequest = serde_json::from_slice(&buf)?;
+            Ok(Some(request))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            // No data available
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
+    };
+
+    // Restore blocking mode if we changed it
+    if was_blocking {
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    }
+
+    result
 }
 
 /// Set a file descriptor to non-blocking mode.
@@ -1691,23 +1876,27 @@ fn handle_interactive_vm_exec(
     }
 
     // Spawn the command directly
-    let mut child = match spawn_direct_interactive_command(&command, &env, workdir.as_deref(), tty)
-    {
-        Ok(child) => child,
-        Err(e) => {
-            send_response(
-                stream,
-                &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
-            )?;
-            return Ok(());
-        }
-    };
+    let (mut child, pty_master) =
+        match spawn_direct_interactive_command(&command, &env, workdir.as_deref(), tty) {
+            Ok(result) => result,
+            Err(e) => {
+                send_response(
+                    stream,
+                    &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
+                )?;
+                return Ok(());
+            }
+        };
 
     // Send Started response
     send_response(stream, &AgentResponse::Started)?;
 
-    // Run the interactive I/O loop
-    let exit_code = run_interactive_loop(stream, &mut child, timeout_ms)?;
+    // Run the appropriate interactive I/O loop
+    let exit_code = match pty_master {
+        #[cfg(target_os = "linux")]
+        Some(pty) => run_interactive_loop_pty(stream, &mut child, pty, timeout_ms)?,
+        _ => run_interactive_loop(stream, &mut child, timeout_ms)?,
+    };
 
     // Send Exited response
     send_response(stream, &AgentResponse::Exited { exit_code })?;
@@ -1716,28 +1905,78 @@ fn handle_interactive_vm_exec(
 }
 
 /// Spawn a command directly in the VM for interactive execution.
+///
+/// When `tty` is true, allocates a PTY pair and attaches the slave side
+/// to the child process. Returns the child and an optional `PtyMaster`.
+#[cfg(target_os = "linux")]
 fn spawn_direct_interactive_command(
     command: &[String],
     env: &[(String, String)],
     workdir: Option<&str>,
     tty: bool,
-) -> Result<Child, Box<dyn std::error::Error>> {
-    if tty {
-        // For TTY mode, we need to use a PTY
-        // TODO: For TTY mode, use --console-socket or similar
-        // For now, fall back to pipe-based I/O
-        warn!("TTY mode requested but not fully supported for direct VM exec, using pipes");
-    }
+) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+    use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::process::CommandExt;
 
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]);
 
-    // Set environment variables
     for (key, value) in env {
         cmd.env(key, value);
     }
+    if let Some(wd) = workdir {
+        cmd.current_dir(wd);
+    }
 
-    // Set working directory
+    if tty {
+        // Allocate a PTY pair with default 80x24 size (host will send Resize).
+        let (pty_master, slave_fd) = pty::open_pty(80, 24)?;
+        let slave_raw = slave_fd.as_raw_fd();
+
+        // Set up stdio from the slave fd. We dup because Stdio::from_raw_fd
+        // takes ownership and we need the fd for all three handles + pre_exec.
+        // SAFETY: slave_fd is a valid open fd from openpty.
+        unsafe {
+            cmd.stdin(Stdio::from_raw_fd(libc::dup(slave_raw)));
+            cmd.stdout(Stdio::from_raw_fd(libc::dup(slave_raw)));
+            cmd.stderr(Stdio::from_raw_fd(libc::dup(slave_raw)));
+        }
+
+        // SAFETY: pre_exec closure calls only async-signal-safe functions.
+        unsafe {
+            cmd.pre_exec(pty::slave_pre_exec(slave_raw));
+        }
+
+        let child = cmd.spawn()?;
+
+        // Close the slave fd in the parent — the child has its own copies.
+        drop(slave_fd);
+
+        Ok((child, Some(pty_master)))
+    } else {
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let child = cmd.spawn()?;
+        Ok((child, None))
+    }
+}
+
+/// Stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+fn spawn_direct_interactive_command(
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    _tty: bool,
+) -> Result<(Child, Option<()>), Box<dyn std::error::Error>> {
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..]);
+
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
     if let Some(wd) = workdir {
         cmd.current_dir(wd);
     }
@@ -1747,7 +1986,7 @@ fn spawn_direct_interactive_command(
     cmd.stderr(Stdio::piped());
 
     let child = cmd.spawn()?;
-    Ok(child)
+    Ok((child, None))
 }
 
 // ============================================================================
@@ -1919,6 +2158,6 @@ fn send_response(
     Ok(())
 }
 
-/// Trait for read+write streams.
-trait ReadWrite: Read + Write {}
-impl<T: Read + Write> ReadWrite for T {}
+/// Trait for read+write streams with raw fd access.
+trait ReadWrite: Read + Write + AsRawFd {}
+impl<T: Read + Write + AsRawFd> ReadWrite for T {}
