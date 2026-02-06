@@ -6,15 +6,21 @@
 //! - Pulls the OCI image
 //! - Runs the container
 //! - Cleans up after execution
+//!
+//! Sandboxes can also be created as persistent, named configurations using
+//! `sandbox create`, managed with `sandbox start/stop/ls/delete`.
 
 use crate::cli::parsers::{
-    mounts_to_virtiofs_bindings, parse_duration, parse_env_spec, parse_mounts, parse_port,
+    mounts_to_virtiofs_bindings, parse_duration, parse_env_spec, parse_mounts,
+    parse_mounts_as_tuples, parse_port,
 };
-use crate::cli::{flush_output, format_pid_suffix, truncate_id};
+use crate::cli::{flush_output, format_pid_suffix, truncate, truncate_id};
 use clap::{Args, Subcommand};
 use smolvm::agent::{
-    docker_config_mount, AgentClient, AgentManager, PortMapping, RunConfig, VmResources,
+    docker_config_mount, AgentClient, AgentManager, HostMount, PortMapping, RunConfig, VmResources,
 };
+use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Quick sandbox commands for running containers
@@ -23,14 +29,28 @@ pub enum SandboxCmd {
     /// Run a container image (ephemeral by default, use -d to keep running)
     Run(RunCmd),
 
+    /// Create a named sandbox configuration
+    Create(CreateCmd),
+
+    /// Start a sandbox
+    Start(StartCmd),
+
     /// Execute a command in an existing sandbox container
     Exec(ExecCmd),
 
-    /// Stop the sandbox and clean up
+    /// Stop a running sandbox
     Stop(StopCmd),
+
+    /// Delete a sandbox configuration
+    #[command(visible_alias = "rm")]
+    Delete(DeleteCmd),
 
     /// Show sandbox status and running containers
     Status(StatusCmd),
+
+    /// List all sandboxes
+    #[command(visible_alias = "list")]
+    Ls(LsCmd),
 
     /// List cached images and storage usage
     Images(ImagesCmd),
@@ -43,9 +63,13 @@ impl SandboxCmd {
     pub fn run(self) -> smolvm::Result<()> {
         match self {
             SandboxCmd::Run(cmd) => cmd.run(),
+            SandboxCmd::Create(cmd) => cmd.run(),
+            SandboxCmd::Start(cmd) => cmd.run(),
             SandboxCmd::Exec(cmd) => cmd.run(),
             SandboxCmd::Stop(cmd) => cmd.run(),
+            SandboxCmd::Delete(cmd) => cmd.run(),
             SandboxCmd::Status(cmd) => cmd.run(),
+            SandboxCmd::Ls(cmd) => cmd.run(),
             SandboxCmd::Images(cmd) => cmd.run(),
             SandboxCmd::Prune(cmd) => cmd.run(),
         }
@@ -58,18 +82,22 @@ impl SandboxCmd {
 
 /// Execute a command in the running sandbox container.
 ///
-/// Requires a sandbox started with `sandbox run -d`. Use `sandbox status`
-/// to check if a sandbox is running.
+/// Requires a sandbox started with `sandbox run -d` or `sandbox start`.
+/// Use `sandbox status` to check if a sandbox is running.
 ///
 /// Examples:
 ///   smolvm sandbox exec -- ls -la
-///   smolvm sandbox exec -- python script.py
+///   smolvm sandbox exec --name mysandbox -- ls -la
 ///   smolvm sandbox exec -e FOO=bar -- env
 #[derive(Args, Debug)]
 pub struct ExecCmd {
     /// Command and arguments to execute
     #[arg(trailing_var_arg = true, required = true, value_name = "COMMAND")]
     pub command: Vec<String>,
+
+    /// Target sandbox (default: "default")
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
 
     /// Set working directory inside container
     #[arg(short = 'w', long, value_name = "DIR")]
@@ -88,13 +116,18 @@ impl ExecCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
 
-        let manager = AgentManager::new_default()?;
+        let manager = get_sandbox_manager(&self.name)?;
+        let label = sandbox_label(&self.name);
 
         // Check if sandbox is running
         if manager.try_connect_existing().is_none() {
             return Err(Error::agent(
                 "connect",
-                "no sandbox running. Start one with: smolvm sandbox run -d <image>",
+                format!(
+                    "sandbox '{}' is not running. Start one with: smolvm sandbox start {}",
+                    label,
+                    self.name.as_deref().unwrap_or("<name>")
+                ),
             ));
         }
 
@@ -156,11 +189,27 @@ impl ExecCmd {
 // ============================================================================
 
 /// Stop a running sandbox.
+///
+/// Stops the default sandbox, or a named sandbox if specified.
+///
+/// Examples:
+///   smolvm sandbox stop
+///   smolvm sandbox stop mysandbox
 #[derive(Args, Debug)]
-pub struct StopCmd;
+pub struct StopCmd {
+    /// Sandbox to stop (default: "default")
+    #[arg(value_name = "NAME")]
+    pub name: Option<String>,
+}
 
 impl StopCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        // If a name is given, try the named path (with config update)
+        if let Some(ref name) = self.name {
+            return self.stop_named(name);
+        }
+
+        // Default anonymous sandbox
         let manager = AgentManager::new_default()?;
 
         if manager.try_connect_existing().is_some() {
@@ -173,6 +222,50 @@ impl StopCmd {
 
         Ok(())
     }
+
+    fn stop_named(&self, name: &str) -> smolvm::Result<()> {
+        let mut config = SmolvmConfig::load()?;
+
+        // Check config for the named VM
+        let record = match config.get_vm(name) {
+            Some(r) => r.clone(),
+            None => {
+                // Maybe it's a running sandbox not in config
+                let manager = AgentManager::for_vm(name)?;
+                if manager.try_connect_existing().is_some() {
+                    println!("Stopping sandbox '{}'...", name);
+                    manager.stop()?;
+                    println!("Sandbox '{}' stopped", name);
+                } else {
+                    println!("Sandbox '{}' not found or not running", name);
+                }
+                return Ok(());
+            }
+        };
+
+        let actual_state = record.actual_state();
+        if actual_state != RecordState::Running {
+            println!("Sandbox '{}' is not running (state: {})", name, actual_state);
+            return Ok(());
+        }
+
+        println!("Stopping sandbox '{}'...", name);
+
+        if let Ok(manager) = AgentManager::for_vm(name) {
+            if let Err(e) = manager.stop() {
+                tracing::warn!(error = %e, "failed to stop sandbox");
+            }
+        }
+
+        config.update_vm(name, |r| {
+            r.state = RecordState::Stopped;
+            r.pid = None;
+        });
+        config.save()?;
+
+        println!("Stopped sandbox: {}", name);
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -180,16 +273,25 @@ impl StopCmd {
 // ============================================================================
 
 /// Show sandbox status.
+///
+/// Examples:
+///   smolvm sandbox status
+///   smolvm sandbox status mysandbox
 #[derive(Args, Debug)]
-pub struct StatusCmd;
+pub struct StatusCmd {
+    /// Sandbox to check (default: "default")
+    #[arg(value_name = "NAME")]
+    pub name: Option<String>,
+}
 
 impl StatusCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = AgentManager::new_default()?;
+        let manager = get_sandbox_manager(&self.name)?;
+        let label = sandbox_label(&self.name);
 
         if manager.try_connect_existing().is_some() {
             let pid_suffix = format_pid_suffix(manager.child_pid());
-            println!("Sandbox: running{}", pid_suffix);
+            println!("Sandbox '{}': running{}", label, pid_suffix);
 
             // Try to list containers
             if let Ok(mut client) = AgentClient::connect(manager.vsock_socket()) {
@@ -203,9 +305,9 @@ impl StatusCmd {
                 }
             }
 
-            std::mem::forget(manager);
+            manager.detach();
         } else {
-            println!("Sandbox: not running");
+            println!("Sandbox '{}': not running", label);
         }
 
         Ok(())
@@ -491,6 +593,394 @@ impl RunCmd {
 }
 
 // ============================================================================
+// Create Command
+// ============================================================================
+
+/// Create a named sandbox configuration.
+///
+/// Creates a persistent sandbox that can be started later with `sandbox start`.
+/// Use `smolvm container` commands to run containers inside.
+///
+/// Examples:
+///   smolvm sandbox create mysandbox
+///   smolvm sandbox create webserver --cpus 2 --mem 1024 -p 80:80
+///   smolvm sandbox create dev -v ./src:/app --net
+#[derive(Args, Debug)]
+pub struct CreateCmd {
+    /// Name for the sandbox
+    #[arg(value_name = "NAME")]
+    pub name: String,
+
+    /// Number of virtual CPUs
+    #[arg(long, default_value = "1", value_name = "N")]
+    pub cpus: u8,
+
+    /// Memory allocation in MiB
+    #[arg(long, default_value = "512", value_name = "MiB")]
+    pub mem: u32,
+
+    /// Mount host directory (can be used multiple times)
+    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
+    pub volume: Vec<String>,
+
+    /// Expose port from sandbox to host (can be used multiple times)
+    #[arg(short = 'p', long = "port", value_parser = parse_port, value_name = "HOST:GUEST")]
+    pub port: Vec<PortMapping>,
+
+    /// Enable outbound network access
+    #[arg(long)]
+    pub net: bool,
+}
+
+impl CreateCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let mut config = SmolvmConfig::load()?;
+
+        // Check if sandbox already exists
+        if config.get_vm(&self.name).is_some() {
+            return Err(smolvm::Error::config(
+                "create sandbox",
+                format!("sandbox '{}' already exists", self.name),
+            ));
+        }
+
+        // Parse and validate volume mounts
+        let mounts = parse_mounts_as_tuples(&self.volume)?;
+
+        // Convert port mappings to tuple format for storage
+        let ports: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
+
+        // Create record
+        let record = VmRecord::new(
+            self.name.clone(),
+            self.cpus,
+            self.mem,
+            mounts,
+            ports,
+            self.net,
+        );
+
+        // Store in config (persisted immediately to database)
+        config.insert_vm(self.name.clone(), record)?;
+
+        println!("Created sandbox: {}", self.name);
+        println!("  CPUs: {}, Memory: {} MiB", self.cpus, self.mem);
+        if !self.volume.is_empty() {
+            println!("  Mounts: {}", self.volume.len());
+        }
+        if !self.port.is_empty() {
+            println!("  Ports: {}", self.port.len());
+        }
+        println!(
+            "\nUse 'smolvm sandbox start {}' to start the sandbox",
+            self.name
+        );
+        println!(
+            "Then use 'smolvm container create {}' to run containers",
+            self.name
+        );
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Start Command
+// ============================================================================
+
+/// Start a sandbox.
+///
+/// Starts a named sandbox, or the default anonymous sandbox if no name given.
+///
+/// Examples:
+///   smolvm sandbox start mysandbox
+///   smolvm sandbox start
+#[derive(Args, Debug)]
+pub struct StartCmd {
+    /// Sandbox to start (default: "default")
+    #[arg(value_name = "NAME")]
+    pub name: Option<String>,
+}
+
+impl StartCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        use smolvm::Error;
+
+        // If no name, start default anonymous sandbox
+        let Some(name) = &self.name else {
+            return self.start_anonymous();
+        };
+
+        let mut config = SmolvmConfig::load()?;
+
+        // Get sandbox record
+        let record = config
+            .get_vm(name)
+            .ok_or_else(|| Error::vm_not_found(name))?
+            .clone();
+
+        // Check state
+        let actual_state = record.actual_state();
+        if actual_state == RecordState::Running {
+            let pid_suffix = format_pid_suffix(record.pid);
+            println!("Sandbox '{}' already running{}", name, pid_suffix);
+            return Ok(());
+        }
+
+        // Convert stored mounts to HostMount
+        let mounts: Vec<HostMount> = record
+            .mounts
+            .iter()
+            .map(|(host, guest, ro)| HostMount {
+                source: PathBuf::from(host),
+                target: PathBuf::from(guest),
+                read_only: *ro,
+            })
+            .collect();
+
+        // Convert stored ports to PortMapping
+        let ports: Vec<PortMapping> = record
+            .ports
+            .iter()
+            .map(|(host, guest)| PortMapping::new(*host, *guest))
+            .collect();
+
+        let resources = VmResources {
+            cpus: record.cpus,
+            mem: record.mem,
+            network: record.network,
+        };
+
+        // Start agent VM for this named sandbox
+        let manager = AgentManager::for_vm(name)
+            .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
+
+        let mount_info = if !mounts.is_empty() {
+            format!(" with {} mount(s)", mounts.len())
+        } else {
+            String::new()
+        };
+        let port_info = if !ports.is_empty() {
+            format!(" and {} port mapping(s)", ports.len())
+        } else {
+            String::new()
+        };
+        println!("Starting sandbox '{}'{}{}...", name, mount_info, port_info);
+
+        manager
+            .ensure_running_with_full_config(mounts, ports, resources)
+            .map_err(|e| Error::agent("start sandbox", e.to_string()))?;
+
+        // Update state
+        let pid = manager.child_pid();
+        config.update_vm(name, |r| {
+            r.state = RecordState::Running;
+            r.pid = pid;
+        });
+        config.save()?;
+
+        println!("Sandbox '{}' running (PID: {})", name, pid.unwrap_or(0));
+        println!(
+            "\nUse 'smolvm container create {} <image>' to run containers",
+            name
+        );
+
+        // Keep sandbox running (persistent)
+        manager.detach();
+        Ok(())
+    }
+
+    fn start_anonymous(&self) -> smolvm::Result<()> {
+        let manager = AgentManager::new_default()?;
+
+        if manager.try_connect_existing().is_some() {
+            let pid_suffix = format_pid_suffix(manager.child_pid());
+            println!("Sandbox 'default' already running{}", pid_suffix);
+            manager.detach();
+            return Ok(());
+        }
+
+        println!("Starting sandbox 'default'...");
+        manager.ensure_running()?;
+
+        let pid = manager.child_pid().unwrap_or(0);
+        println!("Sandbox 'default' running (PID: {})", pid);
+
+        manager.detach();
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Delete Command
+// ============================================================================
+
+/// Delete a sandbox configuration.
+///
+/// Stops the sandbox if running, then removes its configuration.
+///
+/// Examples:
+///   smolvm sandbox delete mysandbox
+///   smolvm sandbox delete mysandbox --force
+#[derive(Args, Debug)]
+pub struct DeleteCmd {
+    /// Sandbox to delete
+    #[arg(value_name = "NAME")]
+    pub name: String,
+
+    /// Skip confirmation prompt
+    #[arg(short, long)]
+    pub force: bool,
+}
+
+impl DeleteCmd {
+    pub fn run(&self) -> smolvm::Result<()> {
+        let mut config = SmolvmConfig::load()?;
+
+        // Check if sandbox exists
+        let record = config
+            .get_vm(&self.name)
+            .ok_or_else(|| smolvm::Error::vm_not_found(&self.name))?
+            .clone();
+
+        // Stop if running
+        if record.actual_state() == RecordState::Running {
+            if let Ok(manager) = AgentManager::for_vm(&self.name) {
+                println!("Stopping sandbox '{}'...", self.name);
+                if let Err(e) = manager.stop() {
+                    tracing::warn!(error = %e, "failed to stop sandbox");
+                }
+            }
+        }
+
+        // Confirm deletion unless --force
+        if !self.force {
+            eprint!("Delete sandbox '{}'? [y/N] ", self.name);
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_ok() {
+                let input = input.trim().to_lowercase();
+                if input != "y" && input != "yes" {
+                    println!("Cancelled");
+                    return Ok(());
+                }
+            } else {
+                println!("Cancelled");
+                return Ok(());
+            }
+        }
+
+        // Remove from config
+        config.remove_vm(&self.name);
+        config.save()?;
+
+        println!("Deleted sandbox: {}", self.name);
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Ls Command
+// ============================================================================
+
+/// List all sandboxes.
+///
+/// Shows all configured sandboxes with their state, resources, and configuration.
+///
+/// Examples:
+///   smolvm sandbox ls
+///   smolvm sandbox ls --verbose
+///   smolvm sandbox ls --json
+#[derive(Args, Debug)]
+pub struct LsCmd {
+    /// Show detailed configuration (mounts, ports, PID)
+    #[arg(short, long)]
+    pub verbose: bool,
+
+    /// Output in JSON format
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl LsCmd {
+    pub fn run(&self) -> smolvm::Result<()> {
+        let config = SmolvmConfig::load()?;
+        let vms: Vec<_> = config.list_vms().collect();
+
+        if vms.is_empty() {
+            if !self.json {
+                println!("No sandboxes found");
+            } else {
+                println!("[]");
+            }
+            return Ok(());
+        }
+
+        if self.json {
+            let json_vms: Vec<_> = vms
+                .iter()
+                .map(|(name, record)| {
+                    let actual_state = record.actual_state();
+                    serde_json::json!({
+                        "name": name,
+                        "state": actual_state.to_string(),
+                        "cpus": record.cpus,
+                        "memory_mib": record.mem,
+                        "pid": record.pid,
+                        "mounts": record.mounts.len(),
+                        "ports": record.ports.len(),
+                        "network": record.network,
+                        "created_at": record.created_at,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json_vms).expect("JSON serialization failed")
+            );
+        } else {
+            println!(
+                "{:<20} {:<10} {:<5} {:<8} {:<6} {:<6}",
+                "NAME", "STATE", "CPUS", "MEMORY", "MOUNTS", "PORTS"
+            );
+            println!("{}", "-".repeat(60));
+
+            for (name, record) in vms {
+                let actual_state = record.actual_state();
+                println!(
+                    "{:<20} {:<10} {:<5} {:<8} {:<6} {:<6}",
+                    truncate(name, 18),
+                    actual_state,
+                    record.cpus,
+                    format!("{} MiB", record.mem),
+                    record.mounts.len(),
+                    record.ports.len(),
+                );
+
+                if self.verbose {
+                    if let Some(pid) = record.pid {
+                        println!("  PID: {}", pid);
+                    }
+                    for (host, guest, ro) in &record.mounts {
+                        let ro_str = if *ro { " (ro)" } else { "" };
+                        println!("  Mount: {} -> {}{}", host, guest, ro_str);
+                    }
+                    for (host, guest) in &record.ports {
+                        println!("  Port: {} -> {}", host, guest);
+                    }
+                    if record.network {
+                        println!("  Network: enabled");
+                    }
+                    println!("  Created: {}", record.created_at);
+                    println!();
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
 // Images Command
 // ============================================================================
 
@@ -691,6 +1181,20 @@ impl PruneCmd {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// Get the agent manager for a sandbox name (or default if None).
+fn get_sandbox_manager(name: &Option<String>) -> smolvm::Result<AgentManager> {
+    if let Some(name) = name {
+        AgentManager::for_vm(name)
+    } else {
+        AgentManager::new_default()
+    }
+}
+
+/// Format the sandbox label for display.
+fn sandbox_label(name: &Option<String>) -> String {
+    name.as_deref().unwrap_or("default").to_string()
+}
 
 /// Format bytes as human-readable string.
 fn format_bytes(bytes: u64) -> String {
