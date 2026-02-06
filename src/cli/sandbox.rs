@@ -212,13 +212,11 @@ impl StopCmd {
         // Default anonymous sandbox
         let manager = AgentManager::new_default()?;
 
-        if manager.try_connect_existing().is_some() {
-            println!("Stopping sandbox...");
-            manager.stop()?;
-            println!("Sandbox stopped");
-        } else {
-            println!("No sandbox running");
-        }
+        // stop() handles both responsive agents and orphan processes via PID file
+        println!("Stopping sandbox...");
+        manager.try_connect_existing();
+        manager.stop()?;
+        println!("Sandbox stopped");
 
         Ok(())
     }
@@ -245,7 +243,10 @@ impl StopCmd {
 
         let actual_state = record.actual_state();
         if actual_state != RecordState::Running {
-            println!("Sandbox '{}' is not running (state: {})", name, actual_state);
+            println!(
+                "Sandbox '{}' is not running (state: {})",
+                name, actual_state
+            );
             return Ok(());
         }
 

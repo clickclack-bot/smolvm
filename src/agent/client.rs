@@ -770,6 +770,12 @@ impl AgentClient {
         use std::io::{stderr, stdin, stdout, Read, Write};
         use std::os::unix::io::AsRawFd;
 
+        // Disable socket read timeout for interactive sessions — the poll loop
+        // handles readiness checking, and the session runs until the user exits.
+        self.stream
+            .set_read_timeout(None)
+            .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
+
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
 
         // Send the vm_exec request with interactive mode
@@ -1009,6 +1015,11 @@ impl AgentClient {
         };
         use std::io::{stderr, stdin, stdout, Read, Write};
         use std::os::unix::io::AsRawFd;
+
+        // Disable socket read timeout for interactive sessions
+        self.stream
+            .set_read_timeout(None)
+            .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
 
         let timeout_ms = config.timeout.map(|t| t.as_millis() as u64);
         let tty = config.tty;
@@ -1329,6 +1340,11 @@ impl AgentClient {
         };
         use std::io::{stderr, stdin, stdout, Read, Write};
         use std::os::unix::io::AsRawFd;
+
+        // Disable socket read timeout for interactive sessions
+        self.stream
+            .set_read_timeout(None)
+            .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
 
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
 

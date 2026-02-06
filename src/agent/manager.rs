@@ -130,6 +130,8 @@ pub struct AgentManager {
     storage_disk: StorageDisk,
     /// vsock socket path for control channel.
     vsock_socket: PathBuf,
+    /// PID file path for tracking the VM process across CLI invocations.
+    pid_file: PathBuf,
     /// Console log path (optional).
     console_log: Option<PathBuf>,
     /// Internal state.
@@ -178,6 +180,7 @@ impl AgentManager {
         std::fs::create_dir_all(&smolvm_runtime)?;
 
         let vsock_socket = smolvm_runtime.join("agent.sock");
+        let pid_file = smolvm_runtime.join("agent.pid");
         let console_log = Some(smolvm_runtime.join("agent-console.log"));
 
         Ok(Self {
@@ -185,6 +188,7 @@ impl AgentManager {
             rootfs_path,
             storage_disk,
             vsock_socket,
+            pid_file,
             console_log,
             inner: Arc::new(Mutex::new(AgentInner {
                 state: AgentState::Stopped,
@@ -275,11 +279,15 @@ impl AgentManager {
     /// Try to reconnect to an existing agent with a known PID.
     ///
     /// If the PID is provided and the process is alive, sets the child process.
+    /// Falls back to reading the PID file if no PID is provided.
     /// Returns Some(()) if agent is running and reachable, None otherwise.
     pub fn try_connect_existing_with_pid(&self, pid: Option<i32>) -> Option<()> {
         if !self.vsock_socket.exists() {
             return None;
         }
+
+        // Resolve PID: use provided PID, or fall back to PID file
+        let effective_pid = pid.or_else(|| self.read_pid_file());
 
         // Try to ping the agent
         if let Ok(mut client) = super::AgentClient::connect(&self.vsock_socket) {
@@ -288,7 +296,7 @@ impl AgentManager {
                 let mut inner = self.inner.lock();
                 inner.state = AgentState::Running;
                 // Set the child process if PID is known and process is alive
-                if let Some(p) = pid {
+                if let Some(p) = effective_pid {
                     if process::is_alive(p) {
                         inner.child = Some(ChildProcess::new(p));
                     }
@@ -298,6 +306,13 @@ impl AgentManager {
         }
 
         None
+    }
+
+    /// Read the PID from the PID file, if it exists and contains a valid PID.
+    fn read_pid_file(&self) -> Option<i32> {
+        std::fs::read_to_string(&self.pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
     }
 
     /// Get the child PID if known.
@@ -559,6 +574,11 @@ impl AgentManager {
             inner.child = Some(ChildProcess::new(child_pid));
         }
 
+        // Write PID file so future CLI invocations can find this process
+        if let Err(e) = std::fs::write(&self.pid_file, child_pid.to_string()) {
+            tracing::warn!(error = %e, "failed to write PID file");
+        }
+
         // Wait for the agent to be ready
         match self.wait_for_ready() {
             Ok(_) => {
@@ -586,6 +606,16 @@ impl AgentManager {
         };
 
         if state == AgentState::Stopped {
+            // Even if internal state is Stopped, check PID file for orphan processes
+            // from previous CLI invocations that weren't properly cleaned up.
+            if let Some(pid) = self.read_pid_file() {
+                if process::is_alive(pid) {
+                    tracing::info!(pid, "found orphan VM process via PID file, killing");
+                    let _ = process::stop_process_fast(pid, AGENT_STOP_TIMEOUT, true);
+                }
+                let _ = std::fs::remove_file(&self.pid_file);
+                let _ = std::fs::remove_file(&self.vsock_socket);
+            }
             return Ok(());
         }
 
@@ -596,11 +626,14 @@ impl AgentManager {
 
         tracing::info!("stopping agent VM");
 
-        // Get the child PID first so we can check if it exits quickly
+        // Get the child PID — try in-memory first, then fall back to PID file.
+        // The PID file fallback is critical for anonymous VMs where a fresh
+        // AgentManager doesn't know the PID from a previous CLI invocation.
         let child_pid = {
             let inner = self.inner.lock();
             inner.child.as_ref().map(|c| c.pid())
-        };
+        }
+        .or_else(|| self.read_pid_file());
 
         // Graceful shutdown via vsock - waits for agent to acknowledge
         // The agent calls sync() before responding, ensuring ext4 journal is flushed
@@ -629,8 +662,9 @@ impl AgentManager {
             inner.child = None;
         }
 
-        // Remove socket
+        // Remove socket and PID file
         let _ = std::fs::remove_file(&self.vsock_socket);
+        let _ = std::fs::remove_file(&self.pid_file);
 
         Ok(())
     }

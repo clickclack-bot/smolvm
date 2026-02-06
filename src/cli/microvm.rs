@@ -440,26 +440,22 @@ impl StopCmd {
     fn stop_anonymous(&self) -> smolvm::Result<()> {
         let manager = AgentManager::new_default()?;
 
-        if manager.try_connect_existing().is_some() {
-            println!("Stopping microvm 'default'...");
-            manager.stop()?;
-            println!("MicroVM 'default' stopped");
-        } else {
-            println!("MicroVM 'default' not running");
-        }
+        // try_connect_existing sets internal state if agent is reachable;
+        // stop() handles both responsive agents and orphans via PID file.
+        manager.try_connect_existing();
+        println!("Stopping microvm 'default'...");
+        manager.stop()?;
+        println!("MicroVM 'default' stopped");
 
         Ok(())
     }
 
     fn stop_named_microvm(&self, name: &str) -> smolvm::Result<()> {
         if let Ok(manager) = AgentManager::for_vm(name) {
-            if manager.try_connect_existing().is_some() {
-                println!("Stopping microvm '{}'...", name);
-                manager.stop()?;
-                println!("MicroVM '{}' stopped", name);
-            } else {
-                println!("MicroVM '{}' not running", name);
-            }
+            manager.try_connect_existing();
+            println!("Stopping microvm '{}'...", name);
+            manager.stop()?;
+            println!("MicroVM '{}' stopped", name);
         } else {
             println!("MicroVM '{}' not found", name);
         }
