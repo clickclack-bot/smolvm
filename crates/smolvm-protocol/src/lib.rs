@@ -20,11 +20,35 @@ use serde::{Deserialize, Serialize};
 
 pub mod retry;
 
+/// Serde helper for encoding `Vec<u8>` as a base64 string in JSON.
+///
+/// Without this, serde_json serializes `Vec<u8>` as a JSON array of numbers
+/// (e.g., `[104,101,108,108,111]`), which inflates binary data by ~4x.
+/// Base64 encoding reduces this to ~1.33x.
+pub mod base64_bytes {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Serialize `Vec<u8>` as a base64 string.
+    pub fn serialize<S: Serializer>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(data))
+    }
+
+    /// Deserialize a base64 string into `Vec<u8>`.
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        STANDARD.decode(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Protocol version.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Maximum frame size (256 MB - increased to support large OCI layers for pack).
-pub const MAX_FRAME_SIZE: u32 = 256 * 1024 * 1024;
+/// Maximum frame size (32 MB - layer exports use chunked streaming).
+pub const MAX_FRAME_SIZE: u32 = 32 * 1024 * 1024;
+
+/// Chunk size for streaming layer data (~16 MB raw, ~21 MB as base64 JSON).
+pub const LAYER_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 
 /// Well-known vsock ports.
 pub mod ports {
@@ -183,6 +207,7 @@ pub enum AgentRequest {
     /// Send stdin data to a running interactive command.
     Stdin {
         /// Input data to send to the command's stdin.
+        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
 
@@ -326,12 +351,14 @@ pub enum AgentResponse {
     /// Stdout data from a running command (interactive mode).
     Stdout {
         /// Output data.
+        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
 
     /// Stderr data from a running command (interactive mode).
     Stderr {
         /// Error output data.
+        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
 
@@ -344,6 +371,7 @@ pub enum AgentResponse {
     /// Layer data chunk (for ExportLayer).
     LayerData {
         /// Binary data chunk.
+        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
         /// Whether this is the last chunk.
         done: bool,
@@ -630,6 +658,7 @@ pub enum GuestMessage {
         /// Request ID.
         request_id: u64,
         /// Output data.
+        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
         /// Whether output was truncated.
         truncated: bool,
@@ -640,6 +669,7 @@ pub enum GuestMessage {
         /// Request ID.
         request_id: u64,
         /// Output data.
+        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
         /// Whether output was truncated.
         truncated: bool,

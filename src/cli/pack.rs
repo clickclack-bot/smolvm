@@ -352,6 +352,9 @@ impl PackCmd {
     }
 
     /// Export a layer from the agent.
+    ///
+    /// The agent streams the layer as a sequence of `LayerData` chunks.
+    /// We accumulate them into a single `Vec<u8>`.
     fn export_layer(
         &self,
         client: &mut AgentClient,
@@ -367,14 +370,23 @@ impl PackCmd {
 
         client.send_raw(&request)?;
 
-        let response = client.recv_raw()?;
-        match response {
-            AgentResponse::LayerData { data, done: true } => Ok(data),
-            AgentResponse::LayerData { .. } => {
-                Err(Error::agent("export layer", "unexpected chunked response"))
+        let mut result = Vec::new();
+        loop {
+            let response = client.recv_raw()?;
+            match response {
+                AgentResponse::LayerData { data, done } => {
+                    result.extend_from_slice(&data);
+                    if done {
+                        return Ok(result);
+                    }
+                }
+                AgentResponse::Error { message, .. } => {
+                    return Err(Error::agent("export layer", message));
+                }
+                _ => {
+                    return Err(Error::agent("export layer", "unexpected response type"));
+                }
             }
-            AgentResponse::Error { message, .. } => Err(Error::agent("export layer", message)),
-            _ => Err(Error::agent("export layer", "unexpected response type")),
         }
     }
 }

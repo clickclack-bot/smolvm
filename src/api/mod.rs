@@ -38,7 +38,7 @@ use state::ApiState;
 #[openapi(
     info(
         title = "smolvm API",
-        version = "0.1.4",
+        version = "0.1.5",
         description = "OCI-native microVM runtime API for managing sandboxes, containers, images, and microvms.",
         license(name = "Apache-2.0", url = "https://www.apache.org/licenses/LICENSE-2.0")
     ),

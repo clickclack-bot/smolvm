@@ -9,7 +9,8 @@
 //! Communication is via vsock on port 6000.
 
 use smolvm_protocol::{
-    error_codes, ports, AgentRequest, AgentResponse, ContainerInfo, RegistryAuth, PROTOCOL_VERSION,
+    error_codes, ports, AgentRequest, AgentResponse, ContainerInfo, RegistryAuth, LAYER_CHUNK_SIZE,
+    PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
@@ -503,6 +504,16 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        // Handle ExportLayer with chunked streaming
+        if let AgentRequest::ExportLayer {
+            ref image_digest,
+            layer_index,
+        } = request
+        {
+            handle_streaming_export_layer(stream, image_digest, layer_index)?;
+            continue;
+        }
+
         // Handle regular request
         let response = handle_request(request);
         send_response(stream, &response)?;
@@ -714,10 +725,10 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             )
         }
 
-        AgentRequest::ExportLayer {
-            image_digest,
-            layer_index,
-        } => handle_export_layer(&image_digest, layer_index),
+        AgentRequest::ExportLayer { .. } => {
+            // Streaming export is handled by handle_streaming_export_layer
+            AgentResponse::error("export layer not handled here", error_codes::INTERNAL_ERROR)
+        }
     }
 }
 
@@ -1659,44 +1670,114 @@ fn handle_format_storage() -> AgentResponse {
     }
 }
 
-/// Handle export layer request.
-/// Returns the layer data as base64 encoded tar.
-fn handle_export_layer(image_digest: &str, layer_index: usize) -> AgentResponse {
-    info!(image_digest = %image_digest, layer_index = layer_index, "exporting layer");
+/// Handle export layer request with chunked streaming.
+///
+/// Reads the layer tar file and sends it in LAYER_CHUNK_SIZE chunks,
+/// each as a separate LayerData response. This avoids hitting MAX_FRAME_SIZE
+/// for large layers.
+fn handle_streaming_export_layer(
+    stream: &mut impl Write,
+    image_digest: &str,
+    layer_index: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!(image_digest = %image_digest, layer_index = layer_index, "exporting layer (chunked)");
 
     // Export layer to tar file
     let tar_path = match storage::export_layer(image_digest, layer_index) {
         Ok(path) => path,
         Err(e) => {
-            return AgentResponse::from_err(e, error_codes::EXPORT_FAILED);
+            send_response(
+                stream,
+                &AgentResponse::from_err(e, error_codes::EXPORT_FAILED),
+            )?;
+            return Ok(());
         }
     };
 
-    // Get layer digest for metadata (verifies the layer exists)
-    let _layer_digest = match storage::get_layer_digest(image_digest, layer_index) {
-        Ok(d) => d,
-        Err(e) => return AgentResponse::from_err(e, error_codes::EXPORT_FAILED),
-    };
+    // Verify layer exists
+    if let Err(e) = storage::get_layer_digest(image_digest, layer_index) {
+        let _ = std::fs::remove_file(&tar_path);
+        send_response(
+            stream,
+            &AgentResponse::from_err(e, error_codes::EXPORT_FAILED),
+        )?;
+        return Ok(());
+    }
 
-    // Read the tar file
-    let tar_data = match std::fs::read(&tar_path) {
-        Ok(data) => data,
+    // Open tar file for streaming
+    let mut file = match std::fs::File::open(&tar_path) {
+        Ok(f) => f,
         Err(e) => {
-            return AgentResponse::error(
-                format!("failed to read tar file: {}", e),
-                error_codes::EXPORT_FAILED,
-            );
+            let _ = std::fs::remove_file(&tar_path);
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("failed to open tar file: {}", e),
+                    error_codes::EXPORT_FAILED,
+                ),
+            )?;
+            return Ok(());
         }
     };
+
+    // Stream in chunks. Read ahead one chunk so we can mark the last
+    // data-carrying frame with done=true, avoiding an empty final frame.
+    let mut buf = vec![0u8; LAYER_CHUNK_SIZE];
+    let mut pending = match file.read(&mut buf) {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tar_path);
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("failed to read tar file: {}", e),
+                    error_codes::EXPORT_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+
+    loop {
+        // Read the next chunk to determine if `pending` is the last one.
+        let mut next_buf = vec![0u8; LAYER_CHUNK_SIZE];
+        let next_n = match file.read(&mut next_buf) {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tar_path);
+                send_response(
+                    stream,
+                    &AgentResponse::error(
+                        format!("failed to read tar file: {}", e),
+                        error_codes::EXPORT_FAILED,
+                    ),
+                )?;
+                return Ok(());
+            }
+        };
+
+        let done = next_n == 0;
+        send_response(
+            stream,
+            &AgentResponse::LayerData {
+                data: buf[..pending].to_vec(),
+                done,
+            },
+        )?;
+
+        if done {
+            break;
+        }
+
+        // Swap buffers: next becomes pending.
+        std::mem::swap(&mut buf, &mut next_buf);
+        pending = next_n;
+    }
 
     // Clean up temp file
     let _ = std::fs::remove_file(&tar_path);
 
-    // Return layer data
-    AgentResponse::LayerData {
-        data: tar_data,
-        done: true,
-    }
+    Ok(())
 }
 
 /// Handle storage status request.
