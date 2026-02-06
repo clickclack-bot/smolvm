@@ -7,10 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
-use crate::api::state::{
-    mount_spec_to_host_mount, port_spec_to_mapping, resource_spec_to_vm_resources, ApiState,
-    DbCloseGuard,
-};
+use crate::api::state::{ensure_sandbox_running_with_db_guard, ApiState};
 use crate::config::{RecordState, RestartConfig, RestartPolicy};
 
 /// Interval between health checks.
@@ -131,37 +128,7 @@ impl Supervisor {
             }
         };
 
-        // Get configuration from entry
-        let (mounts, ports, resources) = {
-            let entry_guard = entry.lock();
-            let mounts_result: Result<Vec<_>, _> = entry_guard
-                .mounts
-                .iter()
-                .map(mount_spec_to_host_mount)
-                .collect();
-            let mounts = mounts_result?;
-            let ports: Vec<_> = entry_guard.ports.iter().map(port_spec_to_mapping).collect();
-            let resources =
-                resource_spec_to_vm_resources(&entry_guard.resources, entry_guard.network);
-            (mounts, ports, resources)
-        };
-
-        // Start the sandbox in a blocking task (this forks).
-        // Use DbCloseGuard to ensure DB is reopened even if cancelled/panicked.
-        let start_result = {
-            let _db_guard = DbCloseGuard::new(&self.state);
-
-            let entry_clone = entry.clone();
-            tokio::task::spawn_blocking(move || {
-                let entry = entry_clone.lock();
-                entry
-                    .manager
-                    .ensure_running_with_full_config(mounts, ports, resources)
-            })
-            .await
-            // Guard dropped here, DB reopened (even on cancellation)
-        }
-        .map_err(|e| crate::Error::agent("spawn task", e.to_string()))?;
+        let start_result = ensure_sandbox_running_with_db_guard(self.state.as_ref(), &entry).await;
 
         // Handle start result
         match start_result {

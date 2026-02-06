@@ -239,14 +239,10 @@ impl SmolvmDb {
     }
 
     /// Remove a VM record by name, returning the removed record if it existed.
+    ///
+    /// Uses a single write transaction to atomically read and delete the record,
+    /// preventing TOCTOU races with concurrent writers.
     pub fn remove_vm(&self, name: &str) -> Result<Option<VmRecord>> {
-        // First get the existing record
-        let existing = self.get_vm(name)?;
-
-        if existing.is_none() {
-            return Ok(None);
-        }
-
         let db_guard = self.db.read();
         let db = db_guard
             .as_ref()
@@ -256,14 +252,38 @@ impl SmolvmDb {
             .begin_write()
             .map_err(|e| Error::database("begin write transaction", e.to_string()))?;
 
-        {
+        let existing = {
             let mut table = write_txn
                 .open_table(VMS_TABLE)
                 .map_err(|e| Error::database("open vms table", e.to_string()))?;
-            table
-                .remove(name)
-                .map_err(|e| Error::database(format!("remove vm '{}'", name), e.to_string()))?;
-        }
+
+            // Read and deserialize first, releasing the AccessGuard before mutation
+            let record = {
+                let get_result = table
+                    .get(name)
+                    .map_err(|e| Error::database(format!("get vm '{}'", name), e.to_string()))?;
+                match get_result {
+                    Some(guard) => {
+                        let r: VmRecord = serde_json::from_slice(guard.value()).map_err(|e| {
+                            Error::database(
+                                format!("deserialize vm record '{}'", name),
+                                e.to_string(),
+                            )
+                        })?;
+                        Some(r)
+                    }
+                    None => None,
+                }
+            };
+
+            // Now safe to mutate — AccessGuard is dropped
+            if record.is_some() {
+                table
+                    .remove(name)
+                    .map_err(|e| Error::database(format!("remove vm '{}'", name), e.to_string()))?;
+            }
+            record
+        };
 
         write_txn
             .commit()
@@ -307,23 +327,66 @@ impl SmolvmDb {
     /// Update a VM record in place using a closure.
     ///
     /// Returns `Some(())` if the VM was found and updated, `None` if not found.
+    ///
+    /// Uses a single write transaction to atomically read, mutate, and write back,
+    /// preventing lost updates from concurrent writers.
     pub fn update_vm<F>(&self, name: &str, f: F) -> Result<Option<()>>
     where
         F: FnOnce(&mut VmRecord),
     {
-        // Get existing record
-        let mut record = match self.get_vm(name)? {
-            Some(r) => r,
-            None => return Ok(None),
+        let db_guard = self.db.read();
+        let db = db_guard
+            .as_ref()
+            .ok_or_else(|| Error::database_unavailable("database is closed"))?;
+
+        let write_txn = db
+            .begin_write()
+            .map_err(|e| Error::database("begin write transaction", e.to_string()))?;
+
+        let updated = {
+            let mut table = write_txn
+                .open_table(VMS_TABLE)
+                .map_err(|e| Error::database("open vms table", e.to_string()))?;
+
+            // Read and deserialize first, releasing the AccessGuard before mutation
+            let record = {
+                let get_result = table
+                    .get(name)
+                    .map_err(|e| Error::database(format!("get vm '{}'", name), e.to_string()))?;
+                match get_result {
+                    Some(guard) => {
+                        let r: VmRecord = serde_json::from_slice(guard.value()).map_err(|e| {
+                            Error::database(
+                                format!("deserialize vm record '{}'", name),
+                                e.to_string(),
+                            )
+                        })?;
+                        Some(r)
+                    }
+                    None => None,
+                }
+            };
+
+            // Now safe to mutate — AccessGuard is dropped
+            match record {
+                Some(mut record) => {
+                    f(&mut record);
+                    let json = serde_json::to_vec(&record)
+                        .map_err(|e| Error::database("serialize vm record", e.to_string()))?;
+                    table.insert(name, json.as_slice()).map_err(|e| {
+                        Error::database(format!("update vm '{}'", name), e.to_string())
+                    })?;
+                    true
+                }
+                None => false,
+            }
         };
 
-        // Apply the update
-        f(&mut record);
+        write_txn
+            .commit()
+            .map_err(|e| Error::database("commit vm update", e.to_string()))?;
 
-        // Write back
-        self.insert_vm(name, &record)?;
-
-        Ok(Some(()))
+        Ok(if updated { Some(()) } else { None })
     }
 
     /// Load all VMs into an in-memory HashMap (for compatibility layer).

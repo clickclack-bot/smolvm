@@ -6,6 +6,7 @@ use axum::{
     Json,
 };
 use serde::Serialize;
+use std::fmt::Display;
 
 /// API error type with HTTP status code mapping.
 #[derive(Debug)]
@@ -20,6 +21,18 @@ pub enum ApiError {
     Timeout,
     /// Internal server error (500).
     Internal(String),
+}
+
+impl ApiError {
+    /// Convert any displayable error to an internal API error.
+    pub fn internal(err: impl Display) -> Self {
+        Self::Internal(err.to_string())
+    }
+
+    /// Wrap a database-layer error with a consistent message prefix.
+    pub fn database(err: impl Display) -> Self {
+        Self::Internal(format!("database error: {}", err))
+    }
 }
 
 /// JSON error response body.

@@ -8,9 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::api::error::ApiError;
-use crate::api::state::{
-    mount_spec_to_host_mount, port_spec_to_mapping, resource_spec_to_vm_resources, ApiState,
-};
+use crate::api::state::{ensure_sandbox_running, ApiState};
 use crate::api::types::{
     ApiErrorResponse, ContainerExecRequest, ContainerInfo, CreateContainerRequest,
     DeleteContainerRequest, ExecResponse, ListContainersResponse, StopContainerRequest,
@@ -38,24 +36,10 @@ pub async fn create_container(
 ) -> Result<Json<ContainerInfo>, ApiError> {
     let entry = state.get_sandbox(&sandbox_id)?;
 
-    // Ensure sandbox is running (blocking operation)
-    {
-        let entry_clone = entry.clone();
-        tokio::task::spawn_blocking(move || {
-            let entry = entry_clone.lock();
-            let mounts_result: Result<Vec<_>, _> =
-                entry.mounts.iter().map(mount_spec_to_host_mount).collect();
-            let mounts = mounts_result?;
-            let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
-            let resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
-
-            entry
-                .manager
-                .ensure_running_with_full_config(mounts, ports, resources)
-        })
-        .await?
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    }
+    // Ensure sandbox is running
+    ensure_sandbox_running(&entry)
+        .await
+        .map_err(ApiError::internal)?;
 
     // Prepare parameters
     let image = req.image.clone();
@@ -84,7 +68,7 @@ pub async fn create_container(
         client.create_container(&image, command, env, workdir, mounts)
     })
     .await?
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    .map_err(ApiError::internal)?;
 
     Ok(Json(ContainerInfo {
         id: container_info.id,
@@ -132,7 +116,7 @@ pub async fn list_containers(
         client.list_containers()
     })
     .await?
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    .map_err(ApiError::internal)?;
 
     let containers = containers
         .into_iter()
@@ -180,7 +164,7 @@ pub async fn start_container(
         client.start_container(&container_id)
     })
     .await?
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    .map_err(ApiError::internal)?;
 
     Ok(Json(serde_json::json!({
         "started": container_id_response
@@ -223,7 +207,7 @@ pub async fn stop_container(
         client.stop_container(&container_id, timeout_secs)
     })
     .await?
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    .map_err(ApiError::internal)?;
 
     Ok(Json(serde_json::json!({
         "stopped": container_id_response
@@ -266,7 +250,7 @@ pub async fn delete_container(
         client.delete_container(&container_id, force)
     })
     .await?
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    .map_err(ApiError::internal)?;
 
     Ok(Json(serde_json::json!({
         "deleted": container_id_response
@@ -319,7 +303,7 @@ pub async fn exec_in_container(
         client.exec(&container_id, command, env, workdir, timeout)
     })
     .await?
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    .map_err(ApiError::internal)?;
 
     Ok(Json(ExecResponse {
         exit_code,

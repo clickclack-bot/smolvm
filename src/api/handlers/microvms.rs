@@ -7,17 +7,15 @@
 //!
 //! ### Name Length Limit
 //!
-//! MicroVM names are limited to 64 characters. However, due to Unix domain
-//! socket path length limits (~104 bytes on macOS), very long names may cause
-//! issues. The full socket path is:
+//! MicroVM names are limited to 40 characters due to Unix domain socket path
+//! length limits (~104 bytes on macOS). The full socket path is:
 //!
 //! ```text
 //! ~/Library/Caches/smolvm/vms/{name}/agent.sock
 //! ```
 //!
-//! With a typical macOS home directory path, names should be kept under ~40
-//! characters to avoid socket path length issues. The API will accept longer
-//! names but VM startup may fail silently.
+//! With a typical macOS home directory path of ~30 chars, a name of 40 chars
+//! results in a socket path of ~90 chars, leaving some margin.
 //!
 //! Recommended: Use short, descriptive names (e.g., "dev-vm", "test-1").
 
@@ -31,7 +29,7 @@ use std::time::Duration;
 
 use crate::agent::{AgentManager, HostMount, PortMapping, VmResources};
 use crate::api::error::ApiError;
-use crate::api::state::ApiState;
+use crate::api::state::{ApiState, DbCloseGuard};
 use crate::api::types::{
     ApiErrorResponse, CreateMicrovmRequest, DeleteResponse, ExecResponse, ListMicrovmsResponse,
     MicrovmExecRequest, MicrovmInfo,
@@ -50,7 +48,7 @@ const MAX_NAME_LENGTH: usize = 40;
 /// Validate a microvm name.
 ///
 /// Rules:
-/// - Length: 1-64 characters
+/// - Length: 1-40 characters
 /// - Allowed characters: alphanumeric, hyphen (-), underscore (_)
 /// - Must start with a letter or digit
 /// - Cannot end with a hyphen
@@ -175,7 +173,7 @@ pub async fn create_microvm(
             "microvm '{}' already exists",
             name
         ))),
-        Err(e) => Err(ApiError::Internal(format!("database error: {}", e))),
+        Err(e) => Err(ApiError::database(e)),
     }
 }
 
@@ -193,9 +191,7 @@ pub async fn list_microvms(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ListMicrovmsResponse>, ApiError> {
     let db = state.db();
-    let vms = db
-        .list_vms()
-        .map_err(|e| ApiError::Internal(format!("database error: {}", e)))?;
+    let vms = db.list_vms().map_err(ApiError::database)?;
 
     let microvms: Vec<MicrovmInfo> = vms
         .iter()
@@ -225,7 +221,7 @@ pub async fn get_microvm(
     let db = state.db();
     let record = db
         .get_vm(&name)
-        .map_err(|e| ApiError::Internal(format!("database error: {}", e)))?
+        .map_err(ApiError::database)?
         .ok_or_else(|| ApiError::NotFound(format!("microvm '{}' not found", name)))?;
 
     Ok(Json(record_to_info(&name, &record)))
@@ -253,7 +249,7 @@ pub async fn start_microvm(
     let db = state.db();
     let record = db
         .get_vm(&name)
-        .map_err(|e| ApiError::Internal(format!("database error: {}", e)))?
+        .map_err(ApiError::database)?
         .ok_or_else(|| ApiError::NotFound(format!("microvm '{}' not found", name)))?;
 
     // Check state
@@ -287,40 +283,44 @@ pub async fn start_microvm(
         network: record.network,
     };
 
-    // Start agent VM in blocking task
+    // Start agent VM in blocking task.
+    // DbCloseGuard ensures the database fd is not inherited by the forked child.
     let name_clone = name.clone();
-    let db_clone = db.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let manager = AgentManager::for_vm(&name_clone)
-            .map_err(|e| format!("failed to create agent manager: {}", e))?;
+    let pid = {
+        let _db_guard = DbCloseGuard::new(&state);
+        tokio::task::spawn_blocking(move || {
+            let manager = AgentManager::for_vm(&name_clone)
+                .map_err(|e| format!("failed to create agent manager: {}", e))?;
 
-        manager
-            .ensure_running_with_full_config(mounts, ports, resources)
-            .map_err(|e| format!("failed to start microvm: {}", e))?;
+            manager
+                .ensure_running_with_full_config(mounts, ports, resources)
+                .map_err(|e| format!("failed to start microvm: {}", e))?;
 
-        // Update state in database
-        let pid = manager.child_pid();
-        let _ = db_clone.update_vm(&name_clone, |r| {
-            r.state = RecordState::Running;
-            r.pid = pid;
-        });
+            let pid = manager.child_pid();
+            manager.detach();
+            Ok::<_, String>(pid)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+        .map_err(ApiError::internal)?
+    };
+    // Guard dropped — DB reopened
 
-        // Keep VM running (persistent)
-        manager.detach();
-
-        // Get updated record
-        db_clone
-            .get_vm(&name_clone)
-            .map_err(|e| format!("database error: {}", e))
-    })
-    .await
-    .map_err(|e| ApiError::Internal(format!("task error: {}", e)))?;
-
-    match result {
-        Ok(Some(record)) => Ok(Json(record_to_info(&name, &record))),
-        Ok(None) => Err(ApiError::NotFound(format!("microvm '{}' not found", name))),
-        Err(e) => Err(ApiError::Internal(e)),
+    // Update state in database (after fork, DB is safe to use)
+    if let Err(e) = db.update_vm(&name, |r| {
+        r.state = RecordState::Running;
+        r.pid = pid;
+    }) {
+        tracing::warn!(error = %e, "failed to persist microvm state");
     }
+
+    // Return updated record
+    let record = db
+        .get_vm(&name)
+        .map_err(ApiError::database)?
+        .ok_or_else(|| ApiError::NotFound(format!("microvm '{}' not found", name)))?;
+
+    Ok(Json(record_to_info(&name, &record)))
 }
 
 /// Stop a microvm.
@@ -345,7 +345,7 @@ pub async fn stop_microvm(
     let db = state.db();
     let record = db
         .get_vm(&name)
-        .map_err(|e| ApiError::Internal(format!("database error: {}", e)))?
+        .map_err(ApiError::database)?
         .ok_or_else(|| ApiError::NotFound(format!("microvm '{}' not found", name)))?;
 
     // Check state
@@ -383,18 +383,20 @@ pub async fn stop_microvm(
         }
 
         // Update state in database
-        let _ = db_clone.update_vm(&name_clone, |r| {
+        if let Err(e) = db_clone.update_vm(&name_clone, |r| {
             r.state = RecordState::Stopped;
             r.pid = None;
-        });
+        }) {
+            tracing::warn!(error = %e, "failed to persist microvm state");
+        }
     })
     .await
-    .map_err(|e| ApiError::Internal(format!("task error: {}", e)))?;
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
 
     // Get updated record
     let record = db
         .get_vm(&name)
-        .map_err(|e| ApiError::Internal(format!("database error: {}", e)))?
+        .map_err(ApiError::database)?
         .ok_or_else(|| ApiError::NotFound(format!("microvm '{}' not found", name)))?;
 
     Ok(Json(record_to_info(&name, &record)))
@@ -423,7 +425,7 @@ pub async fn delete_microvm(
     // Check if VM exists and get its state
     let record = db
         .get_vm(&name)
-        .map_err(|e| ApiError::Internal(format!("database error: {}", e)))?
+        .map_err(ApiError::database)?
         .ok_or_else(|| ApiError::NotFound(format!("microvm '{}' not found", name)))?;
 
     // Get PID from database record
@@ -451,11 +453,10 @@ pub async fn delete_microvm(
         }
     })
     .await
-    .map_err(|e| ApiError::Internal(format!("task error: {}", e)))?;
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
 
     // Remove from database
-    db.remove_vm(&name)
-        .map_err(|e| ApiError::Internal(format!("database error: {}", e)))?;
+    db.remove_vm(&name).map_err(ApiError::database)?;
 
     Ok(Json(serde_json::json!({
         "deleted": name
@@ -490,11 +491,7 @@ pub async fn exec_microvm(
 
     // Check if VM exists
     let db = state.db();
-    if db
-        .get_vm(&name)
-        .map_err(|e| ApiError::Internal(format!("database error: {}", e)))?
-        .is_none()
-    {
+    if db.get_vm(&name).map_err(ApiError::database)?.is_none() {
         return Err(ApiError::NotFound(format!("microvm '{}' not found", name)));
     }
 
@@ -511,19 +508,22 @@ pub async fn exec_microvm(
     let result = tokio::task::spawn_blocking(move || {
         // Get manager and check if running
         let manager = AgentManager::for_vm(&name_clone)
-            .map_err(|e| format!("failed to create agent manager: {}", e))?;
+            .map_err(|e| crate::Error::agent("create agent manager", e.to_string()))?;
 
         if manager.try_connect_existing().is_none() {
-            return Err(format!("microvm '{}' is not running", name_clone));
+            return Err(crate::Error::InvalidState {
+                expected: "running".into(),
+                actual: "stopped".into(),
+            });
         }
 
         // Execute command
         let mut client = manager
             .connect()
-            .map_err(|e| format!("connect error: {}", e))?;
+            .map_err(|e| crate::Error::agent("connect", e.to_string()))?;
         let (exit_code, stdout, stderr) = client
             .vm_exec(command, env, workdir, timeout)
-            .map_err(|e| format!("exec error: {}", e))?;
+            .map_err(|e| crate::Error::agent("exec", e.to_string()))?;
 
         // Keep VM running (persistent)
         manager.detach();
@@ -535,15 +535,9 @@ pub async fn exec_microvm(
         })
     })
     .await
-    .map_err(|e| ApiError::Internal(format!("task error: {}", e)))?;
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
 
-    result.map(Json).map_err(|e: String| {
-        if e.contains("not running") {
-            ApiError::Conflict(e)
-        } else {
-            ApiError::Internal(e)
-        }
-    })
+    result.map(Json).map_err(ApiError::from)
 }
 
 #[cfg(test)]

@@ -8,9 +8,7 @@ use std::sync::Arc;
 
 use crate::agent::PullOptions;
 use crate::api::error::ApiError;
-use crate::api::state::{
-    mount_spec_to_host_mount, port_spec_to_mapping, resource_spec_to_vm_resources, ApiState,
-};
+use crate::api::state::{ensure_sandbox_running, ApiState};
 use crate::api::types::{
     ApiErrorResponse, ImageInfo, ListImagesResponse, PullImageRequest, PullImageResponse,
 };
@@ -50,7 +48,7 @@ pub async fn list_images(
         client.list_images()
     })
     .await?
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    .map_err(ApiError::internal)?;
 
     let images = images
         .into_iter()
@@ -96,24 +94,10 @@ pub async fn pull_image(
 
     let entry = state.get_sandbox(&sandbox_id)?;
 
-    // Ensure sandbox is running (blocking operation)
-    {
-        let entry_clone = entry.clone();
-        tokio::task::spawn_blocking(move || {
-            let entry = entry_clone.lock();
-            let mounts_result: Result<Vec<_>, _> =
-                entry.mounts.iter().map(mount_spec_to_host_mount).collect();
-            let mounts = mounts_result?;
-            let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
-            let resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
-
-            entry
-                .manager
-                .ensure_running_with_full_config(mounts, ports, resources)
-        })
-        .await?
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    }
+    // Ensure sandbox is running
+    ensure_sandbox_running(&entry)
+        .await
+        .map_err(ApiError::internal)?;
 
     // Pull image in blocking task
     let image = req.image.clone();
@@ -129,7 +113,7 @@ pub async fn pull_image(
         client.pull(&image, opts)
     })
     .await?
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    .map_err(ApiError::internal)?;
 
     Ok(Json(PullImageResponse {
         image: ImageInfo {

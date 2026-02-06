@@ -160,7 +160,7 @@ impl ApiState {
     /// Returns an error if the database cannot be opened.
     pub fn new() -> Result<Self, ApiError> {
         let db = SmolvmDb::open()
-            .map_err(|e| ApiError::Internal(format!("failed to open database: {}", e)))?;
+            .map_err(|e| ApiError::internal(format!("failed to open database: {}", e)))?;
         Ok(Self {
             sandboxes: RwLock::new(HashMap::new()),
             reserved_names: RwLock::new(HashSet::new()),
@@ -525,7 +525,7 @@ impl ApiState {
             }
             Err(e) => {
                 tracing::error!(error = %e, sandbox = %name, "database error during registration");
-                Err(ApiError::Internal(format!("database error: {}", e)))
+                Err(ApiError::database(e))
             }
         }
     }
@@ -670,6 +670,49 @@ impl ApiState {
     pub fn new_or_panic() -> Self {
         Self::new().expect("failed to create API state")
     }
+}
+
+// ============================================================================
+// Shared Sandbox Helpers
+// ============================================================================
+
+/// Ensure a sandbox is running, starting it if needed.
+///
+/// This is the shared preflight check used by exec, container, and image handlers.
+/// It converts the sandbox's mount/port/resource config and calls
+/// `ensure_running_with_full_config` in a blocking task.
+pub async fn ensure_sandbox_running(
+    entry: &Arc<parking_lot::Mutex<SandboxEntry>>,
+) -> crate::Result<()> {
+    let entry_clone = entry.clone();
+    tokio::task::spawn_blocking(move || {
+        let entry = entry_clone.lock();
+        let mounts: Vec<_> = entry
+            .mounts
+            .iter()
+            .map(mount_spec_to_host_mount)
+            .collect::<crate::Result<Vec<_>>>()?;
+        let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
+        let resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
+
+        entry
+            .manager
+            .ensure_running_with_full_config(mounts, ports, resources)
+    })
+    .await
+    .map_err(|e| crate::Error::agent("ensure running", e.to_string()))?
+}
+
+/// Ensure a sandbox is running while temporarily closing the DB for fork safety.
+///
+/// Use this helper for paths that may fork a child VM process while the host
+/// process holds the database handle.
+pub async fn ensure_sandbox_running_with_db_guard(
+    state: &ApiState,
+    entry: &Arc<parking_lot::Mutex<SandboxEntry>>,
+) -> crate::Result<()> {
+    let _db_guard = DbCloseGuard::new(state);
+    ensure_sandbox_running(entry).await
 }
 
 // ============================================================================

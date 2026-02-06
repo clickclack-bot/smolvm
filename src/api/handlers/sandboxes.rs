@@ -9,8 +9,8 @@ use std::sync::Arc;
 use crate::agent::AgentManager;
 use crate::api::error::ApiError;
 use crate::api::state::{
-    mount_spec_to_host_mount, port_spec_to_mapping, resource_spec_to_vm_resources,
-    restart_spec_to_config, ApiState, DbCloseGuard, ReservationGuard, SandboxRegistration,
+    ensure_sandbox_running_with_db_guard, mount_spec_to_host_mount, restart_spec_to_config,
+    ApiState, ReservationGuard, SandboxRegistration,
 };
 use crate::api::types::{
     ApiErrorResponse, CreateSandboxRequest, DeleteQuery, DeleteResponse, ListSandboxesResponse,
@@ -152,8 +152,8 @@ pub async fn create_sandbox(
     // Handle manager creation result - guard auto-releases on error return
     let manager = match manager_result {
         Ok(Ok(m)) => m,
-        Ok(Err(e)) => return Err(ApiError::Internal(e.to_string())),
-        Err(e) => return Err(ApiError::Internal(e.to_string())),
+        Ok(Err(e)) => return Err(ApiError::internal(e)),
+        Err(e) => return Err(ApiError::internal(e)),
     };
 
     // Get state for response before completing registration
@@ -256,18 +256,10 @@ pub async fn start_sandbox(
 ) -> Result<Json<SandboxInfo>, ApiError> {
     let entry = state.get_sandbox(&id)?;
 
-    // Get configuration from entry
-    let (mounts, ports, resources, mounts_spec, ports_spec, resources_spec, network) = {
+    // Snapshot configuration for response
+    let (mounts_spec, ports_spec, resources_spec, network) = {
         let entry = entry.lock();
-        let mounts_result: Result<Vec<_>, _> =
-            entry.mounts.iter().map(mount_spec_to_host_mount).collect();
-        let mounts = mounts_result.map_err(|e| ApiError::Internal(e.to_string()))?;
-        let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
-        let resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
         (
-            mounts,
-            ports,
-            resources,
             entry.mounts.clone(),
             entry.ports.clone(),
             entry.resources.clone(),
@@ -278,25 +270,10 @@ pub async fn start_sandbox(
     // Clear user_stopped flag since user is explicitly starting
     state.mark_user_stopped(&id, false);
 
-    // Start the sandbox in a blocking task (this forks).
-    // Use DbCloseGuard to ensure DB is reopened even if cancelled/panicked.
-    let start_result = {
-        let _db_guard = DbCloseGuard::new(&state);
-
-        let entry_clone = entry.clone();
-        tokio::task::spawn_blocking(move || {
-            let entry = entry_clone.lock();
-            entry
-                .manager
-                .ensure_running_with_full_config(mounts, ports, resources)
-        })
+    // Start sandbox with shared preflight + fork-safe DB guard.
+    ensure_sandbox_running_with_db_guard(state.as_ref(), &entry)
         .await
-        // Guard dropped here, DB reopened (even on cancellation)
-    };
-
-    // Check the task join result, then the start result
-    let start_result = start_result?;
-    start_result.map_err(|e| ApiError::Internal(e.to_string()))?;
+        .map_err(ApiError::internal)?;
 
     // Get updated state and persist
     let (agent_state, pid) = {
@@ -370,7 +347,7 @@ pub async fn stop_sandbox(
         entry.manager.stop()
     })
     .await?
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    .map_err(ApiError::internal)?;
 
     // Get updated state and persist
     let (agent_state, pid) = {

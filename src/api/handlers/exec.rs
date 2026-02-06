@@ -12,9 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::api::error::ApiError;
-use crate::api::state::{
-    mount_spec_to_host_mount, port_spec_to_mapping, resource_spec_to_vm_resources, ApiState,
-};
+use crate::api::state::{ensure_sandbox_running, ApiState};
 use crate::api::types::{ApiErrorResponse, ExecRequest, ExecResponse, LogsQuery, RunRequest};
 
 /// Execute a command in a sandbox.
@@ -46,24 +44,10 @@ pub async fn exec_command(
 
     let entry = state.get_sandbox(&id)?;
 
-    // Ensure sandbox is running (blocking operation)
-    {
-        let entry_clone = entry.clone();
-        tokio::task::spawn_blocking(move || {
-            let entry = entry_clone.lock();
-            let mounts_result: Result<Vec<_>, _> =
-                entry.mounts.iter().map(mount_spec_to_host_mount).collect();
-            let mounts = mounts_result?;
-            let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
-            let resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
-
-            entry
-                .manager
-                .ensure_running_with_full_config(mounts, ports, resources)
-        })
-        .await?
+    // Ensure sandbox is running
+    ensure_sandbox_running(&entry)
+        .await
         .map_err(|e| ApiError::BadRequest(format!("mount validation failed: {}", e)))?;
-    }
 
     // Prepare execution parameters
     let command = req.command.clone();
@@ -83,7 +67,7 @@ pub async fn exec_command(
         client.vm_exec(command, env, workdir, timeout)
     })
     .await?
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    .map_err(ApiError::internal)?;
 
     Ok(Json(ExecResponse {
         exit_code,
@@ -121,24 +105,10 @@ pub async fn run_command(
 
     let entry = state.get_sandbox(&id)?;
 
-    // Ensure sandbox is running (blocking operation)
-    {
-        let entry_clone = entry.clone();
-        tokio::task::spawn_blocking(move || {
-            let entry = entry_clone.lock();
-            let mounts_result: Result<Vec<_>, _> =
-                entry.mounts.iter().map(mount_spec_to_host_mount).collect();
-            let mounts = mounts_result?;
-            let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
-            let resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
-
-            entry
-                .manager
-                .ensure_running_with_full_config(mounts, ports, resources)
-        })
-        .await?
+    // Ensure sandbox is running
+    ensure_sandbox_running(&entry)
+        .await
         .map_err(|e| ApiError::BadRequest(format!("mount validation failed: {}", e)))?;
-    }
 
     // Prepare execution parameters
     let image = req.image.clone();
@@ -174,7 +144,7 @@ pub async fn run_command(
         client.run_with_mounts_and_timeout(&image, command, env, workdir, mounts_config, timeout)
     })
     .await?
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    .map_err(ApiError::internal)?;
 
     Ok(Json(ExecResponse {
         exit_code,
@@ -219,7 +189,7 @@ pub async fn stream_logs(
     let path_check = log_path.clone();
     let exists = tokio::task::spawn_blocking(move || path_check.exists())
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        .map_err(ApiError::internal)?;
 
     if !exists {
         return Err(ApiError::NotFound(format!(
@@ -236,8 +206,8 @@ pub async fn stream_logs(
         let path = log_path.clone();
         tokio::task::spawn_blocking(move || read_last_n_lines_bounded(&path, n))
             .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?
-            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .map_err(ApiError::internal)?
+            .map_err(ApiError::internal)?
     } else {
         (Vec::new(), 0)
     };
