@@ -3,9 +3,10 @@
 //! This module provides vsock server functionality for Linux guests.
 
 use std::io::{Read, Write};
-use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
+use std::os::unix::io::AsRawFd;
 
 /// vsock listener.
 pub struct VsockListener {
@@ -115,6 +116,13 @@ mod stub {
 }
 
 #[cfg(target_os = "linux")]
+impl AsRawFd for VsockStream {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl Read for VsockStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         unsafe {
@@ -143,6 +151,13 @@ impl Write for VsockStream {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl AsRawFd for VsockStream {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        unreachable!("vsock only supported on Linux")
     }
 }
 
