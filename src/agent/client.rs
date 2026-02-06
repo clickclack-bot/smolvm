@@ -763,7 +763,10 @@ impl AgentClient {
         timeout: Option<Duration>,
         tty: bool,
     ) -> Result<i32> {
-        use crate::agent::terminal::{poll_io, stdin_is_tty, NonBlockingStdin, RawModeGuard};
+        use crate::agent::terminal::{
+            check_sigwinch, get_terminal_size, install_sigwinch_handler, poll_io, stdin_is_tty,
+            NonBlockingStdin, RawModeGuard,
+        };
         use std::io::{stderr, stdin, stdout, Read, Write};
         use std::os::unix::io::AsRawFd;
 
@@ -802,18 +805,21 @@ impl AgentClient {
             None
         };
 
+        // Send initial terminal size so PTY starts at the right dimensions
+        if tty {
+            if let Some((cols, rows)) = get_terminal_size() {
+                self.send(&AgentRequest::Resize { cols, rows })?;
+            }
+            install_sigwinch_handler();
+        }
+
         // Set stdin to non-blocking (guard restores on drop)
         let _nonblock_stdin = NonBlockingStdin::new()
             .map_err(|e| Error::agent("set stdin nonblocking", e.to_string()))?;
 
-        // Set socket to non-blocking for poll-based I/O
-        self.stream
-            .set_nonblocking(true)
-            .map_err(|e| Error::agent("set nonblocking", e.to_string()))?;
-
-        // Get file descriptors for polling
-        // Note: We get stdin handle once and reuse it to avoid any issues with
-        // multiple stdin() calls
+        // Socket stays blocking — poll() determines readiness, then blocking
+        // read/write completes immediately. This avoids partial-read/write bugs
+        // that occur with non-blocking read_exact/write_all.
         let mut stdin_handle = stdin();
         let stdin_fd = stdin_handle.as_raw_fd();
         let socket_fd = self.stream.as_raw_fd();
@@ -821,128 +827,63 @@ impl AgentClient {
         let mut stdin_eof = false;
 
         let exit_code = loop {
-            // Poll stdin (unless EOF) and socket with 100ms timeout
-            // Use -1 for stdin_fd when EOF to stop polling it
             let effective_stdin_fd = if stdin_eof { -1 } else { stdin_fd };
             let poll_result = poll_io(effective_stdin_fd, socket_fd, 100)
                 .map_err(|e| Error::agent("poll", e.to_string()))?;
 
-            // Handle stdin input - send to agent
+            // Check for terminal resize (SIGWINCH)
+            if tty && check_sigwinch() {
+                if let Some((cols, rows)) = get_terminal_size() {
+                    self.send(&AgentRequest::Resize { cols, rows })?;
+                }
+            }
+
+            // Handle socket data FIRST — drain agent output before writing stdin
+            // to prevent deadlock when send buffer is full
+            if poll_result.socket_ready {
+                match self.receive() {
+                    Ok(AgentResponse::Stdout { data }) => {
+                        stdout().write_all(&data)?;
+                        stdout().flush()?;
+                    }
+                    Ok(AgentResponse::Stderr { data }) => {
+                        stderr().write_all(&data)?;
+                        stderr().flush()?;
+                    }
+                    Ok(AgentResponse::Exited { exit_code }) => {
+                        break exit_code;
+                    }
+                    Ok(AgentResponse::Error { message, .. }) => {
+                        return Err(Error::agent("vm exec interactive", message));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
+            }
+
+            // Handle stdin input — send to agent
             if poll_result.stdin_ready && !stdin_eof {
                 match stdin_handle.read(&mut stdin_buf) {
                     Ok(0) => {
-                        // EOF on stdin - send empty stdin to signal EOF, then stop reading
                         stdin_eof = true;
-                        self.send_nonblocking(&AgentRequest::Stdin { data: Vec::new() })?;
+                        self.send(&AgentRequest::Stdin { data: Vec::new() })?;
                     }
                     Ok(n) => {
-                        self.send_nonblocking(&AgentRequest::Stdin {
+                        self.send(&AgentRequest::Stdin {
                             data: stdin_buf[..n].to_vec(),
                         })?;
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // No data available, continue
-                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => {
                         tracing::warn!(error = %e, "error reading stdin");
                     }
                 }
             }
-
-            // Handle socket data - receive and display
-            if poll_result.socket_ready {
-                match self.try_receive() {
-                    Ok(Some(AgentResponse::Stdout { data })) => {
-                        stdout().write_all(&data)?;
-                        stdout().flush()?;
-                    }
-                    Ok(Some(AgentResponse::Stderr { data })) => {
-                        stderr().write_all(&data)?;
-                        stderr().flush()?;
-                    }
-                    Ok(Some(AgentResponse::Exited { exit_code })) => {
-                        break exit_code;
-                    }
-                    Ok(Some(AgentResponse::Error { message, .. })) => {
-                        let _ = self.stream.set_nonblocking(false);
-                        return Err(Error::agent("vm exec interactive", message));
-                    }
-                    Ok(Some(_)) => {
-                        // Unexpected response, ignore
-                    }
-                    Ok(None) => {
-                        // No complete message yet, continue
-                    }
-                    Err(e) => {
-                        let _ = self.stream.set_nonblocking(false);
-                        return Err(e);
-                    }
-                }
-            }
         };
 
-        // Restore blocking mode
-        let _ = self.stream.set_nonblocking(false);
-
         Ok(exit_code)
-    }
-
-    /// Send a request in non-blocking mode.
-    ///
-    /// Used during interactive sessions where we can't block on writes.
-    fn send_nonblocking(&mut self, request: &AgentRequest) -> Result<()> {
-        let data =
-            encode_message(request).map_err(|e| Error::agent("encode message", e.to_string()))?;
-
-        // Try to write, ignoring WouldBlock
-        match self.stream.write_all(&data) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Buffer is full, drop this input (user can re-type)
-                tracing::warn!("write buffer full, dropping stdin data");
-                Ok(())
-            }
-            Err(e) => Err(Error::agent("send message", e.to_string())),
-        }
-    }
-
-    /// Try to receive a response without blocking.
-    ///
-    /// Returns Ok(None) if no complete message is available yet.
-    fn try_receive(&mut self) -> Result<Option<AgentResponse>> {
-        // Read length prefix (4 bytes)
-        let mut len_buf = [0u8; 4];
-        match self.stream.read_exact(&mut len_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                return Ok(None);
-            }
-            Err(e) => {
-                return Err(Error::agent("read header", e.to_string()));
-            }
-        }
-
-        let len = u32::from_be_bytes(len_buf) as usize;
-        if len > MAX_FRAME_SIZE as usize {
-            return Err(Error::agent(
-                "read payload",
-                format!("frame too large: {} bytes (max {})", len, MAX_FRAME_SIZE),
-            ));
-        }
-
-        // Read payload - once we have the length, we must read the full message
-        // Set blocking temporarily for the payload read
-        let _ = self.stream.set_nonblocking(false);
-        let mut payload = vec![0u8; len];
-        self.stream
-            .read_exact(&mut payload)
-            .map_err(|e| Error::agent("read payload", e.to_string()))?;
-        let _ = self.stream.set_nonblocking(true);
-
-        let response: AgentResponse = serde_json::from_slice(&payload)
-            .map_err(|e| Error::agent("parse response", e.to_string()))?;
-
-        Ok(Some(response))
     }
 
     /// Run a command in an image's rootfs.
@@ -1062,11 +1003,13 @@ impl AgentClient {
     ///
     /// The exit code of the command
     pub fn run_interactive(&mut self, config: RunConfig) -> Result<i32> {
-        use crate::agent::terminal::{poll_io, stdin_is_tty, NonBlockingStdin, RawModeGuard};
+        use crate::agent::terminal::{
+            check_sigwinch, get_terminal_size, install_sigwinch_handler, poll_io, stdin_is_tty,
+            NonBlockingStdin, RawModeGuard,
+        };
         use std::io::{stderr, stdin, stdout, Read, Write};
         use std::os::unix::io::AsRawFd;
 
-        // Convert timeout to milliseconds for protocol
         let timeout_ms = config.timeout.map(|t| t.as_millis() as u64);
         let tty = config.tty;
 
@@ -1101,16 +1044,19 @@ impl AgentClient {
             None
         };
 
+        // Send initial terminal size and install resize handler
+        if tty {
+            if let Some((cols, rows)) = get_terminal_size() {
+                self.send(&AgentRequest::Resize { cols, rows })?;
+            }
+            install_sigwinch_handler();
+        }
+
         // Set stdin to non-blocking
         let _nonblock_stdin = NonBlockingStdin::new()
             .map_err(|e| Error::agent("set stdin nonblocking", e.to_string()))?;
 
-        // Set socket to non-blocking for poll-based I/O
-        self.stream
-            .set_nonblocking(true)
-            .map_err(|e| Error::agent("set nonblocking", e.to_string()))?;
-
-        // Bidirectional I/O loop using poll
+        // Socket stays blocking — poll() determines readiness
         let mut stdin_handle = stdin();
         let stdin_fd = stdin_handle.as_raw_fd();
         let socket_fd = self.stream.as_raw_fd();
@@ -1122,15 +1068,46 @@ impl AgentClient {
             let poll_result = poll_io(effective_stdin_fd, socket_fd, 100)
                 .map_err(|e| Error::agent("poll", e.to_string()))?;
 
+            // Check for terminal resize
+            if tty && check_sigwinch() {
+                if let Some((cols, rows)) = get_terminal_size() {
+                    self.send(&AgentRequest::Resize { cols, rows })?;
+                }
+            }
+
+            // Handle socket data FIRST
+            if poll_result.socket_ready {
+                match self.receive() {
+                    Ok(AgentResponse::Stdout { data }) => {
+                        stdout().write_all(&data)?;
+                        stdout().flush()?;
+                    }
+                    Ok(AgentResponse::Stderr { data }) => {
+                        stderr().write_all(&data)?;
+                        stderr().flush()?;
+                    }
+                    Ok(AgentResponse::Exited { exit_code }) => {
+                        break exit_code;
+                    }
+                    Ok(AgentResponse::Error { message, .. }) => {
+                        return Err(Error::agent("run interactive", message));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
+            }
+
             // Handle stdin input
             if poll_result.stdin_ready && !stdin_eof {
                 match stdin_handle.read(&mut stdin_buf) {
                     Ok(0) => {
                         stdin_eof = true;
-                        self.send_nonblocking(&AgentRequest::Stdin { data: Vec::new() })?;
+                        self.send(&AgentRequest::Stdin { data: Vec::new() })?;
                     }
                     Ok(n) => {
-                        self.send_nonblocking(&AgentRequest::Stdin {
+                        self.send(&AgentRequest::Stdin {
                             data: stdin_buf[..n].to_vec(),
                         })?;
                     }
@@ -1140,38 +1117,8 @@ impl AgentClient {
                     }
                 }
             }
-
-            // Handle socket data
-            if poll_result.socket_ready {
-                match self.try_receive() {
-                    Ok(Some(AgentResponse::Stdout { data })) => {
-                        stdout().write_all(&data)?;
-                        stdout().flush()?;
-                    }
-                    Ok(Some(AgentResponse::Stderr { data })) => {
-                        stderr().write_all(&data)?;
-                        stderr().flush()?;
-                    }
-                    Ok(Some(AgentResponse::Exited { exit_code })) => {
-                        break exit_code;
-                    }
-                    Ok(Some(AgentResponse::Error { message, .. })) => {
-                        let _ = self.stream.set_nonblocking(false);
-                        return Err(Error::agent("run interactive", message));
-                    }
-                    Ok(Some(_)) => {
-                        tracing::warn!("unexpected response during interactive session");
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        let _ = self.stream.set_nonblocking(false);
-                        return Err(e);
-                    }
-                }
-            }
         };
 
-        let _ = self.stream.set_nonblocking(false);
         Ok(exit_code)
     }
 
@@ -1376,7 +1323,10 @@ impl AgentClient {
         timeout: Option<Duration>,
         tty: bool,
     ) -> Result<i32> {
-        use crate::agent::terminal::{poll_io, stdin_is_tty, NonBlockingStdin, RawModeGuard};
+        use crate::agent::terminal::{
+            check_sigwinch, get_terminal_size, install_sigwinch_handler, poll_io, stdin_is_tty,
+            NonBlockingStdin, RawModeGuard,
+        };
         use std::io::{stderr, stdin, stdout, Read, Write};
         use std::os::unix::io::AsRawFd;
 
@@ -1415,16 +1365,19 @@ impl AgentClient {
             None
         };
 
+        // Send initial terminal size and install resize handler
+        if tty {
+            if let Some((cols, rows)) = get_terminal_size() {
+                self.send(&AgentRequest::Resize { cols, rows })?;
+            }
+            install_sigwinch_handler();
+        }
+
         // Set stdin to non-blocking
         let _nonblock_stdin = NonBlockingStdin::new()
             .map_err(|e| Error::agent("set stdin nonblocking", e.to_string()))?;
 
-        // Set socket to non-blocking for poll-based I/O
-        self.stream
-            .set_nonblocking(true)
-            .map_err(|e| Error::agent("set nonblocking", e.to_string()))?;
-
-        // Bidirectional I/O loop using poll
+        // Socket stays blocking — poll() determines readiness
         let mut stdin_handle = stdin();
         let stdin_fd = stdin_handle.as_raw_fd();
         let socket_fd = self.stream.as_raw_fd();
@@ -1436,15 +1389,46 @@ impl AgentClient {
             let poll_result = poll_io(effective_stdin_fd, socket_fd, 100)
                 .map_err(|e| Error::agent("poll", e.to_string()))?;
 
+            // Check for terminal resize
+            if tty && check_sigwinch() {
+                if let Some((cols, rows)) = get_terminal_size() {
+                    self.send(&AgentRequest::Resize { cols, rows })?;
+                }
+            }
+
+            // Handle socket data FIRST
+            if poll_result.socket_ready {
+                match self.receive() {
+                    Ok(AgentResponse::Stdout { data }) => {
+                        stdout().write_all(&data)?;
+                        stdout().flush()?;
+                    }
+                    Ok(AgentResponse::Stderr { data }) => {
+                        stderr().write_all(&data)?;
+                        stderr().flush()?;
+                    }
+                    Ok(AgentResponse::Exited { exit_code }) => {
+                        break exit_code;
+                    }
+                    Ok(AgentResponse::Error { message, .. }) => {
+                        return Err(Error::agent("exec interactive", message));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
+            }
+
             // Handle stdin input
             if poll_result.stdin_ready && !stdin_eof {
                 match stdin_handle.read(&mut stdin_buf) {
                     Ok(0) => {
                         stdin_eof = true;
-                        self.send_nonblocking(&AgentRequest::Stdin { data: Vec::new() })?;
+                        self.send(&AgentRequest::Stdin { data: Vec::new() })?;
                     }
                     Ok(n) => {
-                        self.send_nonblocking(&AgentRequest::Stdin {
+                        self.send(&AgentRequest::Stdin {
                             data: stdin_buf[..n].to_vec(),
                         })?;
                     }
@@ -1454,38 +1438,8 @@ impl AgentClient {
                     }
                 }
             }
-
-            // Handle socket data
-            if poll_result.socket_ready {
-                match self.try_receive() {
-                    Ok(Some(AgentResponse::Stdout { data })) => {
-                        stdout().write_all(&data)?;
-                        stdout().flush()?;
-                    }
-                    Ok(Some(AgentResponse::Stderr { data })) => {
-                        stderr().write_all(&data)?;
-                        stderr().flush()?;
-                    }
-                    Ok(Some(AgentResponse::Exited { exit_code })) => {
-                        break exit_code;
-                    }
-                    Ok(Some(AgentResponse::Error { message, .. })) => {
-                        let _ = self.stream.set_nonblocking(false);
-                        return Err(Error::agent("exec interactive", message));
-                    }
-                    Ok(Some(_)) => {
-                        tracing::warn!("unexpected response during interactive session");
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        let _ = self.stream.set_nonblocking(false);
-                        return Err(e);
-                    }
-                }
-            }
         };
 
-        let _ = self.stream.set_nonblocking(false);
         Ok(exit_code)
     }
 

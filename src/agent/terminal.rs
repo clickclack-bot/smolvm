@@ -5,6 +5,31 @@
 
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Atomic flag set by the SIGWINCH signal handler.
+static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
+
+/// Install a SIGWINCH handler that sets an atomic flag.
+///
+/// Call this before entering an interactive loop that needs resize detection.
+/// The handler is process-global; re-installing is safe and idempotent.
+pub fn install_sigwinch_handler() {
+    extern "C" fn handler(_: libc::c_int) {
+        SIGWINCH_RECEIVED.store(true, Ordering::Relaxed);
+    }
+    // SAFETY: handler only touches an atomic — async-signal-safe.
+    unsafe {
+        libc::signal(libc::SIGWINCH, handler as *const () as libc::sighandler_t);
+    }
+}
+
+/// Check and clear the SIGWINCH flag.
+///
+/// Returns `true` if a terminal resize occurred since the last check.
+pub fn check_sigwinch() -> bool {
+    SIGWINCH_RECEIVED.swap(false, Ordering::Relaxed)
+}
 
 /// RAII guard for terminal raw mode.
 ///

@@ -938,9 +938,10 @@ fn run_interactive_loop(
             None => INTERACTIVE_POLL_TIMEOUT_MS,
         };
 
-        // Build poll fds array for stdout and stderr
+        // Build poll fds array for stdout, stderr, and vsock stream
         let stdout_fd = child_stdout.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1);
         let stderr_fd = child_stderr.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1);
+        let stream_fd = stream.as_raw_fd();
 
         let mut poll_fds = [
             libc::pollfd {
@@ -953,90 +954,89 @@ fn run_interactive_loop(
                 events: if stderr_fd >= 0 { libc::POLLIN } else { 0 },
                 revents: 0,
             },
+            libc::pollfd {
+                fd: stream_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
 
         // Wait for I/O or timeout using poll()
-        let nfds = if stdout_fd >= 0 && stderr_fd >= 0 {
-            2
-        } else if stdout_fd >= 0 || stderr_fd >= 0 {
-            // Only one fd is valid, adjust nfds
-            if stdout_fd >= 0 {
-                1
-            } else {
-                2
-            }
-        } else {
-            0
-        };
+        let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), 3, poll_timeout_ms) };
 
-        if nfds > 0 {
-            let poll_result =
-                unsafe { libc::poll(poll_fds.as_mut_ptr(), nfds as libc::nfds_t, poll_timeout_ms) };
-
-            if poll_result < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() != std::io::ErrorKind::Interrupted {
-                    debug!(error = %err, "poll error");
-                }
-                // On EINTR, just continue the loop
-                continue;
+        if poll_result < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                debug!(error = %err, "poll error");
             }
-        } else {
-            // No fds to poll, just sleep briefly to avoid busy-loop
-            std::thread::sleep(Duration::from_millis(poll_timeout_ms as u64));
+            continue;
         }
 
-        // Read available stdout if poll indicated data ready (or always try in non-blocking mode)
-        if let Some(ref mut stdout) = child_stdout {
-            loop {
-                match stdout.read(&mut stdout_buf) {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        send_response(
-                            stream,
-                            &AgentResponse::Stdout {
-                                data: stdout_buf[..n].to_vec(),
-                            },
-                        )?;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        debug!(error = %e, "stdout read error");
-                        break;
+        // Read available stdout
+        if poll_fds[0].revents & libc::POLLIN != 0 {
+            if let Some(ref mut stdout) = child_stdout {
+                loop {
+                    match stdout.read(&mut stdout_buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            send_response(
+                                stream,
+                                &AgentResponse::Stdout {
+                                    data: stdout_buf[..n].to_vec(),
+                                },
+                            )?;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            debug!(error = %e, "stdout read error");
+                            break;
+                        }
                     }
                 }
             }
         }
 
         // Read available stderr
-        if let Some(ref mut stderr) = child_stderr {
-            loop {
-                match stderr.read(&mut stderr_buf) {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        send_response(
-                            stream,
-                            &AgentResponse::Stderr {
-                                data: stderr_buf[..n].to_vec(),
-                            },
-                        )?;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        debug!(error = %e, "stderr read error");
-                        break;
+        if poll_fds[1].revents & libc::POLLIN != 0 {
+            if let Some(ref mut stderr) = child_stderr {
+                loop {
+                    match stderr.read(&mut stderr_buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            send_response(
+                                stream,
+                                &AgentResponse::Stderr {
+                                    data: stderr_buf[..n].to_vec(),
+                                },
+                            )?;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            debug!(error = %e, "stderr read error");
+                            break;
+                        }
                     }
                 }
             }
         }
 
-        // Check for incoming stdin data (non-blocking read from vsock)
-        // Try to read a request (with timeout)
-        if let Some(request) = try_read_request(stream)? {
+        // Read incoming request from host (stdin data, resize) — only when
+        // poll confirms data is available, then use blocking read_exact which
+        // is safe because the data is already in the kernel buffer.
+        if poll_fds[2].revents & libc::POLLIN != 0 {
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header)?;
+            let len = u32::from_be_bytes(header) as usize;
+            if len > MAX_MESSAGE_SIZE {
+                return Err(format!("message too large: {} bytes", len).into());
+            }
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf)?;
+            let request: AgentRequest = serde_json::from_slice(&buf)?;
+
             match request {
                 AgentRequest::Stdin { data } => {
                     if data.is_empty() {
-                        // Empty data signals EOF - close child's stdin
                         drop(child_stdin.take());
                     } else if let Some(ref mut stdin) = child_stdin {
                         let _ = stdin.write_all(&data);
@@ -1044,8 +1044,7 @@ fn run_interactive_loop(
                     }
                 }
                 AgentRequest::Resize { cols, rows } => {
-                    // TODO: Implement PTY resize using TIOCSWINSZ
-                    debug!(cols, rows, "resize requested (not implemented)");
+                    debug!(cols, rows, "resize requested (no PTY in pipe mode)");
                 }
                 _ => {
                     warn!("unexpected request during interactive session");
@@ -1131,13 +1130,22 @@ fn run_interactive_loop_pty(
             None => INTERACTIVE_POLL_TIMEOUT_MS,
         };
 
-        let mut poll_fds = [libc::pollfd {
-            fd: pty_master.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        }];
+        // Poll PTY master and vsock stream for readable data.
+        let stream_fd = stream.as_raw_fd();
+        let mut poll_fds = [
+            libc::pollfd {
+                fd: pty_master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stream_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
 
-        let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), 1, poll_timeout_ms) };
+        let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, poll_timeout_ms) };
 
         if poll_result < 0 {
             let err = std::io::Error::last_os_error();
@@ -1173,8 +1181,19 @@ fn run_interactive_loop_pty(
             }
         }
 
-        // Check for incoming requests from the host (stdin data, resize).
-        if let Some(request) = try_read_request(stream)? {
+        // Read incoming request from host — only when poll confirms data
+        // is available, then use blocking read_exact (safe, data is buffered).
+        if poll_fds[1].revents & libc::POLLIN != 0 {
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header)?;
+            let len = u32::from_be_bytes(header) as usize;
+            if len > MAX_MESSAGE_SIZE {
+                return Err(format!("message too large: {} bytes", len).into());
+            }
+            let mut msg_buf = vec![0u8; len];
+            stream.read_exact(&mut msg_buf)?;
+            let request: AgentRequest = serde_json::from_slice(&msg_buf)?;
+
             match request {
                 AgentRequest::Stdin { data } => {
                     // For PTY, empty stdin is not EOF (Ctrl+D is a byte).
@@ -1240,61 +1259,6 @@ fn drain_remaining_output(
         }
     }
     Ok(())
-}
-
-/// Try to read a request with a very short timeout.
-fn try_read_request(
-    stream: &mut impl ReadWrite,
-) -> Result<Option<AgentRequest>, Box<dyn std::error::Error>> {
-    let fd = stream.as_raw_fd();
-
-    // Set non-blocking mode
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let was_blocking = (flags & libc::O_NONBLOCK) == 0;
-
-    if was_blocking {
-        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    }
-
-    // Try to read length header (4 bytes)
-    let mut len_buf = [0u8; 4];
-    let result = match stream.read_exact(&mut len_buf) {
-        Ok(()) => {
-            let len = u32::from_be_bytes(len_buf) as usize;
-            if len > MAX_MESSAGE_SIZE {
-                return Err(format!("message too large: {} bytes", len).into());
-            }
-
-            // We have the length - must read the full payload now
-            // Restore blocking mode for the payload read
-            if was_blocking {
-                unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
-            }
-
-            let mut buf = vec![0u8; len];
-            stream.read_exact(&mut buf)?;
-
-            let request: AgentRequest = serde_json::from_slice(&buf)?;
-            Ok(Some(request))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            // No data available
-            Ok(None)
-        }
-        Err(e) => Err(e.into()),
-    };
-
-    // Restore blocking mode if we changed it
-    if was_blocking {
-        unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
-    }
-
-    result
 }
 
 /// Set a file descriptor to non-blocking mode.
