@@ -8,6 +8,7 @@ pub mod pack;
 pub mod parsers;
 pub mod sandbox;
 pub mod serve;
+pub mod vm_common;
 
 use std::io::Write;
 

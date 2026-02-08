@@ -1,0 +1,492 @@
+//! Shared helpers for microvm and sandbox CLI commands.
+//!
+//! Both `microvm` and `sandbox` expose the same lifecycle commands
+//! (create, start, stop, delete, ls) with only cosmetic differences.
+//! This module provides the common implementations, parameterised by
+//! [`VmKind`].
+
+use crate::cli::parsers::parse_mounts_as_tuples;
+use crate::cli::{format_pid_suffix, truncate};
+use smolvm::agent::{AgentManager, HostMount, PortMapping, VmResources};
+use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
+use std::path::PathBuf;
+
+// ============================================================================
+// VmKind
+// ============================================================================
+
+/// Distinguishes microvm vs sandbox for display strings and minor
+/// behavioural differences.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VmKind {
+    Microvm,
+    Sandbox,
+}
+
+impl VmKind {
+    /// Lowercase label used in user-facing messages ("microvm" / "sandbox").
+    pub fn label(self) -> &'static str {
+        match self {
+            VmKind::Microvm => "microvm",
+            VmKind::Sandbox => "sandbox",
+        }
+    }
+
+    /// Title-case label ("MicroVM" / "Sandbox").
+    pub fn display_name(self) -> &'static str {
+        match self {
+            VmKind::Microvm => "MicroVM",
+            VmKind::Sandbox => "Sandbox",
+        }
+    }
+
+    /// CLI prefix for help text ("smolvm microvm" / "smolvm sandbox").
+    pub fn cli_prefix(self) -> &'static str {
+        match self {
+            VmKind::Microvm => "smolvm microvm",
+            VmKind::Sandbox => "smolvm sandbox",
+        }
+    }
+
+    /// Whether the JSON list output should include the `network` field.
+    pub fn include_network_in_json(self) -> bool {
+        matches!(self, VmKind::Sandbox)
+    }
+}
+
+// ============================================================================
+// Shared helpers
+// ============================================================================
+
+/// Get the agent manager for an optional name (default if `None`).
+pub fn get_vm_manager(name: &Option<String>) -> smolvm::Result<AgentManager> {
+    if let Some(name) = name {
+        AgentManager::for_vm(name)
+    } else {
+        AgentManager::new_default()
+    }
+}
+
+/// Return the display label for an optional VM name.
+pub fn vm_label(name: &Option<String>) -> String {
+    name.as_deref().unwrap_or("default").to_string()
+}
+
+// ============================================================================
+// Create
+// ============================================================================
+
+/// Parameters for [`create_vm`].
+pub struct CreateVmParams {
+    pub name: String,
+    pub cpus: u8,
+    pub mem: u32,
+    pub volume: Vec<String>,
+    pub port: Vec<PortMapping>,
+    pub net: bool,
+}
+
+/// Create a named VM/sandbox configuration (does not start it).
+pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
+    let mut config = SmolvmConfig::load()?;
+
+    // Check if already exists
+    if config.get_vm(&params.name).is_some() {
+        return Err(smolvm::Error::config(
+            format!("create {}", kind.label()),
+            format!("{} '{}' already exists", kind.label(), params.name),
+        ));
+    }
+
+    // Parse and validate volume mounts
+    let mounts = parse_mounts_as_tuples(&params.volume)?;
+
+    // Convert port mappings to tuple format for storage
+    let ports: Vec<(u16, u16)> = params.port.iter().map(|p| (p.host, p.guest)).collect();
+
+    // Create record
+    let record = VmRecord::new(
+        params.name.clone(),
+        params.cpus,
+        params.mem,
+        mounts,
+        ports,
+        params.net,
+    );
+
+    // Store in config (persisted immediately to database)
+    config.insert_vm(params.name.clone(), record)?;
+
+    println!("Created {}: {}", kind.label(), params.name);
+    println!("  CPUs: {}, Memory: {} MiB", params.cpus, params.mem);
+    if !params.volume.is_empty() {
+        println!("  Mounts: {}", params.volume.len());
+    }
+    if !params.port.is_empty() {
+        println!("  Ports: {}", params.port.len());
+    }
+    println!(
+        "\nUse '{} start {}' to start the {}",
+        kind.cli_prefix(),
+        params.name,
+        kind.label(),
+    );
+    println!(
+        "Then use 'smolvm container create {}' to run containers",
+        params.name,
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// Start
+// ============================================================================
+
+/// Start a named VM/sandbox that has a config record.
+pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
+    use smolvm::Error;
+
+    let mut config = SmolvmConfig::load()?;
+
+    // Get record
+    let record = config
+        .get_vm(name)
+        .ok_or_else(|| Error::vm_not_found(name))?
+        .clone();
+
+    // Check state
+    let actual_state = record.actual_state();
+    if actual_state == RecordState::Running {
+        let pid_suffix = format_pid_suffix(record.pid);
+        println!(
+            "{} '{}' already running{}",
+            kind.display_name(),
+            name,
+            pid_suffix
+        );
+        return Ok(());
+    }
+
+    // Convert stored mounts to HostMount
+    let mounts: Vec<HostMount> = record
+        .mounts
+        .iter()
+        .map(|(host, guest, ro)| HostMount {
+            source: PathBuf::from(host),
+            target: PathBuf::from(guest),
+            read_only: *ro,
+        })
+        .collect();
+
+    // Convert stored ports to PortMapping
+    let ports: Vec<PortMapping> = record
+        .ports
+        .iter()
+        .map(|(host, guest)| PortMapping::new(*host, *guest))
+        .collect();
+
+    let resources = VmResources {
+        cpus: record.cpus,
+        mem: record.mem,
+        network: record.network,
+    };
+
+    // Start agent VM
+    let manager = AgentManager::for_vm(name)
+        .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
+
+    let mount_info = if !mounts.is_empty() {
+        format!(" with {} mount(s)", mounts.len())
+    } else {
+        String::new()
+    };
+    let port_info = if !ports.is_empty() {
+        format!(" and {} port mapping(s)", ports.len())
+    } else {
+        String::new()
+    };
+    println!(
+        "Starting {} '{}'{}{}...",
+        kind.label(),
+        name,
+        mount_info,
+        port_info
+    );
+
+    manager
+        .ensure_running_with_full_config(mounts, ports, resources)
+        .map_err(|e| Error::agent(format!("start {}", kind.label()), e.to_string()))?;
+
+    // Update state
+    let pid = manager.child_pid();
+    config.update_vm(name, |r| {
+        r.state = RecordState::Running;
+        r.pid = pid;
+    });
+    config.save()?;
+
+    println!(
+        "{} '{}' running (PID: {})",
+        kind.display_name(),
+        name,
+        pid.unwrap_or(0)
+    );
+    println!(
+        "\nUse 'smolvm container create {} <image>' to run containers",
+        name,
+    );
+
+    // Keep VM running (persistent)
+    manager.detach();
+    Ok(())
+}
+
+/// Start the default anonymous VM/sandbox.
+pub fn start_vm_anonymous(kind: VmKind) -> smolvm::Result<()> {
+    let manager = AgentManager::new_default()?;
+
+    if manager.try_connect_existing().is_some() {
+        let pid_suffix = format_pid_suffix(manager.child_pid());
+        println!(
+            "{} 'default' already running{}",
+            kind.display_name(),
+            pid_suffix
+        );
+        manager.detach();
+        return Ok(());
+    }
+
+    println!("Starting {} 'default'...", kind.label());
+    manager.ensure_running()?;
+
+    let pid = manager.child_pid().unwrap_or(0);
+    println!("{} 'default' running (PID: {})", kind.display_name(), pid);
+
+    manager.detach();
+    Ok(())
+}
+
+// ============================================================================
+// Stop
+// ============================================================================
+
+/// Stop a named VM/sandbox that has a config record (or fall back to
+/// agent-only stop if the name is not in config).
+pub fn stop_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
+    let mut config = SmolvmConfig::load()?;
+
+    // Check config for the named VM
+    let record = match config.get_vm(name) {
+        Some(r) => r.clone(),
+        None => {
+            // Not in config — try to stop a running VM with this name directly
+            let manager = AgentManager::for_vm(name)?;
+            if manager.try_connect_existing().is_some() {
+                println!("Stopping {} '{}'...", kind.label(), name);
+                manager.stop()?;
+                println!("{} '{}' stopped", kind.display_name(), name);
+            } else {
+                println!(
+                    "{} '{}' not found or not running",
+                    kind.display_name(),
+                    name
+                );
+            }
+            return Ok(());
+        }
+    };
+
+    let actual_state = record.actual_state();
+    if actual_state != RecordState::Running {
+        println!(
+            "{} '{}' is not running (state: {})",
+            kind.display_name(),
+            name,
+            actual_state,
+        );
+        return Ok(());
+    }
+
+    println!("Stopping {} '{}'...", kind.label(), name);
+
+    if let Ok(manager) = AgentManager::for_vm(name) {
+        if let Err(e) = manager.stop() {
+            tracing::warn!(error = %e, "failed to stop {}", kind.label());
+        }
+    }
+
+    config.update_vm(name, |r| {
+        r.state = RecordState::Stopped;
+        r.pid = None;
+    });
+    config.save()?;
+
+    println!("Stopped {}: {}", kind.label(), name);
+    Ok(())
+}
+
+/// Stop the default anonymous VM/sandbox.
+pub fn stop_vm_anonymous(kind: VmKind) -> smolvm::Result<()> {
+    let manager = AgentManager::new_default()?;
+
+    // try_connect_existing sets internal state if agent is reachable;
+    // stop() handles both responsive agents and orphans via PID file.
+    manager.try_connect_existing();
+    println!("Stopping {} 'default'...", kind.label());
+    manager.stop()?;
+    println!("{} 'default' stopped", kind.display_name());
+
+    Ok(())
+}
+
+// ============================================================================
+// Delete
+// ============================================================================
+
+/// Options that vary between microvm and sandbox delete.
+pub struct DeleteVmOptions {
+    /// If true, stop the VM before deleting when it is running.
+    pub stop_if_running: bool,
+}
+
+/// Delete a named VM/sandbox configuration.
+pub fn delete_vm(
+    kind: VmKind,
+    name: &str,
+    force: bool,
+    options: DeleteVmOptions,
+) -> smolvm::Result<()> {
+    let mut config = SmolvmConfig::load()?;
+
+    // Check if exists
+    let record = config
+        .get_vm(name)
+        .ok_or_else(|| smolvm::Error::vm_not_found(name))?
+        .clone();
+
+    // Stop if running (sandbox does this, microvm does not)
+    if options.stop_if_running && record.actual_state() == RecordState::Running {
+        if let Ok(manager) = AgentManager::for_vm(name) {
+            println!("Stopping {} '{}'...", kind.label(), name);
+            if let Err(e) = manager.stop() {
+                tracing::warn!(error = %e, "failed to stop {}", kind.label());
+            }
+        }
+    }
+
+    // Confirm deletion unless --force
+    if !force {
+        eprint!("Delete {} '{}'? [y/N] ", kind.label(), name);
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_ok() {
+            let input = input.trim().to_lowercase();
+            if input != "y" && input != "yes" {
+                println!("Cancelled");
+                return Ok(());
+            }
+        } else {
+            println!("Cancelled");
+            return Ok(());
+        }
+    }
+
+    // Remove from config
+    config.remove_vm(name);
+    config.save()?;
+
+    println!("Deleted {}: {}", kind.label(), name);
+    Ok(())
+}
+
+// ============================================================================
+// List
+// ============================================================================
+
+/// List all VMs/sandboxes.
+pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
+    let config = SmolvmConfig::load()?;
+    let vms: Vec<_> = config.list_vms().collect();
+
+    let empty_label = match kind {
+        VmKind::Microvm => "No VMs found",
+        VmKind::Sandbox => "No sandboxes found",
+    };
+
+    if vms.is_empty() {
+        if !json {
+            println!("{}", empty_label);
+        } else {
+            println!("[]");
+        }
+        return Ok(());
+    }
+
+    if json {
+        let json_vms: Vec<_> = vms
+            .iter()
+            .map(|(name, record)| {
+                let actual_state = record.actual_state();
+                let mut obj = serde_json::json!({
+                    "name": name,
+                    "state": actual_state.to_string(),
+                    "cpus": record.cpus,
+                    "memory_mib": record.mem,
+                    "pid": record.pid,
+                    "mounts": record.mounts.len(),
+                    "ports": record.ports.len(),
+                    "created_at": record.created_at,
+                });
+                if kind.include_network_in_json() {
+                    obj.as_object_mut()
+                        .unwrap()
+                        .insert("network".into(), serde_json::json!(record.network));
+                }
+                obj
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json_vms).expect("JSON serialization failed")
+        );
+    } else {
+        println!(
+            "{:<20} {:<10} {:<5} {:<8} {:<6} {:<6}",
+            "NAME", "STATE", "CPUS", "MEMORY", "MOUNTS", "PORTS"
+        );
+        println!("{}", "-".repeat(60));
+
+        for (name, record) in vms {
+            let actual_state = record.actual_state();
+            println!(
+                "{:<20} {:<10} {:<5} {:<8} {:<6} {:<6}",
+                truncate(name, 18),
+                actual_state,
+                record.cpus,
+                format!("{} MiB", record.mem),
+                record.mounts.len(),
+                record.ports.len(),
+            );
+
+            if verbose {
+                if let Some(pid) = record.pid {
+                    println!("  PID: {}", pid);
+                }
+                for (host, guest, ro) in &record.mounts {
+                    let ro_str = if *ro { " (ro)" } else { "" };
+                    println!("  Mount: {} -> {}{}", host, guest, ro_str);
+                }
+                for (host, guest) in &record.ports {
+                    println!("  Port: {} -> {}", host, guest);
+                }
+                if kind.include_network_in_json() && record.network {
+                    println!("  Network: enabled");
+                }
+                println!("  Created: {}", record.created_at);
+                println!();
+            }
+        }
+    }
+
+    Ok(())
+}

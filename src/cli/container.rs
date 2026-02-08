@@ -169,7 +169,7 @@ impl ContainerCreateCmd {
         println!("  State: {}", info.state);
 
         // Keep microvm running
-        std::mem::forget(manager);
+        manager.detach();
 
         Ok(())
     }
@@ -202,7 +202,7 @@ impl ContainerStartCmd {
         println!("Started container: {}", self.container_id);
 
         // Keep microvm running
-        std::mem::forget(manager);
+        manager.detach();
 
         Ok(())
     }
@@ -240,7 +240,7 @@ impl ContainerStopCmd {
         println!("Stopped container: {}", self.container_id);
 
         // Keep microvm running
-        std::mem::forget(manager);
+        manager.detach();
 
         Ok(())
     }
@@ -277,7 +277,7 @@ impl ContainerRemoveCmd {
         println!("Removed container: {}", self.container_id);
 
         // Keep microvm running
-        std::mem::forget(manager);
+        manager.detach();
 
         Ok(())
     }
@@ -359,7 +359,7 @@ impl ContainerListCmd {
         }
 
         // Keep microvm running
-        std::mem::forget(manager);
+        manager.detach();
 
         Ok(())
     }
@@ -438,7 +438,7 @@ impl ContainerExecCmd {
         flush_output();
 
         // Keep microvm running
-        std::mem::forget(manager);
+        manager.detach();
 
         std::process::exit(exit_code);
     }

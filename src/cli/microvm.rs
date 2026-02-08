@@ -9,13 +9,14 @@
 //! - status: Show microvm status
 //! - ls: List all named VMs
 
-use crate::cli::parsers::{parse_duration, parse_env_spec, parse_mounts_as_tuples, parse_port};
-use crate::cli::{flush_output, format_pid_suffix, truncate};
+use crate::cli::parsers::{parse_duration, parse_env_spec, parse_port};
+use crate::cli::vm_common::{self, CreateVmParams, DeleteVmOptions, VmKind};
+use crate::cli::{flush_output, format_pid_suffix};
 use clap::{Args, Subcommand};
-use smolvm::agent::{AgentClient, AgentManager, HostMount, PortMapping, VmResources};
-use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
-use std::path::PathBuf;
+use smolvm::agent::{AgentClient, PortMapping};
 use std::time::Duration;
+
+const KIND: VmKind = VmKind::Microvm;
 
 /// Manage persistent microVMs
 #[derive(Subcommand, Debug)]
@@ -109,8 +110,8 @@ pub struct ExecCmd {
 
 impl ExecCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = get_manager(&self.name)?;
-        let label = microvm_label(&self.name);
+        let manager = vm_common::get_vm_manager(&self.name)?;
+        let label = vm_common::vm_label(&self.name);
 
         // Check if microvm is running - exec requires a running VM
         if manager.try_connect_existing().is_none() {
@@ -205,53 +206,17 @@ pub struct CreateCmd {
 
 impl CreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let mut config = SmolvmConfig::load()?;
-
-        // Check if VM already exists
-        if config.get_vm(&self.name).is_some() {
-            return Err(smolvm::Error::config(
-                "create vm",
-                format!("VM '{}' already exists", self.name),
-            ));
-        }
-
-        // Parse and validate volume mounts
-        let mounts = parse_mounts_as_tuples(&self.volume)?;
-
-        // Convert port mappings to tuple format for storage
-        let ports: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
-
-        // Create record
-        let record = VmRecord::new(
-            self.name.clone(),
-            self.cpus,
-            self.mem,
-            mounts,
-            ports,
-            self.net,
-        );
-
-        // Store in config (persisted immediately to database)
-        config.insert_vm(self.name.clone(), record)?;
-
-        println!("Created microvm: {}", self.name);
-        println!("  CPUs: {}, Memory: {} MiB", self.cpus, self.mem);
-        if !self.volume.is_empty() {
-            println!("  Mounts: {}", self.volume.len());
-        }
-        if !self.port.is_empty() {
-            println!("  Ports: {}", self.port.len());
-        }
-        println!(
-            "\nUse 'smolvm microvm start {}' to start the microvm",
-            self.name
-        );
-        println!(
-            "Then use 'smolvm container create {}' to run containers",
-            self.name
-        );
-
-        Ok(())
+        vm_common::create_vm(
+            KIND,
+            CreateVmParams {
+                name: self.name,
+                cpus: self.cpus,
+                mem: self.mem,
+                volume: self.volume,
+                port: self.port,
+                net: self.net,
+            },
+        )
     }
 }
 
@@ -271,111 +236,10 @@ pub struct StartCmd {
 
 impl StartCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        use smolvm::Error;
-
-        // If no name provided, start default anonymous microvm
-        let Some(name) = &self.name else {
-            return self.start_anonymous();
-        };
-        let mut config = SmolvmConfig::load()?;
-
-        // Get VM record
-        let record = config
-            .get_vm(name)
-            .ok_or_else(|| Error::vm_not_found(name))?
-            .clone();
-
-        // Check state
-        let actual_state = record.actual_state();
-        if actual_state == RecordState::Running {
-            let pid_suffix = format_pid_suffix(record.pid);
-            println!("MicroVM '{}' already running{}", name, pid_suffix);
-            return Ok(());
+        match &self.name {
+            Some(name) => vm_common::start_vm_named(KIND, name),
+            None => vm_common::start_vm_anonymous(KIND),
         }
-
-        // Convert stored mounts to HostMount
-        let mounts: Vec<HostMount> = record
-            .mounts
-            .iter()
-            .map(|(host, guest, ro)| HostMount {
-                source: PathBuf::from(host),
-                target: PathBuf::from(guest),
-                read_only: *ro,
-            })
-            .collect();
-
-        // Convert stored ports to PortMapping
-        let ports: Vec<PortMapping> = record
-            .ports
-            .iter()
-            .map(|(host, guest)| PortMapping::new(*host, *guest))
-            .collect();
-
-        let resources = VmResources {
-            cpus: record.cpus,
-            mem: record.mem,
-            network: record.network,
-        };
-
-        // Start agent VM for this named VM
-        let manager = AgentManager::for_vm(name)
-            .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
-
-        // Show startup message
-        let mount_info = if !mounts.is_empty() {
-            format!(" with {} mount(s)", mounts.len())
-        } else {
-            String::new()
-        };
-        let port_info = if !ports.is_empty() {
-            format!(" and {} port mapping(s)", ports.len())
-        } else {
-            String::new()
-        };
-        println!("Starting microvm '{}'{}{}...", name, mount_info, port_info);
-
-        manager
-            .ensure_running_with_full_config(mounts, ports, resources)
-            .map_err(|e| Error::agent("start microvm", e.to_string()))?;
-
-        // Update state
-        let pid = manager.child_pid();
-        config.update_vm(name, |r| {
-            r.state = RecordState::Running;
-            r.pid = pid;
-        });
-        config.save()?;
-
-        println!("MicroVM '{}' running (PID: {})", name, pid.unwrap_or(0));
-        println!(
-            "\nUse 'smolvm container create {} <image>' to run containers",
-            name
-        );
-
-        // Keep microvm running (persistent)
-        manager.detach();
-        Ok(())
-    }
-
-    fn start_anonymous(&self) -> smolvm::Result<()> {
-        let manager = AgentManager::new_default()?;
-
-        // Check if already running
-        if manager.try_connect_existing().is_some() {
-            let pid_suffix = format_pid_suffix(manager.child_pid());
-            println!("MicroVM 'default' already running{}", pid_suffix);
-            manager.detach();
-            return Ok(());
-        }
-
-        println!("Starting microvm 'default'...");
-        manager.ensure_running()?;
-
-        let pid = manager.child_pid().unwrap_or(0);
-        println!("MicroVM 'default' running (PID: {})", pid);
-
-        manager.detach();
-        Ok(())
     }
 }
 
@@ -395,71 +259,10 @@ pub struct StopCmd {
 
 impl StopCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        // If no name provided, stop default anonymous microvm
-        let Some(name) = &self.name else {
-            return self.stop_anonymous();
-        };
-        let mut config = SmolvmConfig::load()?;
-
-        // Get VM record
-        let record = match config.get_vm(name) {
-            Some(r) => r.clone(),
-            None => {
-                // Maybe it's a running anonymous microvm with this name?
-                return self.stop_named_microvm(name);
-            }
-        };
-
-        // Check state
-        let actual_state = record.actual_state();
-        if actual_state != RecordState::Running {
-            println!("VM '{}' is not running (state: {})", name, actual_state);
-            return Ok(());
+        match &self.name {
+            Some(name) => vm_common::stop_vm_named(KIND, name),
+            None => vm_common::stop_vm_anonymous(KIND),
         }
-
-        println!("Stopping VM '{}'...", name);
-
-        // Stop this VM's agent
-        if let Ok(manager) = AgentManager::for_vm(name) {
-            if let Err(e) = manager.stop() {
-                tracing::warn!(error = %e, "failed to stop microvm");
-            }
-        }
-
-        // Update state
-        config.update_vm(name, |r| {
-            r.state = RecordState::Stopped;
-            r.pid = None;
-        });
-        config.save()?;
-
-        println!("Stopped VM: {}", name);
-        Ok(())
-    }
-
-    fn stop_anonymous(&self) -> smolvm::Result<()> {
-        let manager = AgentManager::new_default()?;
-
-        // try_connect_existing sets internal state if agent is reachable;
-        // stop() handles both responsive agents and orphans via PID file.
-        manager.try_connect_existing();
-        println!("Stopping microvm 'default'...");
-        manager.stop()?;
-        println!("MicroVM 'default' stopped");
-
-        Ok(())
-    }
-
-    fn stop_named_microvm(&self, name: &str) -> smolvm::Result<()> {
-        if let Ok(manager) = AgentManager::for_vm(name) {
-            manager.try_connect_existing();
-            println!("Stopping microvm '{}'...", name);
-            manager.stop()?;
-            println!("MicroVM '{}' stopped", name);
-        } else {
-            println!("MicroVM '{}' not found", name);
-        }
-        Ok(())
     }
 }
 
@@ -483,35 +286,14 @@ pub struct DeleteCmd {
 
 impl DeleteCmd {
     pub fn run(&self) -> smolvm::Result<()> {
-        let mut config = SmolvmConfig::load()?;
-
-        // Check if VM exists
-        if config.get_vm(&self.name).is_none() {
-            return Err(smolvm::Error::vm_not_found(&self.name));
-        }
-
-        // Confirm deletion unless --force
-        if !self.force {
-            eprint!("Delete VM '{}'? [y/N] ", self.name);
-            let mut input = String::new();
-            if std::io::stdin().read_line(&mut input).is_ok() {
-                let input = input.trim().to_lowercase();
-                if input != "y" && input != "yes" {
-                    println!("Cancelled");
-                    return Ok(());
-                }
-            } else {
-                println!("Cancelled");
-                return Ok(());
-            }
-        }
-
-        // Remove from config
-        config.remove_vm(&self.name);
-        config.save()?;
-
-        println!("Deleted VM: {}", self.name);
-        Ok(())
+        vm_common::delete_vm(
+            KIND,
+            &self.name,
+            self.force,
+            DeleteVmOptions {
+                stop_if_running: false,
+            },
+        )
     }
 }
 
@@ -531,8 +313,8 @@ pub struct StatusCmd {
 
 impl StatusCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = get_manager(&self.name)?;
-        let label = microvm_label(&self.name);
+        let manager = vm_common::get_vm_manager(&self.name)?;
+        let label = vm_common::vm_label(&self.name);
 
         if manager.try_connect_existing().is_some() {
             let pid_suffix = format_pid_suffix(manager.child_pid());
@@ -566,76 +348,7 @@ pub struct LsCmd {
 
 impl LsCmd {
     pub fn run(&self) -> smolvm::Result<()> {
-        let config = SmolvmConfig::load()?;
-        let vms: Vec<_> = config.list_vms().collect();
-
-        if vms.is_empty() {
-            if !self.json {
-                println!("No VMs found");
-            } else {
-                println!("[]");
-            }
-            return Ok(());
-        }
-
-        if self.json {
-            let json_vms: Vec<_> = vms
-                .iter()
-                .map(|(name, record)| {
-                    let actual_state = record.actual_state();
-                    serde_json::json!({
-                        "name": name,
-                        "state": actual_state.to_string(),
-                        "cpus": record.cpus,
-                        "memory_mib": record.mem,
-                        "pid": record.pid,
-                        "mounts": record.mounts.len(),
-                        "ports": record.ports.len(),
-                        "created_at": record.created_at,
-                    })
-                })
-                .collect();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json_vms).expect("JSON serialization failed")
-            );
-        } else {
-            println!(
-                "{:<20} {:<10} {:<5} {:<8} {:<6} {:<6}",
-                "NAME", "STATE", "CPUS", "MEMORY", "MOUNTS", "PORTS"
-            );
-            println!("{}", "-".repeat(60));
-
-            for (name, record) in vms {
-                let actual_state = record.actual_state();
-                println!(
-                    "{:<20} {:<10} {:<5} {:<8} {:<6} {:<6}",
-                    truncate(name, 18),
-                    actual_state,
-                    record.cpus,
-                    format!("{} MiB", record.mem),
-                    record.mounts.len(),
-                    record.ports.len(),
-                );
-
-                if self.verbose {
-                    if let Some(pid) = record.pid {
-                        println!("  PID: {}", pid);
-                    }
-                    for (host, guest, ro) in &record.mounts {
-                        let ro_str = if *ro { " (ro)" } else { "" };
-                        println!("  Mount: {} -> {}{}", host, guest, ro_str);
-                    }
-                    for (host, guest) in &record.ports {
-                        println!("  Port: {} -> {}", host, guest);
-                    }
-                    println!("  Created: {}", record.created_at);
-                    println!();
-                }
-            }
-        }
-
-        Ok(())
+        vm_common::list_vms(KIND, self.verbose, self.json)
     }
 }
 
@@ -657,8 +370,8 @@ pub struct NetworkTestCmd {
 
 impl NetworkTestCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = get_manager(&self.name)?;
-        let label = microvm_label(&self.name);
+        let manager = vm_common::get_vm_manager(&self.name)?;
+        let label = vm_common::vm_label(&self.name);
 
         // Ensure microvm is running
         if manager.try_connect_existing().is_none() {
@@ -679,22 +392,4 @@ impl NetworkTestCmd {
         manager.detach();
         Ok(())
     }
-}
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Get the agent manager for a name (or default if None).
-fn get_manager(name: &Option<String>) -> smolvm::Result<AgentManager> {
-    if let Some(name) = name {
-        AgentManager::for_vm(name)
-    } else {
-        AgentManager::new_default()
-    }
-}
-
-/// Format the microvm label for display.
-fn microvm_label(name: &Option<String>) -> String {
-    name.as_deref().unwrap_or("default").to_string()
 }
