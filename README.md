@@ -11,21 +11,21 @@ Run microVMs locally to sandbox workloads.
 curl -sSL https://smolmachines.com/install.sh | bash
 
 # sandbox - ephemeral isolated environments
-smolvm sandbox run alpine:latest -- echo "hello"
-smolvm sandbox run -v /tmp:/workspace alpine:latest -- ls /workspace
+smolvm sandbox run --net alpine:latest -- echo "hello"
+smolvm sandbox run --net -v /tmp:/workspace alpine:latest -- ls /workspace
 
-smolvm sandbox run python:3.12-alpine -- python -V
+smolvm sandbox run --net python:3.12-alpine -- python -V
 
 # microvm - persistent linux VMs
 smolvm microvm start
 smolvm microvm exec -- echo "hello"
 smolvm microvm stop
 
-# pack - portable, executable virtual machine
+# pack - build a portable, executable virtual machine.
 smolvm pack alpine:latest -o ./my-sandbox        # creates ./my-sandbox + ./my-sandbox.smolmachine
 smolvm pack alpine:latest -o ./my-sandbox --single-file  # single executable, no sidecar
 
-./my-sandbox echo "hello"
+./my-sandbox uname -a # this will return results of running sys info within the guest linux vm
 
 smolvm pack python:3.12-alpine -o ./my-pythonvm
 ./my-pythonvm python3 -c "import sys; print(sys.version)"
@@ -93,17 +93,17 @@ smolVM makes microVMs easy: <250ms boot, works on macOS and Linux, single binary
 ## known limitations
 
 - **Container rootfs writes**: Writes to container filesystem (`/tmp`, `/home`, etc.) fail due to a libkrun TSI bug with overlayfs. **Writes to mounted volumes work**.
-- **Network: TCP/UDP only**: ICMP (`ping`) and raw sockets do not work. Use `curl`, `wget` for connectivity.
+- **Network is opt-in**: Use `--net` to enable outbound network access (required for image pulls from registries). TCP/UDP only — ICMP (`ping`) and raw sockets do not work.
 - **Volume mounts**: Directories only (no single files)
 - **macOS**: Binary must be signed with Hypervisor.framework entitlements
 
 **File writes for coding agents:**
 ```bash
 # Works: top-level mount path
-smolvm sandbox run -v /tmp:/workspace alpine:latest -- sh -c "echo 'hello' > /workspace/out.txt"
+smolvm sandbox run --net -v /tmp:/workspace alpine:latest -- sh -c "echo 'hello' > /workspace/out.txt"
 
 # Fails: nested mount path or container rootfs
-smolvm sandbox run -v /tmp:/mnt/data alpine:latest -- sh -c "echo 'hello' > /mnt/data/out.txt"
+smolvm sandbox run --net -v /tmp:/mnt/data alpine:latest -- sh -c "echo 'hello' > /mnt/data/out.txt"
 ```
 
 ## development
