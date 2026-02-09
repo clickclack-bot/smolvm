@@ -345,6 +345,218 @@ test_single_file_run_echo() {
 }
 
 # =============================================================================
+# run-packed Subcommand - Basic Tests
+# =============================================================================
+
+test_run_packed_help() {
+    # Verify run-packed subcommand exists and shows help
+    $SMOLVM run-packed --help 2>&1 | grep -q "Run a VM from a packed"
+}
+
+test_run_packed_info() {
+    local output="$TEST_DIR/test-alpine"
+
+    # Ensure we have a packed binary with sidecar
+    if [[ ! -f "$output.smolmachine" ]]; then
+        $SMOLVM pack alpine:latest -o "$output" 2>&1
+    fi
+
+    # Test --info via run-packed
+    local info_output
+    info_output=$($SMOLVM run-packed --sidecar "$output.smolmachine" --info 2>&1)
+    [[ "$info_output" == *"Image:"* ]] && \
+    [[ "$info_output" == *"Platform:"* ]] && \
+    [[ "$info_output" == *"Checksum:"* ]] || return 1
+}
+
+test_run_packed_info_no_sidecar() {
+    # Should error clearly when sidecar doesn't exist
+    local exit_code=0
+    $SMOLVM run-packed --sidecar /tmp/nonexistent-file.smolmachine --info 2>&1 || exit_code=$?
+    [[ $exit_code -ne 0 ]]
+}
+
+test_run_packed_auto_detect() {
+    # Test auto-detection of .smolmachine file in current directory
+    local output="$TEST_DIR/test-alpine"
+
+    if [[ ! -f "$output.smolmachine" ]]; then
+        $SMOLVM pack alpine:latest -o "$output" 2>&1
+    fi
+
+    # Create a temp dir with a single .smolmachine file
+    local detect_dir="$TEST_DIR/auto-detect"
+    mkdir -p "$detect_dir"
+    cp "$output.smolmachine" "$detect_dir/myapp.smolmachine"
+
+    # run-packed --info from that directory should auto-detect
+    local info_output
+    info_output=$(cd "$detect_dir" && $SMOLVM run-packed --info 2>&1)
+    [[ "$info_output" == *"Image:"* ]]
+}
+
+test_run_packed_auto_detect_ambiguous() {
+    # Should error when multiple .smolmachine files exist and no --sidecar given
+    local detect_dir="$TEST_DIR/multi-detect"
+    mkdir -p "$detect_dir"
+
+    # Create two dummy .smolmachine files (just need them to exist for detection)
+    touch "$detect_dir/app1.smolmachine"
+    touch "$detect_dir/app2.smolmachine"
+
+    local exit_code=0
+    (cd "$detect_dir" && $SMOLVM run-packed --info 2>&1) || exit_code=$?
+    [[ $exit_code -ne 0 ]]
+}
+
+# =============================================================================
+# run-packed Subcommand - Execution Tests (Requires VM)
+# =============================================================================
+
+test_run_packed_echo() {
+    local output="$TEST_DIR/test-alpine"
+
+    # Ensure we have a packed binary with sidecar
+    if [[ ! -f "$output.smolmachine" ]]; then
+        $SMOLVM pack alpine:latest -o "$output" 2>&1
+    fi
+
+    # Run command through run-packed with 60s timeout
+    local result
+    result=$(run_with_timeout 60 $SMOLVM run-packed --sidecar "$output.smolmachine" -- echo "run-packed-marker-67890" 2>&1)
+    local exit_code=$?
+
+    if [[ $exit_code -eq 124 ]]; then
+        echo "TIMEOUT: run-packed hung"
+        return 1
+    fi
+
+    [[ "$result" == *"run-packed-marker-67890"* ]]
+}
+
+test_run_packed_exit_code() {
+    local output="$TEST_DIR/test-alpine"
+
+    if [[ ! -f "$output.smolmachine" ]]; then
+        $SMOLVM pack alpine:latest -o "$output" 2>&1
+    fi
+
+    # Exit code 0 (with timeout)
+    run_with_timeout 60 $SMOLVM run-packed --sidecar "$output.smolmachine" -- sh -c "exit 0" 2>&1
+    local exit_zero=$?
+    [[ $exit_zero -eq 124 ]] && { echo "TIMEOUT"; return 1; }
+
+    # Exit code 42 (with timeout)
+    local exit_42=0
+    run_with_timeout 60 $SMOLVM run-packed --sidecar "$output.smolmachine" -- sh -c "exit 42" 2>&1 || exit_42=$?
+    [[ $exit_42 -eq 124 ]] && { echo "TIMEOUT"; return 1; }
+
+    [[ $exit_zero -eq 0 ]] && [[ $exit_42 -eq 42 ]]
+}
+
+test_run_packed_env_var() {
+    local output="$TEST_DIR/test-alpine"
+
+    if [[ ! -f "$output.smolmachine" ]]; then
+        $SMOLVM pack alpine:latest -o "$output" 2>&1
+    fi
+
+    local result
+    result=$(run_with_timeout 60 $SMOLVM run-packed --sidecar "$output.smolmachine" -e MY_VAR=packed_env_test -- sh -c 'echo $MY_VAR' 2>&1)
+    [[ $? -eq 124 ]] && { echo "TIMEOUT"; return 1; }
+    [[ "$result" == *"packed_env_test"* ]]
+}
+
+test_run_packed_workdir() {
+    local output="$TEST_DIR/test-alpine"
+
+    if [[ ! -f "$output.smolmachine" ]]; then
+        $SMOLVM pack alpine:latest -o "$output" 2>&1
+    fi
+
+    local result
+    result=$(run_with_timeout 60 $SMOLVM run-packed --sidecar "$output.smolmachine" -w /tmp -- pwd 2>&1)
+    [[ $? -eq 124 ]] && { echo "TIMEOUT"; return 1; }
+    [[ "$result" == *"/tmp"* ]]
+}
+
+test_run_packed_resource_override() {
+    local output="$TEST_DIR/test-alpine"
+
+    if [[ ! -f "$output.smolmachine" ]]; then
+        $SMOLVM pack alpine:latest -o "$output" 2>&1
+    fi
+
+    # Verify resource override flags are accepted (boot with custom resources)
+    # We use --debug to see the config, and run a quick command
+    local result
+    result=$(run_with_timeout 60 $SMOLVM run-packed --sidecar "$output.smolmachine" --cpus 2 --mem 512 --debug -- echo "resource-test" 2>&1)
+    local exit_code=$?
+
+    [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
+
+    # Should contain the debug output showing the resource overrides
+    [[ "$result" == *"cpus=2"* ]] && [[ "$result" == *"mem=512"* ]] && \
+    [[ "$result" == *"resource-test"* ]]
+}
+
+test_run_packed_force_extract() {
+    local output="$TEST_DIR/test-alpine"
+
+    if [[ ! -f "$output.smolmachine" ]]; then
+        $SMOLVM pack alpine:latest -o "$output" 2>&1
+    fi
+
+    # Run with --force-extract and --debug to verify re-extraction
+    local result
+    result=$(run_with_timeout 60 $SMOLVM run-packed --sidecar "$output.smolmachine" --force-extract --debug -- echo "re-extracted" 2>&1)
+    local exit_code=$?
+
+    [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
+
+    # Debug output should show extraction happening
+    [[ "$result" == *"extract"* ]] && [[ "$result" == *"re-extracted"* ]]
+}
+
+test_run_packed_cached_fast() {
+    # Second run should use cached assets (no extraction)
+    local output="$TEST_DIR/test-alpine"
+
+    if [[ ! -f "$output.smolmachine" ]]; then
+        $SMOLVM pack alpine:latest -o "$output" 2>&1
+    fi
+
+    # First run ensures cache exists
+    run_with_timeout 60 $SMOLVM run-packed --sidecar "$output.smolmachine" -- true 2>&1 || true
+
+    # Second run with --debug should show "using cached assets"
+    local result
+    result=$(run_with_timeout 60 $SMOLVM run-packed --sidecar "$output.smolmachine" --debug -- echo "cached-run" 2>&1)
+    local exit_code=$?
+
+    [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
+    [[ "$result" == *"cached"* ]] && [[ "$result" == *"cached-run"* ]]
+}
+
+test_run_packed_python() {
+    if [[ "$QUICK_MODE" == "true" ]]; then
+        echo "SKIP: --quick mode"
+        return 0
+    fi
+
+    local output="$TEST_DIR/test-python"
+
+    if [[ ! -f "$output.smolmachine" ]]; then
+        $SMOLVM pack python:3.12-slim -o "$output" 2>&1
+    fi
+
+    local result
+    result=$(run_with_timeout 90 $SMOLVM run-packed --sidecar "$output.smolmachine" -- python -c "print('Hello from run-packed Python')" 2>&1)
+    [[ $? -eq 124 ]] && { echo "TIMEOUT"; return 1; }
+    [[ "$result" == *"Hello from run-packed Python"* ]]
+}
+
+# =============================================================================
 # Error Handling Tests
 # =============================================================================
 
@@ -438,6 +650,28 @@ echo ""
 run_test "Daemon mode (start/exec/stop)" test_packed_daemon_mode || true
 
 echo ""
+echo "Running run-packed Subcommand Tests..."
+echo ""
+
+run_test "run-packed help" test_run_packed_help || true
+run_test "run-packed --info" test_run_packed_info || true
+run_test "run-packed --info with missing sidecar" test_run_packed_info_no_sidecar || true
+run_test "run-packed auto-detect sidecar" test_run_packed_auto_detect || true
+run_test "run-packed auto-detect ambiguous" test_run_packed_auto_detect_ambiguous || true
+
+echo ""
+echo "Running run-packed Execution Tests (requires VM)..."
+echo ""
+
+run_test "run-packed echo" test_run_packed_echo || true
+run_test "run-packed exit code" test_run_packed_exit_code || true
+run_test "run-packed env variable" test_run_packed_env_var || true
+run_test "run-packed workdir" test_run_packed_workdir || true
+run_test "run-packed resource override" test_run_packed_resource_override || true
+run_test "run-packed --force-extract" test_run_packed_force_extract || true
+run_test "run-packed cached fast" test_run_packed_cached_fast || true
+
+echo ""
 echo "Running Error Handling Tests..."
 echo ""
 
@@ -450,6 +684,7 @@ if [[ "$QUICK_MODE" != "true" ]]; then
 
     run_test "Pack Python image" test_pack_python || true
     run_test "Packed Python run" test_packed_python_run || true
+    run_test "run-packed Python" test_run_packed_python || true
 fi
 
 print_summary "Pack Tests"

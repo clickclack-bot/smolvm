@@ -51,6 +51,9 @@ enum Commands {
 
     /// Export OpenAPI specification for SDK generation
     Openapi(cli::openapi::OpenapiCmd),
+
+    /// Run a VM from a packed .smolmachine sidecar file
+    RunPacked(cli::run_packed::RunPackedCmd),
 }
 
 fn main() {
@@ -70,6 +73,7 @@ fn main() {
         Commands::Pack(cmd) => cmd.run(),
         Commands::Config(cmd) => cmd.run(),
         Commands::Openapi(cmd) => cmd.run(),
+        Commands::RunPacked(cmd) => cmd.run(),
     };
 
     // Handle errors
