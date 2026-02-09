@@ -12,8 +12,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::api::error::ApiError;
-use crate::api::state::{ensure_sandbox_running, ApiState};
-use crate::api::types::{ApiErrorResponse, ExecRequest, ExecResponse, LogsQuery, RunRequest};
+use crate::api::state::{ensure_sandbox_running, with_sandbox_client, ApiState};
+use crate::api::types::{
+    ApiErrorResponse, EnvVar, ExecRequest, ExecResponse, LogsQuery, RunRequest,
+};
+use crate::api::validation::validate_command;
+use tokio::sync::Semaphore;
+
+/// Classify errors from `ensure_sandbox_running` into proper HTTP status codes.
+///
+/// Mount validation errors are 400 (Bad Request), everything else uses the
+/// standard `Error -> ApiError` mapping (500 for startup failures, etc.).
+fn classify_ensure_running_error(err: crate::Error) -> ApiError {
+    match &err {
+        crate::Error::Mount { .. }
+        | crate::Error::InvalidMountPath { .. }
+        | crate::Error::MountSourceNotFound { .. } => {
+            ApiError::BadRequest(format!("mount validation failed: {}", err))
+        }
+        _ => ApiError::from(err),
+    }
+}
 
 /// Execute a command in a sandbox.
 ///
@@ -38,36 +57,22 @@ pub async fn exec_command(
     Path(id): Path<String>,
     Json(req): Json<ExecRequest>,
 ) -> Result<Json<ExecResponse>, ApiError> {
-    if req.command.is_empty() {
-        return Err(ApiError::BadRequest("command cannot be empty".into()));
-    }
+    validate_command(&req.command)?;
 
     let entry = state.get_sandbox(&id)?;
 
     // Ensure sandbox is running
     ensure_sandbox_running(&entry)
         .await
-        .map_err(|e| ApiError::BadRequest(format!("mount validation failed: {}", e)))?;
+        .map_err(classify_ensure_running_error)?;
 
-    // Prepare execution parameters
     let command = req.command.clone();
-    let env: Vec<(String, String)> = req
-        .env
-        .iter()
-        .map(|e| (e.name.clone(), e.value.clone()))
-        .collect();
+    let env = EnvVar::to_tuples(&req.env);
     let workdir = req.workdir.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
 
-    // Execute in blocking task
-    let entry_clone = entry.clone();
-    let (exit_code, stdout, stderr) = tokio::task::spawn_blocking(move || {
-        let entry = entry_clone.lock();
-        let mut client = entry.manager.connect()?;
-        client.vm_exec(command, env, workdir, timeout)
-    })
-    .await?
-    .map_err(ApiError::internal)?;
+    let (exit_code, stdout, stderr) =
+        with_sandbox_client(&entry, move |c| c.vm_exec(command, env, workdir, timeout)).await?;
 
     Ok(Json(ExecResponse {
         exit_code,
@@ -99,30 +104,22 @@ pub async fn run_command(
     Path(id): Path<String>,
     Json(req): Json<RunRequest>,
 ) -> Result<Json<ExecResponse>, ApiError> {
-    if req.command.is_empty() {
-        return Err(ApiError::BadRequest("command cannot be empty".into()));
-    }
+    validate_command(&req.command)?;
 
     let entry = state.get_sandbox(&id)?;
 
     // Ensure sandbox is running
     ensure_sandbox_running(&entry)
         .await
-        .map_err(|e| ApiError::BadRequest(format!("mount validation failed: {}", e)))?;
+        .map_err(classify_ensure_running_error)?;
 
-    // Prepare execution parameters
     let image = req.image.clone();
     let command = req.command.clone();
-    let env: Vec<(String, String)> = req
-        .env
-        .iter()
-        .map(|e| (e.name.clone(), e.value.clone()))
-        .collect();
+    let env = EnvVar::to_tuples(&req.env);
     let workdir = req.workdir.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
 
     // Get mounts from sandbox config (converted to protocol format)
-    // Tags are "smolvm0", "smolvm1", etc. based on mount index
     let mounts_config = {
         let entry = entry.lock();
         entry
@@ -130,21 +127,16 @@ pub async fn run_command(
             .iter()
             .enumerate()
             .map(|(i, m)| {
-                let tag = format!("smolvm{}", i);
+                let tag = crate::agent::mount_tag(i);
                 (tag, m.target.clone(), m.readonly)
             })
             .collect::<Vec<_>>()
     };
 
-    // Execute in blocking task
-    let entry_clone = entry.clone();
-    let (exit_code, stdout, stderr) = tokio::task::spawn_blocking(move || {
-        let entry = entry_clone.lock();
-        let mut client = entry.manager.connect()?;
-        client.run_with_mounts_and_timeout(&image, command, env, workdir, mounts_config, timeout)
+    let (exit_code, stdout, stderr) = with_sandbox_client(&entry, move |c| {
+        c.run_with_mounts_and_timeout(&image, command, env, workdir, mounts_config, timeout)
     })
-    .await?
-    .map_err(ApiError::internal)?;
+    .await?;
 
     Ok(Json(ExecResponse {
         exit_code,
@@ -152,6 +144,12 @@ pub async fn run_command(
         stderr,
     }))
 }
+
+/// Maximum number of concurrent log-follow SSE streams.
+/// Each follower polls via `spawn_blocking` every 100ms, so capping concurrency
+/// prevents blocking-pool saturation under high follower counts.
+static LOG_FOLLOW_SEMAPHORE: std::sync::LazyLock<Semaphore> =
+    std::sync::LazyLock::new(|| Semaphore::new(16));
 
 /// Stream sandbox console logs via SSE.
 #[utoipa::path(
@@ -201,6 +199,30 @@ pub async fn stream_logs(
     let follow = query.follow;
     let tail = query.tail;
 
+    // Validate tail value upfront
+    const MAX_TAIL_LINES: usize = 10_000;
+    if let Some(n) = tail {
+        if n > MAX_TAIL_LINES {
+            return Err(ApiError::BadRequest(format!(
+                "tail value {} exceeds maximum of {}",
+                n, MAX_TAIL_LINES,
+            )));
+        }
+    }
+
+    // Acquire a follow permit if the client wants to follow. This limits
+    // concurrent long-lived polling streams to prevent blocking-pool saturation.
+    // The permit is moved into the stream so it's held for the stream's lifetime.
+    let follow_permit = if follow {
+        Some(
+            LOG_FOLLOW_SEMAPHORE
+                .try_acquire()
+                .map_err(|_| ApiError::Conflict("too many concurrent log followers".into()))?,
+        )
+    } else {
+        None
+    };
+
     // For tail, read last N lines upfront using spawn_blocking with bounded memory
     let (initial_lines, start_pos) = if let Some(n) = tail {
         let path = log_path.clone();
@@ -214,6 +236,10 @@ pub async fn stream_logs(
 
     // Create the SSE stream
     let stream = async_stream::stream! {
+        // Hold the follow permit for the stream's lifetime so it's released
+        // when the client disconnects or the stream ends.
+        let _permit = follow_permit;
+
         // Emit initial tail lines first
         for line in initial_lines {
             yield Ok(Event::default().data(line));
@@ -234,10 +260,12 @@ pub async fn stream_logs(
 
             let result = tokio::task::spawn_blocking(move || {
                 read_from_position(&path, current_pos)
-            }).await;
+            })
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)));
 
             match result {
-                Ok(Ok((new_data, new_pos))) => {
+                Ok((new_data, new_pos)) => {
                     pos = new_pos;
                     if !new_data.is_empty() {
                         partial_line.push_str(&new_data);
@@ -247,11 +275,12 @@ pub async fn stream_logs(
                             partial_line = partial_line[newline_pos + 1..].to_string();
                             yield Ok(Event::default().data(line));
                         }
+                        // Flush partial line if it exceeds the safety cap
+                        if partial_line.len() > MAX_PARTIAL_LINE {
+                            yield Ok(Event::default().data(partial_line.clone()));
+                            partial_line.clear();
+                        }
                     }
-                }
-                Ok(Err(e)) => {
-                    yield Ok(Event::default().data(format!("error: {}", e)));
-                    break;
                 }
                 Err(e) => {
                     yield Ok(Event::default().data(format!("error: {}", e)));
@@ -287,6 +316,11 @@ fn read_last_n_lines_bounded(
     let metadata = file.metadata()?;
     let file_len = metadata.len();
 
+    // n == 0 means "no tail lines" — skip reading the file entirely
+    if n == 0 {
+        return Ok((Vec::new(), file_len));
+    }
+
     let reader = BufReader::new(file);
 
     // Use a ring buffer to keep only the last N lines in memory
@@ -303,7 +337,18 @@ fn read_last_n_lines_bounded(
     Ok((ring.into_iter().collect(), file_len))
 }
 
+/// Maximum bytes to read per poll cycle (64 KiB).
+/// Bounds memory usage per follower and prevents a single large write from
+/// blocking the async runtime.
+const MAX_READ_CHUNK: u64 = 64 * 1024;
+
+/// Maximum size of the partial (incomplete) line buffer (1 MiB).
+/// If a log produces data without newlines beyond this limit, the partial
+/// buffer is flushed as-is to prevent unbounded memory growth.
+const MAX_PARTIAL_LINE: usize = 1024 * 1024;
+
 /// Read new content from a file starting at a given position.
+/// Reads at most `MAX_READ_CHUNK` bytes per call.
 fn read_from_position(path: &std::path::Path, pos: u64) -> std::io::Result<(String, u64)> {
     use std::io::Read as _;
 
@@ -317,8 +362,11 @@ fn read_from_position(path: &std::path::Path, pos: u64) -> std::io::Result<(Stri
     }
 
     file.seek(SeekFrom::Start(pos))?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)?;
+    let to_read = std::cmp::min(file_len - pos, MAX_READ_CHUNK) as usize;
+    let mut buf = vec![0u8; to_read];
+    file.read_exact(&mut buf)?;
+    let new_pos = pos + to_read as u64;
 
-    Ok((buf, file_len))
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    Ok((text, new_pos))
 }

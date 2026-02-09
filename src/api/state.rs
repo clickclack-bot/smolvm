@@ -2,7 +2,7 @@
 
 use crate::agent::{AgentManager, HostMount, PortMapping, VmResources};
 use crate::api::error::ApiError;
-use crate::api::types::{MountInfo, MountSpec, PortSpec, ResourceSpec, RestartSpec, SandboxInfo};
+use crate::api::types::{MountSpec, PortSpec, ResourceSpec, RestartSpec, SandboxInfo};
 use crate::config::{RecordState, RestartConfig, RestartPolicy, VmRecord};
 use crate::db::SmolvmDb;
 use crate::mount::MountBinding;
@@ -112,48 +112,6 @@ impl Drop for ReservationGuard<'_> {
     }
 }
 
-/// RAII guard for temporarily closing the database during fork operations.
-///
-/// Automatically reopens the database on drop, ensuring the DB is never left
-/// closed even if the operation is cancelled or panics.
-///
-/// # Example
-///
-/// ```ignore
-/// // Guard closes DB on creation, reopens on drop
-/// let _guard = DbCloseGuard::new(&state);
-///
-/// // Fork operation - even if this panics or is cancelled,
-/// // the guard's Drop will reopen the database
-/// let result = tokio::task::spawn_blocking(|| {
-///     // fork happens here
-/// }).await;
-///
-/// // Guard dropped here (or earlier if cancelled), DB reopened
-/// ```
-pub struct DbCloseGuard<'a> {
-    state: &'a ApiState,
-}
-
-impl<'a> DbCloseGuard<'a> {
-    /// Create a new guard, closing the database.
-    ///
-    /// The database will be automatically reopened when the guard is dropped.
-    pub fn new(state: &'a ApiState) -> Self {
-        state.db.close_temporarily();
-        Self { state }
-    }
-}
-
-impl Drop for DbCloseGuard<'_> {
-    fn drop(&mut self) {
-        if let Err(e) = self.state.db.reopen() {
-            // Log error but don't panic - we're in a Drop impl
-            tracing::error!(error = %e, "failed to reopen database in DbCloseGuard drop");
-        }
-    }
-}
-
 impl ApiState {
     /// Create a new API state, opening the database.
     ///
@@ -195,7 +153,10 @@ impl ApiState {
         for (name, record) in vms {
             // Check if VM process is still alive
             if !record.is_process_alive() {
-                tracing::info!(sandbox = %name, "skipping dead sandbox");
+                tracing::info!(sandbox = %name, "cleaning up dead sandbox from database");
+                if let Err(e) = self.db.remove_vm(&name) {
+                    tracing::warn!(sandbox = %name, error = %e, "failed to remove dead sandbox from database");
+                }
                 continue;
             }
 
@@ -229,81 +190,47 @@ impl ApiState {
             match AgentManager::for_vm(&name) {
                 Ok(manager) => {
                     // Try to reconnect to existing running VM
-                    if manager.try_connect_existing_with_pid(record.pid).is_some() {
-                        let mut sandboxes = self.sandboxes.write();
-                        sandboxes.insert(
-                            name.clone(),
-                            Arc::new(parking_lot::Mutex::new(SandboxEntry {
-                                manager,
-                                mounts,
-                                ports,
-                                resources,
-                                restart: record.restart.clone(),
-                                network: record.network,
-                            })),
-                        );
-                        loaded.push(name.clone());
+                    let reconnected = manager
+                        .try_connect_existing_with_pid_and_start_time(
+                            record.pid,
+                            record.pid_start_time,
+                        )
+                        .is_some();
+
+                    if reconnected {
                         tracing::info!(sandbox = %name, pid = ?record.pid, "reconnected to sandbox");
                     } else {
-                        tracing::info!(sandbox = %name, "sandbox not running, skipping");
+                        // Process is alive but agent isn't reachable yet (transient
+                        // boot/socket timing). Register the sandbox anyway so it's
+                        // visible via APIs and the supervisor can manage it. Keep
+                        // the DB record for future reconnect attempts.
+                        tracing::info!(sandbox = %name, pid = ?record.pid, "sandbox alive but not yet reachable, registering for later reconnect");
                     }
+
+                    let mut sandboxes = self.sandboxes.write();
+                    sandboxes.insert(
+                        name.clone(),
+                        Arc::new(parking_lot::Mutex::new(SandboxEntry {
+                            manager,
+                            mounts,
+                            ports,
+                            resources,
+                            restart: record.restart.clone(),
+                            network: record.network,
+                        })),
+                    );
+                    loaded.push(name.clone());
                 }
                 Err(e) => {
-                    tracing::warn!(sandbox = %name, error = %e, "failed to create manager for sandbox");
+                    // Process is alive but manager creation failed (transient
+                    // filesystem/env issue). Preserve the DB record so the VM
+                    // isn't orphaned — next server restart can retry.
+                    tracing::warn!(sandbox = %name, error = %e, "failed to create manager for alive sandbox, preserving DB record");
                 }
             }
         }
 
         loaded
-    }
-
-    /// Register a new sandbox (also persists to database).
-    pub fn register_sandbox(&self, name: String, reg: SandboxRegistration) -> Result<(), ApiError> {
-        // Check for conflicts
-        {
-            let sandboxes = self.sandboxes.read();
-            if sandboxes.contains_key(&name) {
-                return Err(ApiError::Conflict(format!(
-                    "sandbox '{}' already exists",
-                    name
-                )));
-            }
-        }
-
-        // Persist to database
-        let record = VmRecord::new_with_restart(
-            name.clone(),
-            reg.resources.cpus.unwrap_or(crate::agent::DEFAULT_CPUS),
-            reg.resources
-                .memory_mb
-                .unwrap_or(crate::agent::DEFAULT_MEMORY_MIB),
-            reg.mounts
-                .iter()
-                .map(|m| (m.source.clone(), m.target.clone(), m.readonly))
-                .collect(),
-            reg.ports.iter().map(|p| (p.host, p.guest)).collect(),
-            reg.network,
-            reg.restart.clone(),
-        );
-
-        if let Err(e) = self.db.insert_vm(&name, &record) {
-            tracing::warn!(error = %e, "failed to persist sandbox to database");
-        }
-
-        // Add to in-memory registry
-        let mut sandboxes = self.sandboxes.write();
-        sandboxes.insert(
-            name,
-            Arc::new(parking_lot::Mutex::new(SandboxEntry {
-                manager: reg.manager,
-                mounts: reg.mounts,
-                ports: reg.ports,
-                resources: reg.resources,
-                restart: reg.restart,
-                network: reg.network,
-            })),
-        );
-        Ok(())
     }
 
     /// Get a sandbox entry by name.
@@ -323,29 +250,61 @@ impl ApiState {
         &self,
         name: &str,
     ) -> Result<Arc<parking_lot::Mutex<SandboxEntry>>, ApiError> {
-        // Remove from in-memory registry
-        let entry = {
-            let mut sandboxes = self.sandboxes.write();
-            sandboxes
-                .remove(name)
-                .ok_or_else(|| ApiError::NotFound(format!("sandbox '{}' not found", name)))?
-        };
+        // Hold write lock across the entire operation to prevent concurrent
+        // delete races (check + DB delete + in-memory remove must be atomic).
+        let mut sandboxes = self.sandboxes.write();
 
-        // Remove from database
-        if let Err(e) = self.db.remove_vm(name) {
-            tracing::warn!(error = %e, "failed to remove sandbox from database");
+        if !sandboxes.contains_key(name) {
+            return Err(ApiError::NotFound(format!("sandbox '{}' not found", name)));
         }
+
+        // Remove from database first — if this fails, in-memory state stays consistent
+        match self.db.remove_vm(name) {
+            Ok(Some(_)) => {} // expected: row existed and was deleted
+            Ok(None) => {
+                // Row was already gone from DB (concurrent delete or manual cleanup).
+                // Log and continue — we still need to clean up in-memory state.
+                tracing::warn!(
+                    sandbox = name,
+                    "sandbox not found in database during remove (already deleted?)"
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, sandbox = name, "failed to remove sandbox from database");
+                return Err(ApiError::Internal(format!("database error: {}", e)));
+            }
+        }
+
+        // Remove from in-memory registry (guaranteed to succeed — we hold the write lock)
+        let entry = sandboxes
+            .remove(name)
+            .expect("sandbox disappeared while holding write lock");
 
         Ok(entry)
     }
 
     /// Update sandbox state in database (call after start/stop).
-    pub fn update_sandbox_state(&self, name: &str, state: RecordState, pid: Option<i32>) {
-        if let Err(e) = self.db.update_vm(name, |record| {
+    ///
+    /// Returns an error if the database write fails. Callers in API handlers
+    /// should propagate this error; the supervisor can log and continue.
+    pub fn update_sandbox_state(
+        &self,
+        name: &str,
+        state: RecordState,
+        pid: Option<i32>,
+    ) -> std::result::Result<(), crate::Error> {
+        let pid_start_time = pid.and_then(crate::process::process_start_time);
+        let result = self.db.update_vm(name, |record| {
             record.state = state;
             record.pid = pid;
-        }) {
-            tracing::warn!(error = %e, "failed to persist sandbox state");
+            record.pid_start_time = pid_start_time;
+        })?;
+        match result {
+            Some(()) => Ok(()),
+            None => Err(crate::Error::database(
+                "update sandbox state",
+                format!("sandbox '{}' not found in database", name),
+            )),
         }
     }
 
@@ -356,35 +315,7 @@ impl ApiState {
             .iter()
             .map(|(name, entry)| {
                 let entry = entry.lock();
-                let state = format!("{:?}", entry.manager.state());
-                let pid = entry.manager.child_pid();
-                // Convert mounts to MountInfo with tags
-                let mounts = entry
-                    .mounts
-                    .iter()
-                    .enumerate()
-                    .map(|(i, m)| MountInfo {
-                        tag: format!("smolvm{}", i),
-                        source: m.source.clone(),
-                        target: m.target.clone(),
-                        readonly: m.readonly,
-                    })
-                    .collect();
-                let restart_count = if entry.restart.restart_count > 0 {
-                    Some(entry.restart.restart_count)
-                } else {
-                    None
-                };
-                SandboxInfo {
-                    name: name.clone(),
-                    state: state.to_lowercase(),
-                    pid,
-                    mounts,
-                    ports: entry.ports.clone(),
-                    resources: entry.resources.clone(),
-                    network: entry.network,
-                    restart_count,
-                }
+                crate::api::handlers::sandboxes::sandbox_entry_to_info(name.clone(), &entry)
             })
             .collect()
     }
@@ -544,7 +475,7 @@ impl ApiState {
             };
 
             let entry = entry.lock();
-            if entry.manager.is_running() {
+            if entry.manager.is_process_alive() {
                 tracing::info!(sandbox = %name, "stopping sandbox");
                 if let Err(e) = entry.manager.stop() {
                     tracing::warn!(sandbox = %name, error = %e, "failed to stop sandbox");
@@ -576,53 +507,55 @@ impl ApiState {
         })
     }
 
+    /// Best-effort update to the VM database record. Logs warnings on
+    /// `Ok(None)` (row not found) and `Err` without propagating.
+    fn update_vm_best_effort(&self, name: &str, op_label: &str, f: impl FnOnce(&mut VmRecord)) {
+        match self.db.update_vm(name, f) {
+            Ok(Some(())) => {}
+            Ok(None) => {
+                tracing::warn!(sandbox = %name, op = op_label, "sandbox not found in database");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, sandbox = %name, op = op_label, "failed to persist update");
+            }
+        }
+    }
+
     /// Increment restart count for a sandbox.
     pub fn increment_restart_count(&self, name: &str) {
-        // Update in-memory
         if let Some(entry) = self.sandboxes.read().get(name) {
-            let mut entry = entry.lock();
-            entry.restart.restart_count += 1;
+            entry.lock().restart.restart_count += 1;
         }
-        // Update in database
-        if let Err(e) = self.db.update_vm(name, |r| r.restart.restart_count += 1) {
-            tracing::warn!(error = %e, sandbox = %name, "failed to persist restart count");
-        }
+        self.update_vm_best_effort(name, "increment_restart_count", |r| {
+            r.restart.restart_count += 1;
+        });
     }
 
     /// Mark sandbox as user-stopped.
     pub fn mark_user_stopped(&self, name: &str, stopped: bool) {
-        // Update in-memory
         if let Some(entry) = self.sandboxes.read().get(name) {
-            let mut entry = entry.lock();
-            entry.restart.user_stopped = stopped;
+            entry.lock().restart.user_stopped = stopped;
         }
-        // Update in database
-        if let Err(e) = self
-            .db
-            .update_vm(name, |r| r.restart.user_stopped = stopped)
-        {
-            tracing::warn!(error = %e, sandbox = %name, "failed to persist user_stopped");
-        }
+        self.update_vm_best_effort(name, "mark_user_stopped", |r| {
+            r.restart.user_stopped = stopped;
+        });
     }
 
     /// Reset restart count (on successful start).
     pub fn reset_restart_count(&self, name: &str) {
-        // Update in-memory
         if let Some(entry) = self.sandboxes.read().get(name) {
-            let mut entry = entry.lock();
-            entry.restart.restart_count = 0;
+            entry.lock().restart.restart_count = 0;
         }
-        // Update in database
-        if let Err(e) = self.db.update_vm(name, |r| r.restart.restart_count = 0) {
-            tracing::warn!(error = %e, sandbox = %name, "failed to reset restart count");
-        }
+        self.update_vm_best_effort(name, "reset_restart_count", |r| {
+            r.restart.restart_count = 0;
+        });
     }
 
     /// Update last exit code for a sandbox.
     pub fn set_last_exit_code(&self, name: &str, exit_code: Option<i32>) {
-        if let Err(e) = self.db.update_vm(name, |r| r.last_exit_code = exit_code) {
-            tracing::warn!(error = %e, sandbox = %name, "failed to persist exit code");
-        }
+        self.update_vm_best_effort(name, "set_last_exit_code", |r| {
+            r.last_exit_code = exit_code;
+        });
     }
 
     /// Get last exit code for a sandbox.
@@ -635,30 +568,40 @@ impl ApiState {
     }
 
     /// Check if a sandbox process is alive.
+    ///
+    /// Delegates to `AgentManager::is_process_alive()` which checks the
+    /// in-memory child handle (with stored start time) and falls back to the
+    /// PID file. This is start-time-aware to avoid false positives from PID
+    /// reuse, and covers orphan processes not tracked in-memory.
     pub fn is_sandbox_alive(&self, name: &str) -> bool {
         if let Some(entry) = self.sandboxes.read().get(name) {
             let entry = entry.lock();
-            entry.manager.is_running()
+            entry.manager.is_process_alive()
         } else {
             false
         }
     }
+}
 
-    /// Temporarily close the database to release file locks before forking.
-    ///
-    /// This prevents child processes (VMs) from inheriting the database
-    /// file descriptor and holding the lock after the parent reopens it.
-    /// Call `reopen_db()` after the fork completes.
-    pub fn close_db_temporarily(&self) {
-        self.db.close_temporarily();
-    }
-
-    /// Reopen the database after a fork operation.
-    ///
-    /// Call this after forking to restore database access.
-    pub fn reopen_db(&self) -> crate::Result<()> {
-        self.db.reopen()
-    }
+/// Run a blocking operation against a sandbox's agent client.
+///
+/// Handles the common pattern: clone entry → spawn_blocking → lock → connect → op → map errors.
+pub async fn with_sandbox_client<T, F>(
+    entry: &Arc<parking_lot::Mutex<SandboxEntry>>,
+    op: F,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut crate::agent::AgentClient) -> crate::Result<T> + Send + 'static,
+{
+    let entry_clone = entry.clone();
+    tokio::task::spawn_blocking(move || {
+        let entry = entry_clone.lock();
+        let mut client = entry.manager.connect()?;
+        op(&mut client)
+    })
+    .await?
+    .map_err(ApiError::internal)
 }
 
 impl ApiState {
@@ -690,9 +633,9 @@ pub async fn ensure_sandbox_running(
         let mounts: Vec<_> = entry
             .mounts
             .iter()
-            .map(mount_spec_to_host_mount)
+            .map(HostMount::try_from)
             .collect::<crate::Result<Vec<_>>>()?;
-        let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
+        let ports: Vec<_> = entry.ports.iter().map(PortMapping::from).collect();
         let resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
 
         entry
@@ -703,29 +646,44 @@ pub async fn ensure_sandbox_running(
     .map_err(|e| crate::Error::agent("ensure running", e.to_string()))?
 }
 
-/// Ensure a sandbox is running while temporarily closing the DB for fork safety.
-///
-/// Use this helper for paths that may fork a child VM process while the host
-/// process holds the database handle.
-pub async fn ensure_sandbox_running_with_db_guard(
-    state: &ApiState,
-    entry: &Arc<parking_lot::Mutex<SandboxEntry>>,
-) -> crate::Result<()> {
-    let _db_guard = DbCloseGuard::new(state);
-    ensure_sandbox_running(entry).await
-}
-
 // ============================================================================
 // Type Conversions
 // ============================================================================
 
-/// Convert MountSpec to HostMount.
-///
-/// Validates and canonicalizes the mount paths.
-pub fn mount_spec_to_host_mount(spec: &MountSpec) -> crate::Result<HostMount> {
-    // Use MountBinding for validation and canonicalization
-    let binding = MountBinding::try_from(spec)?;
-    Ok(HostMount::from(&binding))
+impl TryFrom<&MountSpec> for HostMount {
+    type Error = crate::Error;
+
+    /// Validate and canonicalize a MountSpec into a HostMount.
+    fn try_from(spec: &MountSpec) -> Result<Self, Self::Error> {
+        let binding = MountBinding::try_from(spec)?;
+        Ok(HostMount::from(&binding))
+    }
+}
+
+impl From<&HostMount> for MountSpec {
+    fn from(mount: &HostMount) -> Self {
+        let binding = MountBinding::from_stored(
+            mount.source.to_string_lossy().to_string(),
+            mount.target.to_string_lossy().to_string(),
+            mount.read_only,
+        );
+        MountSpec::from(&binding)
+    }
+}
+
+impl From<&PortSpec> for PortMapping {
+    fn from(spec: &PortSpec) -> Self {
+        PortMapping::new(spec.host, spec.guest)
+    }
+}
+
+impl From<&PortMapping> for PortSpec {
+    fn from(mapping: &PortMapping) -> Self {
+        PortSpec {
+            host: mapping.host,
+            guest: mapping.guest,
+        }
+    }
 }
 
 /// Convert multiple MountSpecs to MountBindings.
@@ -736,11 +694,6 @@ pub fn mounts_to_bindings(specs: &[MountSpec]) -> Result<Vec<MountBinding>, ApiE
         .iter()
         .map(|s| MountBinding::try_from(s).map_err(|e| ApiError::BadRequest(e.to_string())))
         .collect()
-}
-
-/// Convert PortSpec to PortMapping.
-pub fn port_spec_to_mapping(spec: &PortSpec) -> PortMapping {
-    PortMapping::new(spec.host, spec.guest)
 }
 
 /// Convert ResourceSpec to VmResources.
@@ -758,25 +711,6 @@ pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
         cpus: Some(res.cpus),
         memory_mb: Some(res.mem),
         network: Some(res.network),
-    }
-}
-
-/// Convert HostMount to MountSpec.
-pub fn host_mount_to_spec(mount: &HostMount) -> MountSpec {
-    // Create a MountBinding without validation (already validated)
-    let binding = MountBinding::from_stored(
-        mount.source.to_string_lossy().to_string(),
-        mount.target.to_string_lossy().to_string(),
-        mount.read_only,
-    );
-    MountSpec::from(&binding)
-}
-
-/// Convert PortMapping to PortSpec.
-pub fn port_mapping_to_spec(mapping: &PortMapping) -> PortSpec {
-    PortSpec {
-        host: mapping.host,
-        guest: mapping.guest,
     }
 }
 
@@ -821,14 +755,14 @@ mod tests {
             target: "/guest".into(),
             readonly: true,
         };
-        assert!(mount_spec_to_host_mount(&spec).unwrap().read_only);
+        assert!(HostMount::try_from(&spec).unwrap().read_only);
 
         let spec = MountSpec {
             source: "/tmp".into(),
             target: "/guest".into(),
             readonly: false,
         };
-        assert!(!mount_spec_to_host_mount(&spec).unwrap().read_only);
+        assert!(!HostMount::try_from(&spec).unwrap().read_only);
 
         // ResourceSpec with None uses defaults
         let spec = ResourceSpec {
@@ -857,5 +791,80 @@ mod tests {
             state.remove_sandbox("nope"),
             Err(ApiError::NotFound(_))
         ));
+    }
+
+    // ========================================================================
+    // Startup reconciliation tests
+    // ========================================================================
+
+    #[test]
+    fn test_load_persisted_sandboxes_removes_dead_records() {
+        let (_dir, state) = temp_api_state();
+
+        // Insert a record with a PID that doesn't exist (dead process)
+        let mut record = VmRecord::new("dead-sandbox".into(), 1, 512, vec![], vec![], false);
+        record.pid = Some(i32::MAX); // PID that certainly doesn't exist
+        record.state = RecordState::Running;
+        state.db.insert_vm("dead-sandbox", &record).unwrap();
+
+        // Verify record exists before load
+        assert!(state.db.get_vm("dead-sandbox").unwrap().is_some());
+
+        // Load should detect dead process and clean up DB record
+        let loaded = state.load_persisted_sandboxes();
+        assert!(loaded.is_empty(), "dead sandbox should not be loaded");
+
+        // DB record should be cleaned up
+        assert!(
+            state.db.get_vm("dead-sandbox").unwrap().is_none(),
+            "dead sandbox DB record should be removed"
+        );
+
+        // Name should be available for reuse
+        assert!(state.reserve_sandbox_name("dead-sandbox").is_ok());
+    }
+
+    #[test]
+    fn test_load_persisted_sandboxes_dead_record_does_not_block_name() {
+        let (_dir, state) = temp_api_state();
+
+        // Insert a dead record with no PID (definitely dead)
+        let record = VmRecord::new("ghost".into(), 1, 512, vec![], vec![], false);
+        state.db.insert_vm("ghost", &record).unwrap();
+
+        // Load should remove it (no PID = dead)
+        let loaded = state.load_persisted_sandboxes();
+        assert!(loaded.is_empty());
+
+        // Name should not be blocked
+        assert!(
+            state.reserve_sandbox_name("ghost").is_ok(),
+            "cleaned-up name should be available for reuse"
+        );
+    }
+
+    #[test]
+    fn test_load_persisted_sandboxes_preserves_alive_unreachable_records() {
+        let (_dir, state) = temp_api_state();
+
+        // Use our own PID (always alive and owned by us, so kill(pid,0)==0).
+        // AgentManager::for_vm will create a VM directory but reconnect
+        // will fail (no socket/agent), so it hits the "alive but unreachable"
+        // path. The DB record should be preserved.
+        let our_pid = std::process::id() as i32;
+        let mut record = VmRecord::new("alive-vm".into(), 1, 512, vec![], vec![], false);
+        record.pid = Some(our_pid);
+        record.state = RecordState::Running;
+        state.db.insert_vm("alive-vm", &record).unwrap();
+
+        // Load — reconnect will fail (no agent socket), but record should
+        // be preserved in DB since process is alive
+        let _loaded = state.load_persisted_sandboxes();
+
+        // DB record should still exist (not deleted)
+        assert!(
+            state.db.get_vm("alive-vm").unwrap().is_some(),
+            "alive sandbox DB record should be preserved when reconnect fails"
+        );
     }
 }

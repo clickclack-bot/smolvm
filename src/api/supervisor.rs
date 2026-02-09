@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
-use crate::api::state::{ensure_sandbox_running_with_db_guard, ApiState};
+use crate::api::state::{ensure_sandbox_running, ApiState};
 use crate::config::{RecordState, RestartConfig, RestartPolicy};
 
 /// Interval between health checks.
@@ -80,6 +80,17 @@ impl Supervisor {
             return Ok(());
         }
 
+        // Sandbox is dead — try to retrieve its exit code via waitpid
+        // and persist it so the restart policy can use it.
+        if let Ok(Some(record)) = self.state.db().get_vm(name) {
+            if let Some(pid) = record.pid {
+                let exit_code = crate::process::try_wait(pid);
+                self.state.set_last_exit_code(name, exit_code);
+            }
+        }
+
+        let last_exit_code = self.state.get_last_exit_code(name);
+
         // Sandbox is dead, check restart policy
         let restart_config = match self.state.get_restart_config(name) {
             Some(config) => config,
@@ -87,11 +98,15 @@ impl Supervisor {
         };
 
         // Determine if we should restart
-        if !Self::should_restart(&restart_config) {
+        if !Self::should_restart(&restart_config, last_exit_code) {
             tracing::debug!(sandbox = %name, policy = %restart_config.policy, "sandbox dead, not restarting per policy");
-            // Update state to stopped
-            self.state
-                .update_sandbox_state(name, RecordState::Stopped, None);
+            // Update state to stopped (best-effort in supervisor)
+            if let Err(e) = self
+                .state
+                .update_sandbox_state(name, RecordState::Stopped, None)
+            {
+                tracing::warn!(sandbox = %name, error = %e, "failed to persist stopped state");
+            }
             return Ok(());
         }
 
@@ -128,7 +143,7 @@ impl Supervisor {
             }
         };
 
-        let start_result = ensure_sandbox_running_with_db_guard(self.state.as_ref(), &entry).await;
+        let start_result = ensure_sandbox_running(&entry).await;
 
         // Handle start result
         match start_result {
@@ -138,14 +153,22 @@ impl Supervisor {
                     let entry = entry.lock();
                     entry.manager.child_pid()
                 };
-                self.state
-                    .update_sandbox_state(name, RecordState::Running, pid);
+                if let Err(e) = self
+                    .state
+                    .update_sandbox_state(name, RecordState::Running, pid)
+                {
+                    tracing::warn!(sandbox = %name, error = %e, "failed to persist running state");
+                }
                 tracing::info!(sandbox = %name, pid = ?pid, "sandbox restarted successfully");
                 Ok(())
             }
             Err(e) => {
-                self.state
-                    .update_sandbox_state(name, RecordState::Failed, None);
+                if let Err(db_err) =
+                    self.state
+                        .update_sandbox_state(name, RecordState::Failed, None)
+                {
+                    tracing::warn!(sandbox = %name, error = %db_err, "failed to persist failed state");
+                }
                 tracing::error!(sandbox = %name, error = %e, "failed to restart sandbox");
                 Err(e)
             }
@@ -153,7 +176,7 @@ impl Supervisor {
     }
 
     /// Determine if a sandbox should be restarted based on its restart configuration.
-    fn should_restart(config: &RestartConfig) -> bool {
+    fn should_restart(config: &RestartConfig, last_exit_code: Option<i32>) -> bool {
         // Check max retries limit
         if config.max_retries > 0 && config.restart_count >= config.max_retries {
             return false;
@@ -163,9 +186,9 @@ impl Supervisor {
             RestartPolicy::Never => false,
             RestartPolicy::Always => true,
             RestartPolicy::OnFailure => {
-                // For on-failure, we would ideally check exit code
-                // Since we don't track exit code precisely, treat any unexpected death as failure
-                true
+                // Only restart if the process exited with a non-zero exit code.
+                // Exit code 0 means clean exit — no restart needed.
+                last_exit_code != Some(0)
             }
             RestartPolicy::UnlessStopped => !config.user_stopped,
         }
@@ -216,15 +239,32 @@ mod tests {
 
     #[test]
     fn test_should_restart() {
-        // (policy, max_retries, restart_count, user_stopped, expected, description)
+        // (policy, max_retries, restart_count, user_stopped, last_exit_code, expected, description)
         let cases = [
-            (RestartPolicy::Never, 0, 0, false, false, "never policy"),
-            (RestartPolicy::Always, 0, 5, false, true, "always policy"),
+            (
+                RestartPolicy::Never,
+                0,
+                0,
+                false,
+                None,
+                false,
+                "never policy",
+            ),
+            (
+                RestartPolicy::Always,
+                0,
+                5,
+                false,
+                None,
+                true,
+                "always policy",
+            ),
             (
                 RestartPolicy::Always,
                 3,
                 3,
                 false,
+                None,
                 false,
                 "max retries reached",
             ),
@@ -233,14 +273,43 @@ mod tests {
                 3,
                 2,
                 false,
+                None,
                 true,
                 "under max retries",
+            ),
+            (
+                RestartPolicy::OnFailure,
+                0,
+                0,
+                false,
+                Some(1),
+                true,
+                "on-failure with non-zero exit",
+            ),
+            (
+                RestartPolicy::OnFailure,
+                0,
+                0,
+                false,
+                Some(0),
+                false,
+                "on-failure with clean exit",
+            ),
+            (
+                RestartPolicy::OnFailure,
+                0,
+                0,
+                false,
+                None,
+                true,
+                "on-failure with unknown exit code",
             ),
             (
                 RestartPolicy::UnlessStopped,
                 0,
                 0,
                 false,
+                None,
                 true,
                 "unless-stopped running",
             ),
@@ -249,19 +318,27 @@ mod tests {
                 0,
                 0,
                 true,
+                None,
                 false,
                 "unless-stopped user stopped",
             ),
         ];
 
-        for (policy, max_retries, restart_count, user_stopped, expected, desc) in cases {
+        for (policy, max_retries, restart_count, user_stopped, last_exit_code, expected, desc) in
+            cases
+        {
             let config = RestartConfig {
                 policy,
                 max_retries,
                 restart_count,
                 user_stopped,
             };
-            assert_eq!(Supervisor::should_restart(&config), expected, "{}", desc);
+            assert_eq!(
+                Supervisor::should_restart(&config, last_exit_code),
+                expected,
+                "{}",
+                desc
+            );
         }
     }
 

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::agent::PullOptions;
 use crate::api::error::ApiError;
-use crate::api::state::{ensure_sandbox_running, ApiState};
+use crate::api::state::{ensure_sandbox_running, with_sandbox_client, ApiState};
 use crate::api::types::{
     ApiErrorResponse, ImageInfo, ListImagesResponse, PullImageRequest, PullImageResponse,
 };
@@ -32,23 +32,15 @@ pub async fn list_images(
 ) -> Result<Json<ListImagesResponse>, ApiError> {
     let entry = state.get_sandbox(&sandbox_id)?;
 
-    // Check if sandbox is running, return empty list if not
+    // Check if sandbox VM is actually alive, return empty list if not
     {
         let entry = entry.lock();
-        if !entry.manager.is_running() {
+        if !entry.manager.is_process_alive() {
             return Ok(Json(ListImagesResponse { images: Vec::new() }));
         }
     }
 
-    // List images in blocking task
-    let entry_clone = entry.clone();
-    let images = tokio::task::spawn_blocking(move || {
-        let entry = entry_clone.lock();
-        let mut client = entry.manager.connect()?;
-        client.list_images()
-    })
-    .await?
-    .map_err(ApiError::internal)?;
+    let images = with_sandbox_client(&entry, |c| c.list_images()).await?;
 
     let images = images
         .into_iter()
@@ -99,21 +91,16 @@ pub async fn pull_image(
         .await
         .map_err(ApiError::internal)?;
 
-    // Pull image in blocking task
     let image = req.image.clone();
     let platform = req.platform.clone();
-    let entry_clone = entry.clone();
-    let image_info = tokio::task::spawn_blocking(move || {
-        let entry = entry_clone.lock();
-        let mut client = entry.manager.connect()?;
+    let image_info = with_sandbox_client(&entry, move |c| {
         let mut opts = PullOptions::new().use_registry_config(true);
         if let Some(p) = platform {
             opts = opts.platform(p);
         }
-        client.pull(&image, opts)
+        c.pull(&image, opts)
     })
-    .await?
-    .map_err(ApiError::internal)?;
+    .await?;
 
     Ok(Json(PullImageResponse {
         image: ImageInfo {

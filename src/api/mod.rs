@@ -28,7 +28,11 @@ use axum::{
 };
 use std::sync::Arc;
 use std::time::Duration;
-use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    timeout::TimeoutLayer,
+    trace::TraceLayer,
+};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -133,7 +137,10 @@ pub struct ApiDoc;
 const API_REQUEST_TIMEOUT_SECS: u64 = 300;
 
 /// Create the API router with all endpoints.
-pub fn create_router(state: Arc<ApiState>) -> Router {
+///
+/// `cors_origins` specifies allowed CORS origins. If empty, defaults to
+/// localhost:8080 and localhost:3000 (both http and 127.0.0.1 variants).
+pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router {
     // Health check route
     let health_route = Router::new().route("/health", get(handlers::health::health));
 
@@ -207,15 +214,39 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .nest("/sandboxes", sandbox_routes)
         .nest("/microvms", microvm_routes);
 
-    // CORS: Allow localhost origins only by default for security.
-    // Production deployments should configure their own CORS policy.
-    let cors = CorsLayer::new()
-        .allow_origin([
+    // CORS: Use configured origins, or default to localhost for security.
+    let origins: Vec<axum::http::HeaderValue> = if cors_origins.is_empty() {
+        vec![
             "http://localhost:8080".parse().unwrap(),
             "http://127.0.0.1:8080".parse().unwrap(),
             "http://localhost:3000".parse().unwrap(),
             "http://127.0.0.1:3000".parse().unwrap(),
-        ])
+        ]
+    } else {
+        let mut valid = Vec::new();
+        for origin in &cors_origins {
+            match origin.parse() {
+                Ok(v) => valid.push(v),
+                Err(e) => {
+                    tracing::warn!(origin = %origin, error = %e, "invalid CORS origin, skipping");
+                }
+            }
+        }
+        if valid.is_empty() {
+            tracing::warn!("no valid CORS origins provided, falling back to defaults");
+            vec![
+                "http://localhost:8080".parse().unwrap(),
+                "http://127.0.0.1:8080".parse().unwrap(),
+                "http://localhost:3000".parse().unwrap(),
+                "http://127.0.0.1:3000".parse().unwrap(),
+            ]
+        } else {
+            valid
+        }
+    };
+
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,

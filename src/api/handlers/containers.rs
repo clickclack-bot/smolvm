@@ -8,12 +8,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::api::error::ApiError;
-use crate::api::state::{ensure_sandbox_running, ApiState};
+use crate::api::state::{ensure_sandbox_running, with_sandbox_client, ApiState};
 use crate::api::types::{
     ApiErrorResponse, ContainerExecRequest, ContainerInfo, CreateContainerRequest,
-    DeleteContainerRequest, DeleteResponse, ExecResponse, ListContainersResponse, StartResponse,
-    StopContainerRequest, StopResponse,
+    DeleteContainerRequest, DeleteResponse, EnvVar, ExecResponse, ListContainersResponse,
+    StartResponse, StopContainerRequest, StopResponse,
 };
+use crate::api::validation::validate_command;
 
 /// Create a container in a sandbox.
 #[utoipa::path(
@@ -49,11 +50,7 @@ pub async fn create_container(
     } else {
         req.command.clone()
     };
-    let env: Vec<(String, String)> = req
-        .env
-        .iter()
-        .map(|e| (e.name.clone(), e.value.clone()))
-        .collect();
+    let env = EnvVar::to_tuples(&req.env);
     let workdir = req.workdir.clone();
     let mounts: Vec<(String, String, bool)> = req
         .mounts
@@ -61,15 +58,10 @@ pub async fn create_container(
         .map(|m| (m.source.clone(), m.target.clone(), m.readonly))
         .collect();
 
-    // Create container in blocking task
-    let entry_clone = entry.clone();
-    let container_info = tokio::task::spawn_blocking(move || {
-        let entry = entry_clone.lock();
-        let mut client = entry.manager.connect()?;
-        client.create_container(&image, command, env, workdir, mounts)
+    let container_info = with_sandbox_client(&entry, move |c| {
+        c.create_container(&image, command, env, workdir, mounts)
     })
-    .await?
-    .map_err(ApiError::internal)?;
+    .await?;
 
     Ok(Json(ContainerInfo {
         id: container_info.id,
@@ -99,25 +91,17 @@ pub async fn list_containers(
 ) -> Result<Json<ListContainersResponse>, ApiError> {
     let entry = state.get_sandbox(&sandbox_id)?;
 
-    // Check if sandbox is running, return empty list if not
+    // Check if sandbox VM is actually alive, return empty list if not
     {
         let entry = entry.lock();
-        if !entry.manager.is_running() {
+        if !entry.manager.is_process_alive() {
             return Ok(Json(ListContainersResponse {
                 containers: Vec::new(),
             }));
         }
     }
 
-    // List containers in blocking task
-    let entry_clone = entry.clone();
-    let containers = tokio::task::spawn_blocking(move || {
-        let entry = entry_clone.lock();
-        let mut client = entry.manager.connect()?;
-        client.list_containers()
-    })
-    .await?
-    .map_err(ApiError::internal)?;
+    let containers = with_sandbox_client(&entry, |c| c.list_containers()).await?;
 
     let containers = containers
         .into_iter()
@@ -154,19 +138,8 @@ pub async fn start_container(
 ) -> Result<Json<StartResponse>, ApiError> {
     let entry = state.get_sandbox(&sandbox_id)?;
 
-    // Clone container_id for the response
     let container_id_response = container_id.clone();
-
-    // Start container in blocking task
-    let entry_clone = entry.clone();
-    tokio::task::spawn_blocking(move || {
-        let entry = entry_clone.lock();
-        let mut client = entry.manager.connect()?;
-        client.start_container(&container_id)
-    })
-    .await?
-    .map_err(ApiError::internal)?;
-
+    with_sandbox_client(&entry, move |c| c.start_container(&container_id)).await?;
     Ok(Json(StartResponse {
         started: container_id_response,
     }))
@@ -197,19 +170,11 @@ pub async fn stop_container(
 
     let timeout_secs = req.timeout_secs;
 
-    // Clone container_id for the response
     let container_id_response = container_id.clone();
-
-    // Stop container in blocking task
-    let entry_clone = entry.clone();
-    tokio::task::spawn_blocking(move || {
-        let entry = entry_clone.lock();
-        let mut client = entry.manager.connect()?;
-        client.stop_container(&container_id, timeout_secs)
+    with_sandbox_client(&entry, move |c| {
+        c.stop_container(&container_id, timeout_secs)
     })
-    .await?
-    .map_err(ApiError::internal)?;
-
+    .await?;
     Ok(Json(StopResponse {
         stopped: container_id_response,
     }))
@@ -240,19 +205,8 @@ pub async fn delete_container(
 
     let force = req.force;
 
-    // Clone container_id for the response
     let container_id_response = container_id.clone();
-
-    // Delete container in blocking task
-    let entry_clone = entry.clone();
-    tokio::task::spawn_blocking(move || {
-        let entry = entry_clone.lock();
-        let mut client = entry.manager.connect()?;
-        client.delete_container(&container_id, force)
-    })
-    .await?
-    .map_err(ApiError::internal)?;
-
+    with_sandbox_client(&entry, move |c| c.delete_container(&container_id, force)).await?;
     Ok(Json(DeleteResponse {
         deleted: container_id_response,
     }))
@@ -280,31 +234,20 @@ pub async fn exec_in_container(
     Path((sandbox_id, container_id)): Path<(String, String)>,
     Json(req): Json<ContainerExecRequest>,
 ) -> Result<Json<ExecResponse>, ApiError> {
-    if req.command.is_empty() {
-        return Err(ApiError::BadRequest("command cannot be empty".into()));
-    }
+    validate_command(&req.command)?;
 
     let entry = state.get_sandbox(&sandbox_id)?;
 
     // Prepare parameters
     let command = req.command.clone();
-    let env: Vec<(String, String)> = req
-        .env
-        .iter()
-        .map(|e| (e.name.clone(), e.value.clone()))
-        .collect();
+    let env = EnvVar::to_tuples(&req.env);
     let workdir = req.workdir.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
 
-    // Execute in blocking task
-    let entry_clone = entry.clone();
-    let (exit_code, stdout, stderr) = tokio::task::spawn_blocking(move || {
-        let entry = entry_clone.lock();
-        let mut client = entry.manager.connect()?;
-        client.exec(&container_id, command, env, workdir, timeout)
+    let (exit_code, stdout, stderr) = with_sandbox_client(&entry, move |c| {
+        c.exec(&container_id, command, env, workdir, timeout)
     })
-    .await?
-    .map_err(ApiError::internal)?;
+    .await?;
 
     Ok(Json(ExecResponse {
         exit_code,

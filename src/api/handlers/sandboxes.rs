@@ -6,11 +6,10 @@ use axum::{
 };
 use std::sync::Arc;
 
-use crate::agent::AgentManager;
+use crate::agent::{AgentManager, HostMount};
 use crate::api::error::ApiError;
 use crate::api::state::{
-    ensure_sandbox_running_with_db_guard, mount_spec_to_host_mount, restart_spec_to_config,
-    ApiState, ReservationGuard, SandboxRegistration,
+    ensure_sandbox_running, restart_spec_to_config, ApiState, ReservationGuard, SandboxRegistration,
 };
 use crate::api::types::{
     ApiErrorResponse, CreateSandboxRequest, DeleteQuery, DeleteResponse, ListSandboxesResponse,
@@ -20,15 +19,17 @@ use crate::api::validation::validate_resource_name;
 use crate::config::RecordState;
 
 /// Maximum sandbox name length.
-const MAX_NAME_LENGTH: usize = 64;
+/// Socket path is ~/Library/Caches/smolvm/vms/{name}/agent.sock — a name
+/// of 40 chars results in a socket path of ~90 chars, leaving some margin.
+const MAX_NAME_LENGTH: usize = 40;
 
 /// Convert MountSpec list to MountInfo list with virtiofs tags.
-fn mounts_to_info(mounts: &[MountSpec]) -> Vec<MountInfo> {
+pub(crate) fn mounts_to_info(mounts: &[MountSpec]) -> Vec<MountInfo> {
     mounts
         .iter()
         .enumerate()
         .map(|(i, m)| MountInfo {
-            tag: format!("smolvm{}", i),
+            tag: crate::agent::mount_tag(i),
             source: m.source.clone(),
             target: m.target.clone(),
             readonly: m.readonly,
@@ -36,17 +37,26 @@ fn mounts_to_info(mounts: &[MountSpec]) -> Vec<MountInfo> {
         .collect()
 }
 
-/// Validate a sandbox name.
-///
-/// Rules:
-/// - Length: 1-64 characters
-/// - Allowed characters: alphanumeric, hyphen (-), underscore (_)
-/// - Must start with a letter or digit
-/// - Cannot end with a hyphen
-/// - No consecutive hyphens
-/// - No path separators (/, \)
-fn validate_sandbox_name(name: &str) -> Result<(), ApiError> {
-    validate_resource_name(name, "sandbox", MAX_NAME_LENGTH)
+/// Build a SandboxInfo from a locked SandboxEntry.
+pub(crate) fn sandbox_entry_to_info(
+    name: String,
+    entry: &crate::api::state::SandboxEntry,
+) -> SandboxInfo {
+    let (effective_state, pid) = entry.manager.effective_status();
+    SandboxInfo {
+        name,
+        state: effective_state.to_string(),
+        pid,
+        mounts: mounts_to_info(&entry.mounts),
+        ports: entry.ports.clone(),
+        resources: entry.resources.clone(),
+        network: entry.network,
+        restart_count: if entry.restart.restart_count > 0 {
+            Some(entry.restart.restart_count)
+        } else {
+            None
+        },
+    }
 }
 
 /// Create a new sandbox.
@@ -66,12 +76,11 @@ pub async fn create_sandbox(
     Json(req): Json<CreateSandboxRequest>,
 ) -> Result<Json<SandboxInfo>, ApiError> {
     // Validate name format
-    validate_sandbox_name(&req.name)?;
+    validate_resource_name(&req.name, "sandbox", MAX_NAME_LENGTH)?;
 
     // Validate mounts
-    let _mounts_result: Result<Vec<_>, _> =
-        req.mounts.iter().map(mount_spec_to_host_mount).collect();
-    _mounts_result.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let mounts_result: Result<Vec<_>, _> = req.mounts.iter().map(HostMount::try_from).collect();
+    mounts_result.map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let resources = req.resources.clone().unwrap_or(ResourceSpec {
         cpus: None,
@@ -100,7 +109,7 @@ pub async fn create_sandbox(
     };
 
     // Get state for response before completing registration
-    let agent_state = format!("{:?}", manager.state()).to_lowercase();
+    let agent_state = manager.state().to_string();
     let pid = manager.child_pid();
 
     // Complete registration - consumes the guard
@@ -158,25 +167,7 @@ pub async fn get_sandbox(
 ) -> Result<Json<SandboxInfo>, ApiError> {
     let entry = state.get_sandbox(&id)?;
     let entry = entry.lock();
-
-    let agent_state = format!("{:?}", entry.manager.state()).to_lowercase();
-    let pid = entry.manager.child_pid();
-    let restart_count = if entry.restart.restart_count > 0 {
-        Some(entry.restart.restart_count)
-    } else {
-        None
-    };
-
-    Ok(Json(SandboxInfo {
-        name: id,
-        state: agent_state,
-        pid,
-        mounts: mounts_to_info(&entry.mounts),
-        ports: entry.ports.clone(),
-        resources: entry.resources.clone(),
-        network: entry.network,
-        restart_count,
-    }))
+    Ok(Json(sandbox_entry_to_info(id, &entry)))
 }
 
 /// Start a sandbox.
@@ -213,15 +204,15 @@ pub async fn start_sandbox(
     // Clear user_stopped flag since user is explicitly starting
     state.mark_user_stopped(&id, false);
 
-    // Start sandbox with shared preflight + fork-safe DB guard.
-    ensure_sandbox_running_with_db_guard(state.as_ref(), &entry)
+    // Start sandbox (child process closes inherited fds, so DB stays open).
+    ensure_sandbox_running(&entry)
         .await
         .map_err(ApiError::internal)?;
 
     // Get updated state and persist
     let (agent_state, pid) = {
         let entry = entry.lock();
-        let agent_state = format!("{:?}", entry.manager.state()).to_lowercase();
+        let agent_state = entry.manager.state().to_string();
         let pid = entry.manager.child_pid();
         (agent_state, pid)
     };
@@ -230,7 +221,9 @@ pub async fn start_sandbox(
     state.reset_restart_count(&id);
 
     // Persist state to config
-    state.update_sandbox_state(&id, RecordState::Running, pid);
+    state
+        .update_sandbox_state(&id, RecordState::Running, pid)
+        .map_err(ApiError::database)?;
 
     Ok(Json(SandboxInfo {
         name: id,
@@ -285,23 +278,30 @@ pub async fn stop_sandbox(
 
     // Stop the sandbox in a blocking task
     let entry_clone = entry.clone();
-    tokio::task::spawn_blocking(move || {
+    let stop_result = tokio::task::spawn_blocking(move || {
         let entry = entry_clone.lock();
         entry.manager.stop()
     })
-    .await?
-    .map_err(ApiError::internal)?;
+    .await?;
+
+    if let Err(e) = stop_result {
+        // Roll back user_stopped so the supervisor can still restart if configured
+        state.mark_user_stopped(&id, false);
+        return Err(ApiError::internal(e));
+    }
 
     // Get updated state and persist
     let (agent_state, pid) = {
         let entry = entry.lock();
-        let agent_state = format!("{:?}", entry.manager.state()).to_lowercase();
+        let agent_state = entry.manager.state().to_string();
         let pid = entry.manager.child_pid();
         (agent_state, pid)
     };
 
     // Persist state to config
-    state.update_sandbox_state(&id, RecordState::Stopped, None);
+    state
+        .update_sandbox_state(&id, RecordState::Stopped, None)
+        .map_err(ApiError::database)?;
 
     Ok(Json(SandboxInfo {
         name: id,
@@ -348,10 +348,11 @@ pub async fn delete_sandbox(
 
     // Handle stop errors
     if let Err(ref e) = stop_result {
-        // Check if VM is actually still running
+        // Check if VM process is actually still alive using start-time-aware
+        // verification across both child handle and PID file.
         let still_running = {
             let entry = entry.lock();
-            entry.manager.is_running()
+            entry.manager.is_process_alive()
         };
 
         if still_running && !query.force {
@@ -377,57 +378,4 @@ pub async fn delete_sandbox(
     state.remove_sandbox(&id)?;
 
     Ok(Json(DeleteResponse { deleted: id }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_validate_sandbox_name() {
-        // Valid names
-        let valid = [
-            "test",
-            "my-sandbox",
-            "my_sandbox",
-            "test123",
-            "123test",
-            "a",
-            "test-sandbox-123",
-            "TEST_SANDBOX",
-            &"a".repeat(64),
-        ];
-        for name in valid {
-            assert!(
-                validate_sandbox_name(name).is_ok(),
-                "expected '{}' to be valid",
-                name
-            );
-        }
-
-        // Invalid names
-        let invalid = [
-            ("", "empty"),
-            (&"a".repeat(65), "too long"),
-            ("-test", "starts with hyphen"),
-            ("_test", "starts with underscore"),
-            (".test", "starts with dot"),
-            ("test-", "ends with hyphen"),
-            ("test--sandbox", "consecutive hyphens"),
-            ("test/sandbox", "forward slash"),
-            ("test\\sandbox", "backslash"),
-            ("../test", "path traversal"),
-            ("test sandbox", "space"),
-            ("test@sandbox", "at sign"),
-            ("test.sandbox", "dot"),
-        ];
-        for (name, desc) in invalid {
-            assert!(
-                validate_sandbox_name(name).is_err(),
-                "expected '{}' ({}) to be invalid",
-                name,
-                desc
-            );
-        }
-    }
 }

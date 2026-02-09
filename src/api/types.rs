@@ -163,6 +163,15 @@ pub struct EnvVar {
     pub value: String,
 }
 
+impl EnvVar {
+    /// Convert a slice of EnvVar to (name, value) tuples for the agent protocol.
+    pub fn to_tuples(env: &[EnvVar]) -> Vec<(String, String)> {
+        env.iter()
+            .map(|e| (e.name.clone(), e.value.clone()))
+            .collect()
+    }
+}
+
 /// Command execution result.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ExecResponse {

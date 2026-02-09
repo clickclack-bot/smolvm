@@ -28,12 +28,12 @@ use std::time::Duration;
 
 use crate::agent::AgentManager;
 use crate::api::error::ApiError;
-use crate::api::state::{ApiState, DbCloseGuard};
+use crate::api::state::ApiState;
 use crate::api::types::{
     ApiErrorResponse, CreateMicrovmRequest, DeleteResponse, EnvVar, ExecResponse,
     ListMicrovmsResponse, MicrovmExecRequest, MicrovmInfo,
 };
-use crate::api::validation::validate_resource_name;
+use crate::api::validation::{validate_command, validate_resource_name};
 use crate::config::{RecordState, VmRecord};
 use crate::mount::MountBinding;
 
@@ -45,28 +45,22 @@ use crate::mount::MountBinding;
 /// of 40 chars results in a socket path of ~90 chars, leaving some margin.
 const MAX_NAME_LENGTH: usize = 40;
 
-/// Validate a microvm name.
-///
-/// Rules:
-/// - Length: 1-40 characters
-/// - Allowed characters: alphanumeric, hyphen (-), underscore (_)
-/// - Must start with a letter or digit
-/// - Cannot end with a hyphen
-/// - No consecutive hyphens
-/// - No path separators (/, \)
-fn validate_microvm_name(name: &str) -> Result<(), ApiError> {
-    validate_resource_name(name, "microvm", MAX_NAME_LENGTH)
-}
-
 /// Convert VmRecord to MicrovmInfo.
 fn record_to_info(name: &str, record: &VmRecord) -> MicrovmInfo {
     let actual_state = record.actual_state();
+    // Clear stale PID when the process is not actually running, so clients
+    // never see state=stopped paired with a PID.
+    let pid = if actual_state == RecordState::Stopped {
+        None
+    } else {
+        record.pid
+    };
     MicrovmInfo {
         name: name.to_string(),
         state: actual_state.to_string(),
         cpus: record.cpus,
         mem: record.mem,
-        pid: record.pid,
+        pid,
         mounts: record.mounts.len(),
         ports: record.ports.len(),
         network: record.network,
@@ -75,22 +69,54 @@ fn record_to_info(name: &str, record: &VmRecord) -> MicrovmInfo {
 }
 
 /// Attempt graceful shutdown, then force-terminate if still running.
-fn shutdown_microvm_process(name: &str, pid: Option<i32>) {
+///
+/// Uses verified signals to prevent killing an unrelated process if the
+/// PID was recycled by the OS. Returns true if the process is confirmed
+/// dead (or was never running), false if it may still be alive.
+fn shutdown_microvm_process(name: &str, pid: Option<i32>, pid_start_time: Option<u64>) -> bool {
     // Try graceful shutdown via vsock first.
-    if let Ok(manager) = AgentManager::for_vm(name) {
+    let manager = AgentManager::for_vm(name).ok();
+    if let Some(ref manager) = manager {
         if let Ok(mut client) = crate::agent::AgentClient::connect(manager.vsock_socket()) {
             let _ = client.shutdown();
         }
     }
 
-    // Fall back to PID-based signal handling.
+    // PID-based signal handling with start-time verification.
     if let Some(pid) = pid {
-        crate::process::terminate(pid);
+        crate::process::terminate_verified(pid, pid_start_time);
         std::thread::sleep(std::time::Duration::from_millis(100));
+        if crate::process::is_our_process_strict(pid, pid_start_time) {
+            crate::process::kill_verified(pid, pid_start_time);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // Post-check: verify the process is actually gone.
         if crate::process::is_alive(pid) {
-            crate::process::kill(pid);
+            tracing::warn!(pid, name, "process still alive after shutdown attempts");
+            return false;
+        }
+    } else {
+        // No PID available — check if VM is still reachable via vsock.
+        // Without a PID we can't signal, but we can detect if it's still running.
+        if let Some(ref manager) = manager {
+            if let Ok(mut client) = crate::agent::AgentClient::connect(manager.vsock_socket()) {
+                if client.ping().is_ok() {
+                    tracing::warn!(name, "VM still reachable via vsock but no PID to signal");
+                    return false;
+                }
+            }
+        } else {
+            // Neither PID nor vsock manager available — cannot verify shutdown
+            tracing::warn!(
+                name,
+                "no PID and no vsock manager: cannot verify VM shutdown"
+            );
+            return false;
         }
     }
+
+    true
 }
 
 /// Create a new microvm.
@@ -110,7 +136,7 @@ pub async fn create_microvm(
     Json(req): Json<CreateMicrovmRequest>,
 ) -> Result<Json<MicrovmInfo>, ApiError> {
     // Validate name format
-    validate_microvm_name(&req.name)?;
+    validate_resource_name(&req.name, "microvm", MAX_NAME_LENGTH)?;
 
     let name = req.name.clone();
     let cpus = req.cpus;
@@ -231,34 +257,40 @@ pub async fn start_microvm(
     let resources = record.vm_resources();
 
     // Start agent VM in blocking task.
-    // DbCloseGuard ensures the database fd is not inherited by the forked child.
+    // Child process closes inherited fds, so DB stays open for concurrent requests.
     let name_clone = name.clone();
-    let pid = {
-        let _db_guard = DbCloseGuard::new(&state);
-        tokio::task::spawn_blocking(move || {
-            let manager = AgentManager::for_vm(&name_clone)
-                .map_err(|e| format!("failed to create agent manager: {}", e))?;
+    let pid = tokio::task::spawn_blocking(move || {
+        let manager = AgentManager::for_vm(&name_clone)
+            .map_err(|e| format!("failed to create agent manager: {}", e))?;
 
-            manager
-                .ensure_running_with_full_config(mounts, ports, resources)
-                .map_err(|e| format!("failed to start microvm: {}", e))?;
+        manager
+            .ensure_running_with_full_config(mounts, ports, resources)
+            .map_err(|e| format!("failed to start microvm: {}", e))?;
 
-            let pid = manager.child_pid();
-            manager.detach();
-            Ok::<_, String>(pid)
+        let pid = manager.child_pid();
+        manager.detach();
+        Ok::<_, String>(pid)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+    .map_err(ApiError::internal)?;
+
+    // Capture start time for PID verification
+    let pid_start_time = pid.and_then(crate::process::process_start_time);
+
+    // Persist state to database
+    let updated = db
+        .update_vm(&name, |r| {
+            r.state = RecordState::Running;
+            r.pid = pid;
+            r.pid_start_time = pid_start_time;
         })
-        .await
-        .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
-        .map_err(ApiError::internal)?
-    };
-    // Guard dropped — DB reopened
-
-    // Update state in database (after fork, DB is safe to use)
-    if let Err(e) = db.update_vm(&name, |r| {
-        r.state = RecordState::Running;
-        r.pid = pid;
-    }) {
-        tracing::warn!(error = %e, "failed to persist microvm state");
+        .map_err(ApiError::database)?;
+    if updated.is_none() {
+        return Err(ApiError::NotFound(format!(
+            "microvm '{}' disappeared from database during start",
+            name
+        )));
     }
 
     // Return updated record
@@ -302,25 +334,39 @@ pub async fn stop_microvm(
         return Ok(Json(record_to_info(&name, &record)));
     }
 
-    // Get PID from database record - this is the source of truth
+    // Get PID and start time from database record - this is the source of truth
     let pid = record.pid;
+    let pid_start_time = record.pid_start_time;
 
     // Stop VM in blocking task
     let name_clone = name.clone();
-    let db_clone = db.clone();
-    tokio::task::spawn_blocking(move || {
-        shutdown_microvm_process(&name_clone, pid);
-
-        // Update state in database
-        if let Err(e) = db_clone.update_vm(&name_clone, |r| {
-            r.state = RecordState::Stopped;
-            r.pid = None;
-        }) {
-            tracing::warn!(error = %e, "failed to persist microvm state");
-        }
+    let stopped = tokio::task::spawn_blocking(move || {
+        shutdown_microvm_process(&name_clone, pid, pid_start_time)
     })
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+
+    if !stopped {
+        return Err(ApiError::Internal(format!(
+            "microvm '{}' process may still be running after stop attempt",
+            name
+        )));
+    }
+
+    // Persist state to database — only after confirmed stop
+    let updated = db
+        .update_vm(&name, |r| {
+            r.state = RecordState::Stopped;
+            r.pid = None;
+            r.pid_start_time = None;
+        })
+        .map_err(ApiError::database)?;
+    if updated.is_none() {
+        return Err(ApiError::NotFound(format!(
+            "microvm '{}' disappeared from database during stop",
+            name
+        )));
+    }
 
     // Get updated record
     let record = db
@@ -357,19 +403,35 @@ pub async fn delete_microvm(
         .map_err(ApiError::database)?
         .ok_or_else(|| ApiError::NotFound(format!("microvm '{}' not found", name)))?;
 
-    // Get PID from database record
+    // Get PID and start time from database record
     let pid = record.pid;
+    let pid_start_time = record.pid_start_time;
 
     // Stop if running (in blocking task)
     let name_clone = name.clone();
-    tokio::task::spawn_blocking(move || {
-        shutdown_microvm_process(&name_clone, pid);
+    let stopped = tokio::task::spawn_blocking(move || {
+        shutdown_microvm_process(&name_clone, pid, pid_start_time)
     })
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
 
-    // Remove from database
-    db.remove_vm(&name).map_err(ApiError::database)?;
+    if !stopped {
+        return Err(ApiError::Internal(format!(
+            "microvm '{}' process (pid {}) is still alive after shutdown; not removing",
+            name,
+            pid.map(|p| p.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+        )));
+    }
+
+    // Remove from database — safe now that process is confirmed dead
+    let removed = db.remove_vm(&name).map_err(ApiError::database)?;
+    if removed.is_none() {
+        return Err(ApiError::NotFound(format!(
+            "microvm '{}' was already removed",
+            name
+        )));
+    }
 
     Ok(Json(DeleteResponse { deleted: name }))
 }
@@ -396,9 +458,7 @@ pub async fn exec_microvm(
     Path(name): Path<String>,
     Json(req): Json<MicrovmExecRequest>,
 ) -> Result<Json<ExecResponse>, ApiError> {
-    if req.command.is_empty() {
-        return Err(ApiError::BadRequest("command cannot be empty".into()));
-    }
+    validate_command(&req.command)?;
 
     // Check if VM exists
     let db = state.db();
@@ -450,52 +510,6 @@ pub async fn exec_microvm(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_validate_microvm_name() {
-        // Valid names
-        let valid = [
-            "test",
-            "my-vm",
-            "my_vm",
-            "test123",
-            "123test",
-            "a",
-            "test-vm-123",
-            "TEST_VM",
-            &"a".repeat(40), // max length
-        ];
-        for name in valid {
-            assert!(
-                validate_microvm_name(name).is_ok(),
-                "expected '{}' to be valid",
-                name
-            );
-        }
-
-        // Invalid names
-        let invalid = [
-            ("", "empty"),
-            (&"a".repeat(41), "too long"),
-            ("-test", "starts with hyphen"),
-            ("_test", "starts with underscore"),
-            ("test-", "ends with hyphen"),
-            ("test--vm", "consecutive hyphens"),
-            ("test/vm", "forward slash"),
-            ("test\\vm", "backslash"),
-            ("test vm", "space"),
-            ("test@vm", "at sign"),
-            ("../test", "path traversal"),
-        ];
-        for (name, desc) in invalid {
-            assert!(
-                validate_microvm_name(name).is_err(),
-                "expected '{}' ({}) to be invalid",
-                name,
-                desc
-            );
-        }
-    }
 
     #[test]
     fn test_record_to_info() {
@@ -565,34 +579,5 @@ mod tests {
 
         assert_eq!(info.name, "network-vm");
         assert!(info.network);
-    }
-
-    #[test]
-    fn test_validate_microvm_name_special_characters() {
-        // Underscore is allowed
-        assert!(validate_microvm_name("test_vm").is_ok());
-        assert!(validate_microvm_name("test_vm_123").is_ok());
-
-        // Dot is not allowed
-        assert!(validate_microvm_name("test.vm").is_err());
-
-        // Colon is not allowed
-        assert!(validate_microvm_name("test:vm").is_err());
-
-        // Hash is not allowed
-        assert!(validate_microvm_name("test#vm").is_err());
-    }
-
-    #[test]
-    fn test_validate_microvm_name_boundary_conditions() {
-        // Single character (minimum valid)
-        assert!(validate_microvm_name("a").is_ok());
-        assert!(validate_microvm_name("1").is_ok());
-
-        // 40 characters (maximum valid - limited for Unix socket path length)
-        assert!(validate_microvm_name(&"a".repeat(40)).is_ok());
-
-        // 41 characters (too long)
-        assert!(validate_microvm_name(&"a".repeat(41)).is_err());
     }
 }

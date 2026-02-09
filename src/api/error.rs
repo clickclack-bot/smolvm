@@ -75,16 +75,12 @@ impl From<crate::error::Error> for ApiError {
                 "invalid state: expected {}, got {}",
                 expected, actual
             )),
-            // Handle structured Agent errors
-            crate::error::Error::Agent { reason, .. } => {
-                if reason.contains("not found") {
-                    ApiError::NotFound(reason.clone())
-                } else if reason.contains("already") {
-                    ApiError::Conflict(reason.clone())
-                } else {
-                    ApiError::Internal(reason.clone())
-                }
-            }
+            // Handle structured Agent errors using kind for HTTP status mapping
+            crate::error::Error::Agent { reason, kind, .. } => match kind {
+                crate::error::AgentErrorKind::NotFound => ApiError::NotFound(reason.clone()),
+                crate::error::AgentErrorKind::Conflict => ApiError::Conflict(reason.clone()),
+                crate::error::AgentErrorKind::Other => ApiError::Internal(reason.clone()),
+            },
             _ => ApiError::Internal(err.to_string()),
         }
     }
@@ -119,16 +115,16 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_error_keyword_detection() {
-        // "not found" in message -> NotFound
-        let err = crate::error::Error::agent("lookup", "container not found");
+    fn test_agent_error_kind_mapping() {
+        // NotFound kind -> NotFound
+        let err = crate::error::Error::agent_not_found("lookup", "container not found");
         assert!(matches!(ApiError::from(err), ApiError::NotFound(_)));
 
-        // "already" in message -> Conflict
-        let err = crate::error::Error::agent("create", "already exists");
+        // Conflict kind -> Conflict
+        let err = crate::error::Error::agent_conflict("create", "already exists");
         assert!(matches!(ApiError::from(err), ApiError::Conflict(_)));
 
-        // No keywords -> Internal
+        // Default (Other) kind -> Internal
         let err = crate::error::Error::agent("connect", "connection refused");
         assert!(matches!(ApiError::from(err), ApiError::Internal(_)));
     }
