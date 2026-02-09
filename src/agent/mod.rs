@@ -5,6 +5,7 @@
 
 mod client;
 mod launcher;
+pub mod launcher_dynamic;
 mod manager;
 pub mod terminal;
 
