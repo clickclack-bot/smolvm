@@ -403,7 +403,7 @@ pub struct HealthResponse {
     #[schema(example = "ok")]
     pub status: &'static str,
     /// Server version.
-    #[schema(example = "0.1.5")]
+    #[schema(example = "0.1.6")]
     pub version: &'static str,
 }
 

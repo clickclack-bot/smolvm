@@ -326,12 +326,6 @@ install_smolvm() {
     chmod +x "$prefix/smolvm"
     chmod +x "$prefix/smolvm-bin"
 
-    # Copy smolvm-stub if present (needed for 'smolvm pack' command)
-    if [[ -f "$extracted_dir/smolvm-stub" ]]; then
-        cp "$extracted_dir/smolvm-stub" "$prefix/"
-        chmod +x "$prefix/smolvm-stub"
-    fi
-
     # Copy storage template if present
     if [[ -f "$extracted_dir/storage-template.ext4" ]]; then
         cp "$extracted_dir/storage-template.ext4" "$prefix/"

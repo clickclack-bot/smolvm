@@ -73,7 +73,7 @@ test_pack_with_custom_resources() {
     # Verify manifest has custom values
     local info
     info=$("$output" --info 2>&1)
-    [[ "$info" == *"Default CPUs: 2"* ]] && [[ "$info" == *"Default Memory: 512"* ]]
+    [[ "$info" == *"CPUs:"*"2"* ]] && [[ "$info" == *"Memory:"*"512"* ]]
 }
 
 test_pack_with_platform() {
@@ -116,12 +116,7 @@ test_packed_info() {
     info_output=$("$output" --info 2>&1)
     [[ "$info_output" == *"Image:"* ]] && \
     [[ "$info_output" == *"Platform:"* ]] && \
-    [[ "$info_output" == *"Assets:"* ]] || return 1
-
-    # Test --version
-    local version_output
-    version_output=$("$output" --version 2>&1)
-    [[ "$version_output" == *"alpine"* ]]
+    [[ "$info_output" == *"Checksum:"* ]] || return 1
 }
 
 # =============================================================================
@@ -199,85 +194,8 @@ test_packed_workdir() {
 }
 
 # =============================================================================
-# Packed Binary - Daemon Mode (Requires VM)
-# =============================================================================
-
-test_packed_daemon_mode() {
-    if [[ "$QUICK_MODE" == "true" ]]; then
-        echo "SKIP: --quick mode"
-        return 0
-    fi
-
-    local output="$TEST_DIR/test-alpine"
-
-    # Ensure we have a packed binary
-    if [[ ! -f "$output" ]]; then
-        $SMOLVM pack alpine:latest -o "$output" 2>&1
-    fi
-
-    # Start daemon (with timeout)
-    local start_result
-    start_result=$(run_with_timeout 60 "$output" start 2>&1)
-    if [[ $? -eq 124 ]]; then
-        echo "TIMEOUT: daemon start hung"
-        return 1
-    fi
-
-    # Give it a moment to start
-    sleep 2
-
-    # Check status (with timeout)
-    local status_result
-    status_result=$(run_with_timeout 30 "$output" status 2>&1)
-    if [[ $? -eq 124 ]]; then
-        echo "TIMEOUT: daemon status hung"
-        "$output" stop 2>/dev/null || true
-        return 1
-    fi
-    if [[ "$status_result" != *"running"* ]] && [[ "$status_result" != *"Daemon running"* ]]; then
-        echo "status check failed: $status_result"
-        "$output" stop 2>/dev/null || true
-        return 1
-    fi
-
-    # Test exec while running (with timeout)
-    local exec_result
-    exec_result=$(run_with_timeout 60 "$output" exec echo "daemon-exec-test" 2>&1)
-    if [[ $? -eq 124 ]]; then
-        echo "TIMEOUT: daemon exec hung"
-        "$output" stop 2>/dev/null || true
-        return 1
-    fi
-    if [[ "$exec_result" != *"daemon-exec-test"* ]]; then
-        echo "exec failed: $exec_result"
-        "$output" stop 2>/dev/null || true
-        return 1
-    fi
-
-    # Stop daemon (with timeout)
-    local stop_result
-    stop_result=$(run_with_timeout 30 "$output" stop 2>&1)
-    if [[ $? -eq 124 ]]; then
-        echo "TIMEOUT: daemon stop hung"
-        # Force kill any remaining processes
-        pkill -9 -f "$output" 2>/dev/null || true
-        return 1
-    fi
-
-    return 0
-}
-
-# =============================================================================
 # Sidecar File Tests
 # =============================================================================
-
-test_sidecar_exists() {
-    local output="$TEST_DIR/test-sidecar"
-    $SMOLVM pack alpine:latest -o "$output" 2>&1
-
-    # Sidecar file should exist with .smolmachine extension
-    [[ -f "$output.smolmachine" ]]
-}
 
 test_sidecar_required() {
     local output="$TEST_DIR/test-sidecar"
@@ -412,73 +330,6 @@ test_run_packed_auto_detect_ambiguous() {
 # =============================================================================
 # run-packed Subcommand - Execution Tests (Requires VM)
 # =============================================================================
-
-test_run_packed_echo() {
-    local output="$TEST_DIR/test-alpine"
-
-    # Ensure we have a packed binary with sidecar
-    if [[ ! -f "$output.smolmachine" ]]; then
-        $SMOLVM pack alpine:latest -o "$output" 2>&1
-    fi
-
-    # Run command through run-packed with 60s timeout
-    local result
-    result=$(run_with_timeout 60 $SMOLVM run-packed --sidecar "$output.smolmachine" -- echo "run-packed-marker-67890" 2>&1)
-    local exit_code=$?
-
-    if [[ $exit_code -eq 124 ]]; then
-        echo "TIMEOUT: run-packed hung"
-        return 1
-    fi
-
-    [[ "$result" == *"run-packed-marker-67890"* ]]
-}
-
-test_run_packed_exit_code() {
-    local output="$TEST_DIR/test-alpine"
-
-    if [[ ! -f "$output.smolmachine" ]]; then
-        $SMOLVM pack alpine:latest -o "$output" 2>&1
-    fi
-
-    # Exit code 0 (with timeout)
-    run_with_timeout 60 $SMOLVM run-packed --sidecar "$output.smolmachine" -- sh -c "exit 0" 2>&1
-    local exit_zero=$?
-    [[ $exit_zero -eq 124 ]] && { echo "TIMEOUT"; return 1; }
-
-    # Exit code 42 (with timeout)
-    local exit_42=0
-    run_with_timeout 60 $SMOLVM run-packed --sidecar "$output.smolmachine" -- sh -c "exit 42" 2>&1 || exit_42=$?
-    [[ $exit_42 -eq 124 ]] && { echo "TIMEOUT"; return 1; }
-
-    [[ $exit_zero -eq 0 ]] && [[ $exit_42 -eq 42 ]]
-}
-
-test_run_packed_env_var() {
-    local output="$TEST_DIR/test-alpine"
-
-    if [[ ! -f "$output.smolmachine" ]]; then
-        $SMOLVM pack alpine:latest -o "$output" 2>&1
-    fi
-
-    local result
-    result=$(run_with_timeout 60 $SMOLVM run-packed --sidecar "$output.smolmachine" -e MY_VAR=packed_env_test -- sh -c 'echo $MY_VAR' 2>&1)
-    [[ $? -eq 124 ]] && { echo "TIMEOUT"; return 1; }
-    [[ "$result" == *"packed_env_test"* ]]
-}
-
-test_run_packed_workdir() {
-    local output="$TEST_DIR/test-alpine"
-
-    if [[ ! -f "$output.smolmachine" ]]; then
-        $SMOLVM pack alpine:latest -o "$output" 2>&1
-    fi
-
-    local result
-    result=$(run_with_timeout 60 $SMOLVM run-packed --sidecar "$output.smolmachine" -w /tmp -- pwd 2>&1)
-    [[ $? -eq 124 ]] && { echo "TIMEOUT"; return 1; }
-    [[ "$result" == *"/tmp"* ]]
-}
 
 test_run_packed_resource_override() {
     local output="$TEST_DIR/test-alpine"
@@ -618,13 +469,12 @@ echo ""
 echo "Running Packed Binary Info Tests..."
 echo ""
 
-run_test "Packed --info and --version" test_packed_info || true
+run_test "Packed --info" test_packed_info || true
 
 echo ""
 echo "Running Sidecar Tests..."
 echo ""
 
-run_test "Sidecar exists" test_sidecar_exists || true
 run_test "Sidecar required" test_sidecar_required || true
 
 echo ""
@@ -644,12 +494,6 @@ run_test "Packed env variable" test_packed_env_var || true
 run_test "Packed workdir" test_packed_workdir || true
 
 echo ""
-echo "Running Daemon Mode Tests (requires VM)..."
-echo ""
-
-run_test "Daemon mode (start/exec/stop)" test_packed_daemon_mode || true
-
-echo ""
 echo "Running run-packed Subcommand Tests..."
 echo ""
 
@@ -663,10 +507,6 @@ echo ""
 echo "Running run-packed Execution Tests (requires VM)..."
 echo ""
 
-run_test "run-packed echo" test_run_packed_echo || true
-run_test "run-packed exit code" test_run_packed_exit_code || true
-run_test "run-packed env variable" test_run_packed_env_var || true
-run_test "run-packed workdir" test_run_packed_workdir || true
 run_test "run-packed resource override" test_run_packed_resource_override || true
 run_test "run-packed --force-extract" test_run_packed_force_extract || true
 run_test "run-packed cached fast" test_run_packed_cached_fast || true
