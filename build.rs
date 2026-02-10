@@ -45,7 +45,7 @@ fn link_krun() {
     #[cfg(target_os = "macos")]
     println!("cargo:rustc-link-arg=-Wl,-weak-lkrun");
     #[cfg(not(target_os = "macos"))]
-    link_krun();
+    println!("cargo:rustc-link-lib=krun");
 }
 
 fn main() {
