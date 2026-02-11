@@ -109,8 +109,9 @@ pub fn try_wait(pid: libc::pid_t) -> Option<i32> {
                 // EINTR - interrupted by signal, retry
                 continue;
             }
-            // Other error (process doesn't exist or not our child)
-            return Some(-1);
+            // ECHILD: not our child (e.g., session-leader reparented to init).
+            // Return None so callers fall back to is_alive() (kill -0) polling.
+            return None;
         } else {
             // Still running
             return None;
@@ -218,7 +219,14 @@ pub fn process_start_time(pid: libc::pid_t) -> Option<u64> {
         )
     };
     if ret > 0 {
-        Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+        let usec = info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec;
+        // proc_pidinfo can return a zeroed struct for session-leader children
+        // (e.g., VM processes that called setsid()). Treat 0 as unavailable.
+        if usec > 0 {
+            Some(usec)
+        } else {
+            None
+        }
     } else {
         None
     }
