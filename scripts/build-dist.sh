@@ -18,7 +18,14 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 echo "Building smolvm distribution: ${DIST_NAME}"
 
 # Check for required libraries
-LIB_DIR="${LIB_DIR:-./lib}"
+# On Linux, look in lib/linux-{arch}/ first
+if [[ "$(uname -s)" == "Linux" ]]; then
+    ARCH="$(uname -m)"
+    LIB_DIR="${LIB_DIR:-./lib/linux-${ARCH}}"
+else
+    LIB_DIR="${LIB_DIR:-./lib}"
+fi
+
 if [[ ! -f "$LIB_DIR/libkrun.dylib" ]] && [[ ! -f "$LIB_DIR/libkrun.so" ]]; then
     echo "Error: libkrun not found in $LIB_DIR"
     echo "Set LIB_DIR to point to your libkrun library directory."
@@ -37,8 +44,25 @@ LIBKRUN_BUNDLE="$LIB_DIR" cargo build --release --bin smolvm
 
 # Build smolvm-agent for Linux (size-optimized)
 echo "Building smolvm-agent for Linux (optimized for size)..."
-docker run --rm -v "$PROJECT_ROOT:/work" -w /work rust:alpine sh -c \
-    "apk add musl-dev && cargo build --profile release-small -p smolvm-agent"
+if [[ "$(uname -s)" == "Linux" ]]; then
+    # On Linux, build natively with musl for static linking
+    if command -v cargo &> /dev/null; then
+        # Check if musl target is available
+        if rustup target list --installed 2>/dev/null | grep -q musl; then
+            cargo build --profile release-small -p smolvm-agent --target x86_64-unknown-linux-musl
+        else
+            # Fall back to Docker build
+            docker run --rm --network=host -v "$PROJECT_ROOT:/work" -w /work rust:alpine sh -c \
+                "apk add musl-dev && cargo build --profile release-small -p smolvm-agent"
+        fi
+    else
+        docker run --rm --network=host -v "$PROJECT_ROOT:/work" -w /work rust:alpine sh -c \
+            "apk add musl-dev && cargo build --profile release-small -p smolvm-agent"
+    fi
+else
+    docker run --rm -v "$PROJECT_ROOT:/work" -w /work rust:alpine sh -c \
+        "apk add musl-dev && cargo build --profile release-small -p smolvm-agent"
+fi
 
 # Sign binary (macOS only)
 if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -65,8 +89,40 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     # Create symlink for compatibility
     ln -sf libkrunfw.5.dylib "$DIST_DIR/lib/libkrunfw.dylib"
 else
-    cp "$LIB_DIR/libkrun.so"* "$DIST_DIR/lib/"
-    cp "$LIB_DIR/libkrunfw.so"* "$DIST_DIR/lib/"
+    # Copy libraries preserving symlinks with -a, or copy files individually
+    if [[ -L "$LIB_DIR/libkrun.so" ]]; then
+        cp -a "$LIB_DIR"/libkrun.so* "$DIST_DIR/lib/" 2>/dev/null || \
+            cp "$LIB_DIR"/libkrun.so* "$DIST_DIR/lib/"
+    else
+        cp "$LIB_DIR/libkrun.so" "$DIST_DIR/lib/"
+        # Create versioned symlink
+        ln -sf libkrun.so "$DIST_DIR/lib/libkrun.so.1"
+    fi
+    if [[ -L "$LIB_DIR/libkrunfw.so" ]]; then
+        cp -a "$LIB_DIR"/libkrunfw.so* "$DIST_DIR/lib/" 2>/dev/null || \
+            cp "$LIB_DIR"/libkrunfw.so* "$DIST_DIR/lib/"
+    else
+        cp "$LIB_DIR/libkrunfw.so"* "$DIST_DIR/lib/"
+    fi
+fi
+
+# Copy init.krun for Linux (required by libkrunfw kernel)
+if [[ "$(uname -s)" == "Linux" ]]; then
+    # Look for init.krun in libkrun submodule or system locations
+    INIT_KRUN=""
+    if [[ -f "$PROJECT_ROOT/libkrun/init/init" ]]; then
+        INIT_KRUN="$PROJECT_ROOT/libkrun/init/init"
+    elif [[ -f "/usr/local/share/smolvm/init.krun" ]]; then
+        INIT_KRUN="/usr/local/share/smolvm/init.krun"
+    fi
+
+    if [[ -n "$INIT_KRUN" ]]; then
+        echo "Copying init.krun from $INIT_KRUN..."
+        cp "$INIT_KRUN" "$DIST_DIR/init.krun"
+        chmod +x "$DIST_DIR/init.krun"
+    else
+        echo "Warning: init.krun not found - users may need to build libkrun init"
+    fi
 fi
 
 # Build agent-rootfs

@@ -349,6 +349,13 @@ install_smolvm() {
         warn "agent-rootfs not found in distribution - some features may not work"
     fi
 
+    # Copy init.krun if present (Linux only, required by libkrunfw kernel)
+    if [[ -f "$extracted_dir/init.krun" ]]; then
+        info "Installing init.krun to $data_dir..."
+        cp "$extracted_dir/init.krun" "$data_dir/init.krun"
+        chmod +x "$data_dir/init.krun"
+    fi
+
     # Store version info
     echo "$version" > "$prefix/.version"
 

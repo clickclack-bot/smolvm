@@ -537,11 +537,8 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             version: PROTOCOL_VERSION,
         },
 
-        AgentRequest::Pull {
-            image,
-            platform,
-            auth,
-        } => handle_pull(&image, platform.as_deref(), auth.as_ref()),
+        // Pull is handled separately in handle_streaming_pull for progress streaming
+        AgentRequest::Pull { .. } => unreachable!("Pull handled before match"),
 
         AgentRequest::Query { image } => handle_query(&image),
 
@@ -1597,22 +1594,6 @@ fn handle_streaming_pull<S: Read + Write>(
     );
 
     send_response(stream, &response)
-}
-
-/// Handle image pull request (legacy, no progress).
-#[allow(dead_code)]
-fn handle_pull(image: &str, platform: Option<&str>, auth: Option<&RegistryAuth>) -> AgentResponse {
-    info!(
-        image = %image,
-        ?platform,
-        has_auth = auth.is_some(),
-        "pulling image"
-    );
-
-    AgentResponse::from_result(
-        storage::pull_image_with_auth(image, platform, auth),
-        error_codes::PULL_FAILED,
-    )
 }
 
 /// Handle image query request.

@@ -125,6 +125,14 @@ install_from_dir() {
         warn "agent-rootfs not found in distribution"
     fi
 
+    # Copy init.krun if present (Linux only, required by libkrunfw kernel)
+    if [[ -f "$src_dir/init.krun" ]]; then
+        info "Installing init.krun to $data_dir..."
+        cp "$src_dir/init.krun" "$data_dir/init.krun"
+        chmod +x "$data_dir/init.krun"
+        success "init.krun installed"
+    fi
+
     # Store version
     echo "$version" > "$INSTALL_PREFIX/.version"
 

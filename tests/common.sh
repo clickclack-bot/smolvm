@@ -68,6 +68,16 @@ init_smolvm() {
         exit 1
     fi
 
+    # Set library path for Linux to ensure we use bundled libkrun/libkrunfw
+    # This is needed when running from target/release since the system may have
+    # an older libkrunfw installed that doesn't have all required kernel features
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        local lib_dir="$PROJECT_ROOT/lib/linux-$(uname -m)"
+        if [[ -d "$lib_dir" ]]; then
+            export LD_LIBRARY_PATH="${lib_dir}:${LD_LIBRARY_PATH:-}"
+        fi
+    fi
+
     echo "Using smolvm: $SMOLVM"
 }
 

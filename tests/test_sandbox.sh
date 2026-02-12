@@ -27,13 +27,13 @@ echo ""
 
 test_sandbox_run_echo() {
     local output
-    output=$($SMOLVM sandbox run alpine:latest -- echo "integration-test-marker" 2>&1)
+    output=$($SMOLVM sandbox run --net alpine:latest -- echo "integration-test-marker" 2>&1)
     [[ "$output" == *"integration-test-marker"* ]]
 }
 
 test_sandbox_run_cat() {
     local output
-    output=$($SMOLVM sandbox run alpine:latest -- cat /etc/os-release 2>&1)
+    output=$($SMOLVM sandbox run --net alpine:latest -- cat /etc/os-release 2>&1)
     [[ "$output" == *"Alpine"* ]]
 }
 
@@ -42,12 +42,12 @@ test_sandbox_run_cat() {
 # =============================================================================
 
 test_sandbox_exit_code_zero() {
-    $SMOLVM sandbox run alpine:latest -- sh -c "exit 0" 2>&1
+    $SMOLVM sandbox run --net alpine:latest -- sh -c "exit 0" 2>&1
 }
 
 test_sandbox_exit_code_nonzero() {
     local exit_code=0
-    $SMOLVM sandbox run alpine:latest -- sh -c "exit 42" 2>&1 || exit_code=$?
+    $SMOLVM sandbox run --net alpine:latest -- sh -c "exit 42" 2>&1 || exit_code=$?
     [[ $exit_code -eq 42 ]]
 }
 
@@ -57,13 +57,13 @@ test_sandbox_exit_code_nonzero() {
 
 test_sandbox_env_variable() {
     local output
-    output=$($SMOLVM sandbox run -e TEST_VAR=hello_world alpine:latest -- sh -c 'echo $TEST_VAR' 2>&1)
+    output=$($SMOLVM sandbox run --net -e TEST_VAR=hello_world alpine:latest -- sh -c 'echo $TEST_VAR' 2>&1)
     [[ "$output" == *"hello_world"* ]]
 }
 
 test_sandbox_multiple_env_variables() {
     local output
-    output=$($SMOLVM sandbox run -e VAR1=one -e VAR2=two alpine:latest -- sh -c 'echo $VAR1 $VAR2' 2>&1)
+    output=$($SMOLVM sandbox run --net -e VAR1=one -e VAR2=two alpine:latest -- sh -c 'echo $VAR1 $VAR2' 2>&1)
     [[ "$output" == *"one"* ]] && [[ "$output" == *"two"* ]]
 }
 
@@ -75,7 +75,7 @@ test_sandbox_timeout() {
     local start_time end_time elapsed output
     start_time=$(date +%s)
 
-    output=$($SMOLVM sandbox run --timeout 5s alpine:latest -- sleep 60 2>&1 || true)
+    output=$($SMOLVM sandbox run --net --timeout 5s alpine:latest -- sleep 60 2>&1 || true)
 
     end_time=$(date +%s)
     elapsed=$((end_time - start_time))
@@ -97,7 +97,7 @@ test_sandbox_timeout() {
 
 test_sandbox_workdir() {
     local output
-    output=$($SMOLVM sandbox run -w /tmp alpine:latest -- pwd 2>&1)
+    output=$($SMOLVM sandbox run --net -w /tmp alpine:latest -- pwd 2>&1)
     [[ "$output" == *"/tmp"* ]]
 }
 
@@ -114,7 +114,7 @@ test_sandbox_volume_mount_read() {
     echo "mount-test-content-12345" > "$tmpdir/testfile.txt"
 
     local output
-    output=$($SMOLVM sandbox run -v "$tmpdir:/hostmnt" alpine:latest -- cat /hostmnt/testfile.txt 2>&1)
+    output=$($SMOLVM sandbox run --net -v "$tmpdir:/hostmnt" alpine:latest -- cat /hostmnt/testfile.txt 2>&1)
 
     rm -rf "$tmpdir"
 
@@ -135,7 +135,7 @@ test_sandbox_volume_mount_write() {
     # NOTE: Must use top-level mount path (e.g., /workspace) not nested (e.g., /hostmnt)
     # Nested paths require creating dirs on overlayfs which triggers TSI bug
     local output
-    output=$($SMOLVM sandbox run -v "$tmpdir:/workspace" alpine:latest -- sh -c "echo 'written-from-vm' > /workspace/output.txt" 2>&1)
+    output=$($SMOLVM sandbox run --net -v "$tmpdir:/workspace" alpine:latest -- sh -c "echo 'written-from-vm' > /workspace/output.txt" 2>&1)
 
     # Verify on host
     local content
@@ -152,7 +152,7 @@ test_sandbox_volume_mount_readonly() {
 
     # Read should work
     local output
-    output=$($SMOLVM sandbox run -v "$tmpdir:/hostmnt:ro" alpine:latest -- cat /hostmnt/readonly.txt 2>&1)
+    output=$($SMOLVM sandbox run --net -v "$tmpdir:/hostmnt:ro" alpine:latest -- cat /hostmnt/readonly.txt 2>&1)
 
     # Check for known libkrun TSI bug
     if [[ "$output" == *"Connection reset"* ]]; then
@@ -163,7 +163,7 @@ test_sandbox_volume_mount_readonly() {
 
     # Write should fail
     local write_exit=0
-    $SMOLVM sandbox run -v "$tmpdir:/hostmnt:ro" alpine:latest -- sh -c "echo 'fail' > /hostmnt/newfile.txt" 2>&1 || write_exit=$?
+    $SMOLVM sandbox run --net -v "$tmpdir:/hostmnt:ro" alpine:latest -- sh -c "echo 'fail' > /hostmnt/newfile.txt" 2>&1 || write_exit=$?
 
     rm -rf "$tmpdir"
     [[ "$output" == *"readonly-content"* ]] && [[ $write_exit -ne 0 ]]
@@ -176,7 +176,7 @@ test_sandbox_volume_mount_subdirectory() {
     echo "nested-file-content" > "$tmpdir/subdir/nested/deep.txt"
 
     local output
-    output=$($SMOLVM sandbox run -v "$tmpdir:/hostmnt" alpine:latest -- cat /hostmnt/subdir/nested/deep.txt 2>&1)
+    output=$($SMOLVM sandbox run --net -v "$tmpdir:/hostmnt" alpine:latest -- cat /hostmnt/subdir/nested/deep.txt 2>&1)
 
     rm -rf "$tmpdir"
 
@@ -197,7 +197,7 @@ test_sandbox_volume_mount_multiple() {
     echo "content-two" > "$tmpdir2/file2.txt"
 
     local output
-    output=$($SMOLVM sandbox run -v "$tmpdir1:/data1" -v "$tmpdir2:/data2" alpine:latest -- sh -c "cat /data1/file1.txt && cat /data2/file2.txt" 2>&1)
+    output=$($SMOLVM sandbox run --net -v "$tmpdir1:/data1" -v "$tmpdir2:/data2" alpine:latest -- sh -c "cat /data1/file1.txt && cat /data2/file2.txt" 2>&1)
 
     rm -rf "$tmpdir1" "$tmpdir2"
 
@@ -219,7 +219,7 @@ test_sandbox_volume_mount_multiple() {
 test_tsi_overlayfs_rootfs_write_works() {
     # Writing to container rootfs (overlayfs) should work
     local output exit_code=0
-    output=$($SMOLVM sandbox run alpine:latest -- sh -c "echo 'test' > /tmp/rootfs-test.txt && cat /tmp/rootfs-test.txt" 2>&1) || exit_code=$?
+    output=$($SMOLVM sandbox run --net alpine:latest -- sh -c "echo 'test' > /tmp/rootfs-test.txt && cat /tmp/rootfs-test.txt" 2>&1) || exit_code=$?
 
     # Should succeed and contain the written content
     [[ $exit_code -eq 0 ]] && [[ "$output" == *"test"* ]]
@@ -231,7 +231,7 @@ test_tsi_virtiofs_mount_write_works() {
     tmpdir=$(mktemp -d)
 
     local output exit_code=0
-    output=$($SMOLVM sandbox run -v "$tmpdir:/workspace" alpine:latest -- sh -c "echo 'virtiofs-write-test' > /workspace/test.txt" 2>&1) || exit_code=$?
+    output=$($SMOLVM sandbox run --net -v "$tmpdir:/workspace" alpine:latest -- sh -c "echo 'virtiofs-write-test' > /workspace/test.txt" 2>&1) || exit_code=$?
 
     # Verify file was written
     local content
@@ -256,7 +256,7 @@ test_tsi_coding_agent_workflow() {
 
     # Run "agent" that reads input, processes, and writes output
     local output exit_code=0
-    output=$($SMOLVM sandbox run -v "$tmpdir:/workspace" alpine:latest -- sh -c "
+    output=$($SMOLVM sandbox run --net -v "$tmpdir:/workspace" alpine:latest -- sh -c "
         # Read input
         INPUT=\$(cat /workspace/input.txt)
         # Process (uppercase)
@@ -286,12 +286,12 @@ test_tsi_coding_agent_workflow() {
 
 test_sandbox_shell_pipeline() {
     local output
-    output=$($SMOLVM sandbox run alpine:latest -- sh -c "echo 'hello world' | wc -w" 2>&1)
+    output=$($SMOLVM sandbox run --net alpine:latest -- sh -c "echo 'hello world' | wc -w" 2>&1)
     [[ "$output" == *"2"* ]]
 }
 
 test_sandbox_command_not_found() {
-    ! $SMOLVM sandbox run alpine:latest -- nonexistent_command_12345 2>/dev/null
+    ! $SMOLVM sandbox run --net alpine:latest -- nonexistent_command_12345 2>/dev/null
 }
 
 # =============================================================================
@@ -303,7 +303,10 @@ test_sandbox_command_not_found() {
 
 test_network_disabled_by_default() {
     # Without --net, network should be disabled
-    # DNS resolution should fail when network is disabled
+    # First, ensure the image is cached by pulling with --net
+    $SMOLVM sandbox run --net alpine:latest -- true 2>&1 >/dev/null || true
+
+    # Now test without --net - DNS resolution should fail when network is disabled
     local exit_code=0
     $SMOLVM sandbox run alpine:latest -- nslookup cloudflare.com 2>&1 || exit_code=$?
 

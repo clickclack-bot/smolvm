@@ -155,6 +155,7 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
 
 /// Error type for storage operations.
 #[derive(Debug)]
+#[allow(dead_code)] // Some variants reserved for future use
 pub enum StorageError {
     // ========================================================================
     // I/O Errors
@@ -251,6 +252,7 @@ pub enum StorageError {
     Internal { message: String },
 }
 
+#[allow(dead_code)] // Some helpers reserved for future use
 impl StorageError {
     /// Create a new internal error with the given message.
     /// Use this as a fallback when no specific variant fits.
@@ -619,219 +621,6 @@ pub fn status() -> Result<StorageStatus> {
     })
 }
 
-/// Pull an OCI image using crane.
-pub fn pull_image(image: &str, platform: Option<&str>) -> Result<ImageInfo> {
-    pull_image_with_auth(image, platform, None)
-}
-
-/// Pull an OCI image using crane with optional authentication.
-pub fn pull_image_with_auth(
-    image: &str,
-    platform: Option<&str>,
-    auth: Option<&RegistryAuth>,
-) -> Result<ImageInfo> {
-    // Validate image reference before any operations
-    crate::oci::validate_image_reference(image).map_err(|e| {
-        StorageError::InvalidImageReference {
-            reference: image.to_string(),
-            reason: e,
-        }
-    })?;
-
-    // If packed layers are available, return synthetic image info
-    // The layers are already present from the packed binary
-    if let Some(packed_dir) = get_packed_layers_dir() {
-        info!(image = %image, "using packed layers, skipping network pull");
-        return create_packed_image_info(image, packed_dir);
-    }
-
-    // Determine platform - default to current architecture
-    // This must happen BEFORE the cache check so we can verify architecture
-    let platform = platform.or({
-        #[cfg(target_arch = "aarch64")]
-        {
-            Some("linux/arm64")
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            Some("linux/amd64")
-        }
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        {
-            None
-        }
-    });
-
-    // Check if already cached with correct architecture
-    if let Ok(Some(info)) = query_image(image) {
-        // Verify cached image architecture matches requested platform
-        let cached_arch = &info.architecture;
-        let requested_arch = platform
-            .map(|p| platform_to_arch(p))
-            .unwrap_or_else(|| cached_arch.clone());
-
-        if cached_arch == &requested_arch {
-            debug!(
-                image = %image,
-                architecture = %cached_arch,
-                "image already cached with correct architecture, skipping pull"
-            );
-            return Ok(info);
-        } else {
-            // Architecture mismatch - need to re-pull
-            info!(
-                image = %image,
-                cached_arch = %cached_arch,
-                requested_arch = %requested_arch,
-                "cached image has wrong architecture, will re-pull"
-            );
-            // Clean up the mismatched cached manifest
-            let root = Path::new(STORAGE_ROOT);
-            let manifest_path = root
-                .join(MANIFESTS_DIR)
-                .join(sanitize_image_name(image) + ".json");
-            let _ = std::fs::remove_file(&manifest_path);
-        }
-    }
-
-    let root = Path::new(STORAGE_ROOT);
-
-    // Get manifest with platform specified
-    info!(image = %image, platform = ?platform, "fetching manifest");
-    let manifest = crane_manifest(image, platform, auth)?;
-
-    // Parse manifest to get config and layers
-    let manifest_json: serde_json::Value =
-        serde_json::from_str(&manifest).map_err(|e| StorageError::parse_error("manifest", e))?;
-
-    // Handle manifest list (multi-arch) - this shouldn't happen with --platform but just in case
-    let config_digest = if manifest_json.get("config").is_some() {
-        manifest_json["config"]["digest"]
-            .as_str()
-            .ok_or_else(|| StorageError::MissingField {
-                context: "manifest".into(),
-                field: "config digest".into(),
-            })?
-    } else if manifest_json.get("manifests").is_some() {
-        // This is a manifest list, need to fetch platform-specific manifest
-        return Err(StorageError::new(format!(
-            "got manifest list instead of image manifest - platform may not be available. \
-             manifests: {:?}",
-            manifest_json["manifests"].as_array().map(|arr| arr
-                .iter()
-                .filter_map(|m| m["platform"]["architecture"].as_str())
-                .collect::<Vec<_>>())
-        )));
-    } else {
-        return Err(StorageError::UnsupportedManifest {
-            media_type: "unknown".into(),
-        });
-    };
-
-    let layers: Vec<String> = manifest_json["layers"]
-        .as_array()
-        .ok_or_else(|| StorageError::MissingField {
-            context: "manifest".into(),
-            field: "layers".into(),
-        })?
-        .iter()
-        .filter_map(|l| l["digest"].as_str().map(String::from))
-        .collect();
-
-    // Save manifest
-    let manifest_path = root
-        .join(MANIFESTS_DIR)
-        .join(sanitize_image_name(image) + ".json");
-    std::fs::write(&manifest_path, &manifest)?;
-
-    // Fetch and save config
-    let config = crane_config(image, platform, auth)?;
-    let config_id = config_digest
-        .strip_prefix("sha256:")
-        .unwrap_or(config_digest);
-    let config_path = root.join(CONFIGS_DIR).join(format!("{}.json", config_id));
-    std::fs::write(&config_path, &config)?;
-
-    // Parse config for metadata
-    let config_json: serde_json::Value =
-        serde_json::from_str(&config).map_err(|e| StorageError::parse_error("config", e))?;
-
-    // Extract layers with retry logic for transient failures
-    let mut total_size = 0u64;
-    for (i, layer_digest) in layers.iter().enumerate() {
-        let layer_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
-        let layer_dir = root.join(LAYERS_DIR).join(layer_id);
-
-        if is_layer_cached(&layer_dir) {
-            info!(layer = %layer_id, "layer already cached");
-            // Still count cached layer size
-            if let Ok(size) = dir_size(&layer_dir) {
-                total_size += size;
-            }
-            continue;
-        }
-
-        info!(
-            layer = %layer_id,
-            progress = format!("{}/{}", i + 1, layers.len()),
-            "extracting layer"
-        );
-
-        // Extract with retry logic for transient network failures
-        extract_layer_with_retry(image, layer_digest, &layer_dir, platform, auth)?;
-
-        // Get layer size
-        if let Ok(size) = dir_size(&layer_dir) {
-            total_size += size;
-        }
-    }
-
-    // Sync filesystem to ensure all layer data is persisted to the ext4 journal.
-    // Defense in depth: even though shutdown waits for acknowledgment (which also
-    // syncs), we sync here because:
-    // 1. Commands may complete and VM may exit before shutdown is called
-    // 2. Protects against ungraceful termination (SIGKILL, host crash)
-    // 3. Empty layer directories cause "executable not found" errors that are
-    //    hard to diagnose - better to be safe than sorry
-    // SAFETY: sync() is always safe to call
-    unsafe {
-        libc::sync();
-    }
-
-    // Build ImageInfo
-    let architecture = config_json["architecture"]
-        .as_str()
-        .unwrap_or("unknown")
-        .to_string();
-    let os = config_json["os"].as_str().unwrap_or("linux").to_string();
-    let created = config_json["created"].as_str().map(String::from);
-
-    Ok(ImageInfo {
-        reference: image.to_string(),
-        digest: config_digest.to_string(),
-        size: total_size,
-        created,
-        architecture,
-        os,
-        layer_count: layers.len(),
-        layers,
-    })
-}
-
-/// Pull an OCI image with progress callback.
-///
-/// The callback is called for each layer being pulled with (current, total, layer_id).
-pub fn pull_image_with_progress<F>(
-    image: &str,
-    platform: Option<&str>,
-    progress: F,
-) -> Result<ImageInfo>
-where
-    F: FnMut(usize, usize, &str),
-{
-    pull_image_with_progress_and_auth(image, platform, None, progress)
-}
-
 /// Pull an OCI image with progress callback and optional authentication.
 ///
 /// The callback is called for each layer being pulled with (current, total, layer_id).
@@ -1004,26 +793,8 @@ where
         // Stream layer directly to tar extraction using direct process piping
         // (no shell to avoid injection risks)
 
-        // Create per-request temp directory for credentials (if needed)
-        let temp_dir = if auth.is_some() {
-            Some(tempfile::TempDir::new().map_err(|e| {
-                StorageError::new(format!("failed to create temp directory for auth: {}", e))
-            })?)
-        } else {
-            None
-        };
-
-        // Set up auth via Docker config file if credentials provided
-        if let (Some(a), Some(ref td)) = (auth, &temp_dir) {
-            let registry = extract_registry_from_image(image);
-            let auth_b64 = base64_encode(&format!("{}:{}", a.username, a.password));
-            let config_json = format!(
-                r#"{{"auths":{{"{}":{{"auth":"{}"}}}}}}"#,
-                registry, auth_b64
-            );
-            let config_path = td.path().join("config.json");
-            std::fs::write(&config_path, &config_json)?;
-        }
+        // Set up auth if provided (temp_dir must stay alive until command completes)
+        let temp_dir = setup_docker_auth(image, auth)?;
 
         // Build crane command
         let mut crane_cmd = Command::new("crane");
@@ -1036,7 +807,6 @@ where
         // Use null for stderr to avoid deadlock (pipe buffer can fill if not consumed)
         crane_cmd.stderr(Stdio::null());
 
-        // Set DOCKER_CONFIG if we have auth
         if let Some(ref td) = temp_dir {
             crane_cmd.env("DOCKER_CONFIG", td.path());
         }
@@ -2186,98 +1956,44 @@ fn base64_encode(input: &str) -> String {
     result
 }
 
-/// Validate OCI platform string format.
+/// Set up Docker auth configuration for crane commands.
 ///
-/// Valid formats: "os/arch" or "os/arch/variant"
-/// Examples: "linux/amd64", "linux/arm64", "linux/arm/v7"
+/// Creates a temporary directory with a Docker config.json file containing
+/// registry credentials. The returned TempDir must be kept alive for the
+/// duration of the command execution.
 ///
-/// This function prevents shell injection by rejecting any platform string
-/// that contains characters that could be interpreted by a shell.
-fn validate_platform(platform: &str) -> Result<()> {
-    // Reject empty platform
-    if platform.is_empty() {
-        return Err(StorageError::ValidationFailed {
-            context: "platform".to_string(),
-            reason: "platform string cannot be empty".to_string(),
-        });
-    }
+/// Returns `Ok(None)` if no auth is provided.
+fn setup_docker_auth(
+    image: &str,
+    auth: Option<&RegistryAuth>,
+) -> Result<Option<tempfile::TempDir>> {
+    let Some(a) = auth else {
+        return Ok(None);
+    };
 
-    // Only allow alphanumeric characters, slashes, hyphens, and underscores
-    // This prevents shell metacharacters like $, `, ;, |, &, etc.
-    let valid_chars = platform
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_');
+    let registry = extract_registry_from_image(image);
 
-    if !valid_chars {
-        return Err(StorageError::ValidationFailed {
-            context: "platform".to_string(),
-            reason: format!(
-                "platform '{}' contains invalid characters (only alphanumeric, '/', '-', '_' allowed)",
-                platform
-            ),
-        });
-    }
+    let temp_dir = tempfile::TempDir::new().map_err(|e| {
+        StorageError::new(format!("failed to create temp directory for auth: {}", e))
+    })?;
 
-    // Validate structure: must be os/arch or os/arch/variant
-    let parts: Vec<&str> = platform.split('/').collect();
-    match parts.len() {
-        2 => {
-            // os/arch format
-            let valid_os = ["linux", "windows", "darwin"];
-            let valid_arch = [
-                "amd64", "arm64", "arm", "386", "ppc64le", "s390x", "riscv64", "mips64le",
-            ];
-            if !valid_os.contains(&parts[0]) {
-                return Err(StorageError::ValidationFailed {
-                    context: "platform".to_string(),
-                    reason: format!(
-                        "unknown OS '{}' (expected one of: {:?})",
-                        parts[0], valid_os
-                    ),
-                });
-            }
-            if !valid_arch.contains(&parts[1]) {
-                return Err(StorageError::ValidationFailed {
-                    context: "platform".to_string(),
-                    reason: format!(
-                        "unknown architecture '{}' (expected one of: {:?})",
-                        parts[1], valid_arch
-                    ),
-                });
-            }
-        }
-        3 => {
-            // os/arch/variant format (e.g., linux/arm/v7)
-            let valid_os = ["linux", "windows", "darwin"];
-            if !valid_os.contains(&parts[0]) {
-                return Err(StorageError::ValidationFailed {
-                    context: "platform".to_string(),
-                    reason: format!(
-                        "unknown OS '{}' (expected one of: {:?})",
-                        parts[0], valid_os
-                    ),
-                });
-            }
-            // Variant can be various values like v7, v8, etc. - just ensure it's not empty
-            if parts[2].is_empty() {
-                return Err(StorageError::ValidationFailed {
-                    context: "platform".to_string(),
-                    reason: "platform variant cannot be empty".to_string(),
-                });
-            }
-        }
-        _ => {
-            return Err(StorageError::ValidationFailed {
-                context: "platform".to_string(),
-                reason: format!(
-                    "invalid platform format '{}' (expected 'os/arch' or 'os/arch/variant')",
-                    platform
-                ),
-            });
-        }
-    }
+    let auth_b64 = base64_encode(&format!("{}:{}", a.username, a.password));
+    let config_json = format!(
+        r#"{{"auths":{{"{}":{{"auth":"{}"}}}}}}"#,
+        registry, auth_b64
+    );
 
-    Ok(())
+    let config_path = temp_dir.path().join("config.json");
+    std::fs::write(&config_path, &config_json)
+        .map_err(|e| StorageError::new(format!("failed to write docker auth config: {}", e)))?;
+
+    debug!(
+        registry = %registry,
+        username = %a.username,
+        "using registry credentials via docker config"
+    );
+
+    Ok(Some(temp_dir))
 }
 
 /// Run a crane command with the given operation.
@@ -2326,43 +2042,11 @@ fn run_crane_once(
         cmd.arg("--platform").arg(p);
     }
 
-    // Create per-request temp directory for credentials (if needed)
-    // This prevents race conditions and ensures credentials are cleaned up
-    let _temp_dir = if let Some(a) = auth {
-        // Extract registry from image (e.g., "docker.io" from "alpine:latest")
-        let registry = extract_registry_from_image(image);
-
-        // Create isolated temp directory for this request
-        let temp_dir = tempfile::TempDir::new().map_err(|e| {
-            StorageError::new(format!("failed to create temp directory for auth: {}", e))
-        })?;
-
-        // Base64 encode username:password for Docker auth format
-        let auth_str = format!("{}:{}", a.username, a.password);
-        let auth_b64 = base64_encode(&auth_str);
-
-        let config_json = format!(
-            r#"{{"auths":{{"{}":{{"auth":"{}"}}}}}}"#,
-            registry, auth_b64
-        );
-
-        let config_path = temp_dir.path().join("config.json");
-        if let Err(e) = std::fs::write(&config_path, &config_json) {
-            warn!(error = %e, "failed to write docker config for crane auth");
-        } else {
-            cmd.env("DOCKER_CONFIG", temp_dir.path());
-            debug!(
-                operation = %operation,
-                image = %image,
-                username = %a.username,
-                registry = %registry,
-                "using registry credentials via docker config"
-            );
-        }
-        Some(temp_dir)
-    } else {
-        None
-    };
+    // Set up auth if provided (temp_dir must stay alive until command completes)
+    let _temp_dir = setup_docker_auth(image, auth)?;
+    if let Some(ref td) = _temp_dir {
+        cmd.env("DOCKER_CONFIG", td.path());
+    }
 
     let output = cmd.output()?;
 
@@ -2491,157 +2175,6 @@ fn dir_size(path: &Path) -> Result<u64> {
     Ok(size)
 }
 
-/// Extract a single layer with retry logic for transient network failures.
-///
-/// Cleans up failed extractions and retries on transient errors.
-/// Uses direct process piping (crane | tar) instead of shell to prevent injection.
-fn extract_layer_with_retry(
-    image: &str,
-    layer_digest: &str,
-    layer_dir: &Path,
-    platform: Option<&str>,
-    auth: Option<&RegistryAuth>,
-) -> Result<()> {
-    use crate::retry::{
-        is_permanent_error, is_transient_network_error, retry_with_backoff, RetryConfig,
-    };
-
-    // Validate platform to prevent injection attacks
-    if let Some(p) = platform {
-        validate_platform(p)?;
-    }
-
-    let layer_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
-    let op_name = format!("extract layer {}", &layer_id[..12.min(layer_id.len())]);
-
-    retry_with_backoff(
-        RetryConfig::for_network(),
-        &op_name,
-        || {
-            // Clean up any previous failed attempt
-            if layer_dir.exists() {
-                let _ = std::fs::remove_dir_all(layer_dir);
-            }
-            std::fs::create_dir_all(layer_dir)?;
-
-            // Create per-request temp directory for credentials (if needed)
-            // This prevents race conditions and ensures cleanup
-            let temp_dir = if auth.is_some() {
-                Some(tempfile::TempDir::new().map_err(|e| {
-                    StorageError::new(format!("failed to create temp directory for auth: {}", e))
-                })?)
-            } else {
-                None
-            };
-
-            // Set up auth via Docker config file if credentials provided
-            if let Some(a) = auth {
-                if let Some(ref td) = temp_dir {
-                    let registry = extract_registry_from_image(image);
-                    let auth_b64 = base64_encode(&format!("{}:{}", a.username, a.password));
-                    let config_json = format!(
-                        r#"{{"auths":{{"{}":{{"auth":"{}"}}}}}}"#,
-                        registry, auth_b64
-                    );
-                    let config_path = td.path().join("config.json");
-                    std::fs::write(&config_path, &config_json).map_err(|e| {
-                        StorageError::new(format!("failed to write auth config: {}", e))
-                    })?;
-                }
-            }
-
-            // Build crane command with explicit arguments (no shell interpolation)
-            let mut crane_cmd = Command::new("crane");
-            crane_cmd.arg("blob");
-            crane_cmd.arg(format!("{}@{}", image, layer_digest));
-            if let Some(p) = platform {
-                crane_cmd.arg(format!("--platform={}", p));
-            }
-            crane_cmd.stdout(Stdio::piped());
-            crane_cmd.stderr(Stdio::piped());
-
-            // Set DOCKER_CONFIG if we have auth
-            if let Some(ref td) = temp_dir {
-                crane_cmd.env("DOCKER_CONFIG", td.path());
-            }
-
-            // Spawn crane process
-            let mut crane = crane_cmd.spawn().map_err(|e| StorageError::SpawnFailed {
-                command: "crane".to_string(),
-                cause: e.to_string(),
-            })?;
-
-            // Get crane's stdout to pipe to tar
-            let crane_stdout = crane
-                .stdout
-                .take()
-                .ok_or_else(|| StorageError::new("failed to capture crane stdout"))?;
-
-            // Build tar command with explicit arguments
-            let mut tar_cmd = Command::new("tar");
-            tar_cmd.args(["-xzf", "-", "-C"]);
-            tar_cmd.arg(layer_dir);
-            tar_cmd.stdin(crane_stdout);
-            tar_cmd.stderr(Stdio::piped());
-
-            // Spawn tar process
-            let tar_output = tar_cmd.output().map_err(|e| StorageError::SpawnFailed {
-                command: "tar".to_string(),
-                cause: e.to_string(),
-            })?;
-
-            // Wait for crane to finish
-            let crane_output = crane
-                .wait_with_output()
-                .map_err(|e| StorageError::new(format!("failed to wait for crane: {}", e)))?;
-
-            // temp_dir is dropped here, cleaning up credentials
-
-            // Check crane exit status
-            if !crane_output.status.success() {
-                let _ = std::fs::remove_dir_all(layer_dir);
-                let stderr = String::from_utf8_lossy(&crane_output.stderr);
-                return Err(StorageError::CommandFailed {
-                    command: "crane blob".to_string(),
-                    exit_code: crane_output.status.code(),
-                    stderr: stderr.to_string(),
-                });
-            }
-
-            // Check tar exit status
-            if !tar_output.status.success() {
-                let _ = std::fs::remove_dir_all(layer_dir);
-                let stderr = String::from_utf8_lossy(&tar_output.stderr);
-                return Err(StorageError::CommandFailed {
-                    command: "tar".to_string(),
-                    exit_code: tar_output.status.code(),
-                    stderr: stderr.to_string(),
-                });
-            }
-
-            // Verify extraction succeeded (directory is not empty)
-            if !is_layer_cached(layer_dir) {
-                let _ = std::fs::remove_dir_all(layer_dir);
-                return Err(StorageError::new(format!(
-                    "layer extraction produced empty directory: {}",
-                    layer_digest
-                )));
-            }
-
-            Ok(())
-        },
-        |e| {
-            let error_msg = e.to_string();
-            // Don't retry permanent errors
-            if is_permanent_error(&error_msg) {
-                return false;
-            }
-            // Retry transient network errors
-            is_transient_network_error(&error_msg)
-        },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2680,38 +2213,5 @@ mod tests {
             sanitize_image_name("ghcr.io/owner/repo@sha256:abc123"),
             "ghcr.io_owner_repo_sha256_abc123"
         );
-    }
-
-    // ========================================================================
-    // Platform Validation Tests (Security)
-    // ========================================================================
-
-    #[test]
-    fn test_validate_platform_accepts_valid() {
-        // os/arch format
-        assert!(validate_platform("linux/amd64").is_ok());
-        assert!(validate_platform("linux/arm64").is_ok());
-        // os/arch/variant format
-        assert!(validate_platform("linux/arm64/v8").is_ok());
-        assert!(validate_platform("linux/arm/v7").is_ok());
-    }
-
-    #[test]
-    fn test_validate_platform_rejects_shell_injection() {
-        assert!(validate_platform("linux/amd64; rm -rf /").is_err());
-        assert!(validate_platform("linux/$(whoami)").is_err());
-        assert!(validate_platform("linux/`id`").is_err());
-        assert!(validate_platform("linux/amd64 | cat /etc/passwd").is_err());
-        assert!(validate_platform("linux/amd64 && rm -rf /").is_err());
-        assert!(validate_platform("linux/amd64\nrm -rf /").is_err());
-    }
-
-    #[test]
-    fn test_validate_platform_rejects_invalid() {
-        assert!(validate_platform("").is_err()); // empty
-        assert!(validate_platform("linux").is_err()); // missing arch
-        assert!(validate_platform("linux/arm64/v8/extra").is_err()); // too many parts
-        assert!(validate_platform("freebsd/amd64").is_err()); // invalid OS
-        assert!(validate_platform("linux/sparc").is_err()); // invalid arch
     }
 }
