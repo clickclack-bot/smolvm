@@ -1984,9 +1984,8 @@ fn setup_docker_auth(
     );
 
     let config_path = temp_dir.path().join("config.json");
-    std::fs::write(&config_path, &config_json).map_err(|e| {
-        StorageError::new(format!("failed to write docker auth config: {}", e))
-    })?;
+    std::fs::write(&config_path, &config_json)
+        .map_err(|e| StorageError::new(format!("failed to write docker auth config: {}", e)))?;
 
     debug!(
         registry = %registry,
