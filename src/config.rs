@@ -311,6 +311,18 @@ pub struct VmRecord {
     /// Last exit code from the VM process.
     #[serde(default)]
     pub last_exit_code: Option<i32>,
+
+    /// Commands to run on every VM start (via `sh -c`).
+    #[serde(default)]
+    pub init: Vec<String>,
+
+    /// Environment variables for init commands.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+
+    /// Working directory for init commands.
+    #[serde(default)]
+    pub workdir: Option<String>,
 }
 
 fn default_cpus() -> u8 {
@@ -344,6 +356,9 @@ impl VmRecord {
             network,
             restart: RestartConfig::default(),
             last_exit_code: None,
+            init: Vec::new(),
+            env: Vec::new(),
+            workdir: None,
         }
     }
 
@@ -370,6 +385,9 @@ impl VmRecord {
             network,
             restart,
             last_exit_code: None,
+            init: Vec::new(),
+            env: Vec::new(),
+            workdir: None,
         }
     }
 
