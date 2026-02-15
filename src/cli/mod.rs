@@ -9,6 +9,7 @@ pub mod parsers;
 pub mod run_packed;
 pub mod sandbox;
 pub mod serve;
+pub mod smolfile;
 pub mod vm_common;
 
 use std::io::Write;

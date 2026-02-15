@@ -11,9 +11,10 @@
 
 use crate::cli::flush_output;
 use crate::cli::parsers::{parse_duration, parse_env_list, parse_port};
-use crate::cli::vm_common::{self, CreateVmParams, DeleteVmOptions, VmKind};
+use crate::cli::vm_common::{self, DeleteVmOptions, VmKind};
 use clap::{Args, Subcommand};
 use smolvm::agent::{AgentClient, PortMapping};
+use std::path::PathBuf;
 use std::time::Duration;
 
 const KIND: VmKind = VmKind::Microvm;
@@ -201,21 +202,39 @@ pub struct CreateCmd {
     /// Enable outbound network access
     #[arg(long)]
     pub net: bool,
+
+    /// Run command on every VM start (can be used multiple times)
+    #[arg(long = "init", value_name = "COMMAND")]
+    pub init: Vec<String>,
+
+    /// Set environment variable for init commands (can be used multiple times)
+    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+
+    /// Set working directory for init commands
+    #[arg(short = 'w', long = "workdir", value_name = "DIR")]
+    pub workdir: Option<String>,
+
+    /// Load configuration from a Smolfile (TOML)
+    #[arg(long = "smolfile", visible_short_alias = 's', value_name = "PATH")]
+    pub smolfile: Option<PathBuf>,
 }
 
 impl CreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        vm_common::create_vm(
-            KIND,
-            CreateVmParams {
-                name: self.name,
-                cpus: self.cpus,
-                mem: self.mem,
-                volume: self.volume,
-                port: self.port,
-                net: self.net,
-            },
-        )
+        let params = crate::cli::smolfile::build_create_params(
+            self.name,
+            self.cpus,
+            self.mem,
+            self.volume,
+            self.port,
+            self.net,
+            self.init,
+            self.env,
+            self.workdir,
+            self.smolfile,
+        )?;
+        vm_common::create_vm(KIND, params)
     }
 }
 

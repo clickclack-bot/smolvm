@@ -83,6 +83,9 @@ pub struct CreateVmParams {
     pub volume: Vec<String>,
     pub port: Vec<PortMapping>,
     pub net: bool,
+    pub init: Vec<String>,
+    pub env: Vec<String>,
+    pub workdir: Option<String>,
 }
 
 /// Create a named VM/sandbox configuration (does not start it).
@@ -103,8 +106,22 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
     // Convert port mappings to tuple format for storage
     let ports: Vec<(u16, u16)> = params.port.iter().map(|p| (p.host, p.guest)).collect();
 
+    // Parse environment variables for init
+    let env: Vec<(String, String)> = params
+        .env
+        .iter()
+        .filter_map(|e| {
+            let (k, v) = e.split_once('=')?;
+            if k.is_empty() {
+                None
+            } else {
+                Some((k.to_string(), v.to_string()))
+            }
+        })
+        .collect();
+
     // Create record
-    let record = VmRecord::new(
+    let mut record = VmRecord::new(
         params.name.clone(),
         params.cpus,
         params.mem,
@@ -112,6 +129,9 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
         ports,
         params.net,
     );
+    record.init = params.init.clone();
+    record.env = env;
+    record.workdir = params.workdir.clone();
 
     // Store in config (persisted immediately to database)
     config.insert_vm(params.name.clone(), record)?;
@@ -123,6 +143,9 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
     }
     if !params.port.is_empty() {
         println!("  Ports: {}", params.port.len());
+    }
+    if !params.init.is_empty() {
+        println!("  Init commands: {}", params.init.len());
     }
     println!(
         "\nUse '{} start {}' to start the {}",
@@ -206,6 +229,20 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
         r.pid_start_time = pid_start_time;
     });
     config.save()?;
+
+    // Run init commands if configured
+    if !record.init.is_empty() {
+        println!("Running {} init command(s)...", record.init.len());
+        let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+        for (i, cmd) in record.init.iter().enumerate() {
+            let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
+            let (exit_code, _stdout, stderr) =
+                client.vm_exec(argv, record.env.clone(), record.workdir.clone(), None)?;
+            if exit_code != 0 {
+                eprintln!("init[{}] failed (exit {}): {}", i, exit_code, stderr.trim());
+            }
+        }
+    }
 
     println!(
         "{} '{}' running (PID: {})",
@@ -490,6 +527,15 @@ pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
                 }
                 if kind.include_network_in_json() && record.network {
                     println!("  Network: enabled");
+                }
+                for cmd in &record.init {
+                    println!("  Init: {}", cmd);
+                }
+                for (k, v) in &record.env {
+                    println!("  Env: {}={}", k, v);
+                }
+                if let Some(wd) = &record.workdir {
+                    println!("  Workdir: {}", wd);
                 }
                 println!("  Created: {}", record.created_at);
                 println!();
