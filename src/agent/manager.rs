@@ -5,14 +5,14 @@
 
 use crate::error::{Error, Result};
 use crate::process::{self, ChildProcess};
-use crate::storage::StorageDisk;
+use crate::storage::{OverlayDisk, StorageDisk};
 use parking_lot::Mutex;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::launcher::launch_agent_vm;
+use super::launcher::{self, launch_agent_vm};
 use super::{HostMount, PortMapping, VmResources};
 
 // ============================================================================
@@ -134,6 +134,8 @@ pub struct AgentManager {
     rootfs_path: PathBuf,
     /// Storage disk for OCI layers.
     storage_disk: StorageDisk,
+    /// Overlay disk for persistent rootfs changes.
+    overlay_disk: OverlayDisk,
     /// vsock socket path for control channel.
     vsock_socket: PathBuf,
     /// PID file path for tracking the VM process across CLI invocations.
@@ -151,8 +153,13 @@ impl AgentManager {
     ///
     /// * `rootfs_path` - Path to the agent VM rootfs
     /// * `storage_disk` - Storage disk for OCI layers
-    pub fn new(rootfs_path: impl Into<PathBuf>, storage_disk: StorageDisk) -> Result<Self> {
-        Self::new_internal(None, rootfs_path.into(), storage_disk)
+    /// * `overlay_disk` - Overlay disk for persistent rootfs changes
+    pub fn new(
+        rootfs_path: impl Into<PathBuf>,
+        storage_disk: StorageDisk,
+        overlay_disk: OverlayDisk,
+    ) -> Result<Self> {
+        Self::new_internal(None, rootfs_path.into(), storage_disk, overlay_disk)
     }
 
     /// Create a new agent manager for a named VM.
@@ -162,8 +169,14 @@ impl AgentManager {
         name: impl Into<String>,
         rootfs_path: impl Into<PathBuf>,
         storage_disk: StorageDisk,
+        overlay_disk: OverlayDisk,
     ) -> Result<Self> {
-        Self::new_internal(Some(name.into()), rootfs_path.into(), storage_disk)
+        Self::new_internal(
+            Some(name.into()),
+            rootfs_path.into(),
+            storage_disk,
+            overlay_disk,
+        )
     }
 
     /// Internal constructor.
@@ -171,6 +184,7 @@ impl AgentManager {
         name: Option<String>,
         rootfs_path: PathBuf,
         storage_disk: StorageDisk,
+        overlay_disk: OverlayDisk,
     ) -> Result<Self> {
         // Create runtime directory for sockets
         let runtime_dir = dirs::runtime_dir()
@@ -193,6 +207,7 @@ impl AgentManager {
             name,
             rootfs_path,
             storage_disk,
+            overlay_disk,
             vsock_socket,
             pid_file,
             console_log,
@@ -210,19 +225,46 @@ impl AgentManager {
     /// Get the default (anonymous) agent manager.
     ///
     /// Uses default paths for rootfs and storage.
-    pub fn new_default() -> Result<Self> {
+    /// `storage_gb` and `overlay_gb` override the default disk sizes (20 GiB / 2 GiB).
+    pub fn new_default_with_sizes(
+        storage_gb: Option<u64>,
+        overlay_gb: Option<u64>,
+    ) -> Result<Self> {
         let rootfs_path = Self::default_rootfs_path()?;
-        let storage_disk = StorageDisk::open_or_create()?;
+        let sg = storage_gb.unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GB);
+        let og = overlay_gb.unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GB);
 
-        Self::new(rootfs_path, storage_disk)
+        let storage_disk = StorageDisk::open_or_create_with_size(sg)?;
+
+        // Overlay disk lives next to the storage disk
+        let overlay_path = storage_disk
+            .path()
+            .parent()
+            .unwrap_or_else(|| Path::new("/tmp"))
+            .join(crate::storage::OVERLAY_DISK_FILENAME);
+        let overlay_disk = OverlayDisk::open_or_create_at(&overlay_path, og)?;
+
+        Self::new(rootfs_path, storage_disk, overlay_disk)
+    }
+
+    /// Get the default (anonymous) agent manager with default sizes.
+    pub fn new_default() -> Result<Self> {
+        Self::new_default_with_sizes(None, None)
     }
 
     /// Get an agent manager for a named VM.
     ///
     /// Each named VM gets its own isolated storage and socket.
-    pub fn for_vm(name: impl Into<String>) -> Result<Self> {
+    /// `storage_gb` and `overlay_gb` override the default disk sizes (20 GiB / 2 GiB).
+    pub fn for_vm_with_sizes(
+        name: impl Into<String>,
+        storage_gb: Option<u64>,
+        overlay_gb: Option<u64>,
+    ) -> Result<Self> {
         let name = name.into();
         let rootfs_path = Self::default_rootfs_path()?;
+        let sg = storage_gb.unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GB);
+        let og = overlay_gb.unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GB);
 
         // Named VMs get their own storage disk
         let storage_dir = dirs::cache_dir()
@@ -233,11 +275,18 @@ impl AgentManager {
             .join(&name);
         std::fs::create_dir_all(&storage_dir)?;
 
-        let storage_path = storage_dir.join("storage.img");
-        let storage_disk =
-            StorageDisk::open_or_create_at(&storage_path, crate::storage::DEFAULT_STORAGE_SIZE_GB)?;
+        let storage_path = storage_dir.join(crate::storage::STORAGE_DISK_FILENAME);
+        let storage_disk = StorageDisk::open_or_create_at(&storage_path, sg)?;
 
-        Self::new_named(name, rootfs_path, storage_disk)
+        let overlay_path = storage_dir.join(crate::storage::OVERLAY_DISK_FILENAME);
+        let overlay_disk = OverlayDisk::open_or_create_at(&overlay_path, og)?;
+
+        Self::new_named(name, rootfs_path, storage_disk, overlay_disk)
+    }
+
+    /// Get an agent manager for a named VM with default sizes.
+    pub fn for_vm(name: impl Into<String>) -> Result<Self> {
+        Self::for_vm_with_sizes(name, None, None)
     }
 
     /// Get the VM name if this is a named agent.
@@ -611,6 +660,14 @@ impl AgentManager {
             );
         }
 
+        // Pre-format overlay disk for persistent rootfs
+        if let Err(e) = self.overlay_disk.ensure_formatted() {
+            tracing::warn!(
+                error = %e,
+                "failed to pre-format overlay disk on host, will format in VM on first boot"
+            );
+        }
+
         // Install SIGCHLD handler to automatically reap zombie children.
         // This must be done AFTER ensure_formatted() because the handler
         // reaps all children, which interferes with Command::output().
@@ -626,8 +683,15 @@ impl AgentManager {
         // Clone paths for the child process (owned copies)
         let rootfs_path = self.rootfs_path.clone();
         let storage_disk_path = self.storage_disk.path().to_path_buf();
+        let overlay_disk_path = self.overlay_disk.path().to_path_buf();
         let vsock_socket = self.vsock_socket.clone();
         let console_log = self.console_log.clone();
+        let storage_size_gb = resources
+            .storage_gb
+            .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GB);
+        let overlay_size_gb = resources
+            .overlay_gb
+            .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GB);
 
         // Fork child process using the safe abstraction.
         // The child becomes a session leader (detached from parent's session)
@@ -642,7 +706,7 @@ impl AgentManager {
             // Re-create StorageDisk in child (we only have the path)
             let storage_disk = match crate::storage::StorageDisk::open_or_create_at(
                 &storage_disk_path,
-                crate::storage::DEFAULT_STORAGE_SIZE_GB,
+                storage_size_gb,
             ) {
                 Ok(d) => d,
                 Err(e) => {
@@ -651,10 +715,26 @@ impl AgentManager {
                 }
             };
 
+            // Re-create OverlayDisk in child
+            let overlay_disk = match crate::storage::OverlayDisk::open_or_create_at(
+                &overlay_disk_path,
+                overlay_size_gb,
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("failed to open overlay disk: {}", e);
+                    process::exit_child(1);
+                }
+            };
+
             // Launch the agent VM (never returns on success)
+            let disks = launcher::VmDisks {
+                storage: &storage_disk,
+                overlay: Some(&overlay_disk),
+            };
             let result = launch_agent_vm(
                 &rootfs_path,
-                &storage_disk,
+                &disks,
                 &vsock_socket,
                 console_log.as_deref(),
                 &mounts,
@@ -832,12 +912,17 @@ impl AgentManager {
             }
         }
 
-        // Defense in depth: sync host's view of the storage file
+        // Defense in depth: sync host's view of the disk files
         // This catches any writes that made it to the host buffer but weren't flushed
         // Combined with agent-side sync(), this provides robust data integrity
-        if let Ok(file) = std::fs::File::open(self.storage_disk.path()) {
-            if file.sync_all().is_ok() {
-                tracing::debug!("storage disk synced to host");
+        for (label, path) in [
+            ("storage", self.storage_disk.path()),
+            ("overlay", self.overlay_disk.path()),
+        ] {
+            if let Ok(file) = std::fs::File::open(path) {
+                if file.sync_all().is_ok() {
+                    tracing::debug!("{} disk synced to host", label);
+                }
             }
         }
 
