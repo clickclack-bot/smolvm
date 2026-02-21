@@ -8,6 +8,7 @@ use crate::cli::vm_common;
 use crate::cli::{flush_output, truncate, truncate_id, COMMAND_WIDTH, IMAGE_NAME_WIDTH};
 use clap::{Args, Subcommand};
 use smolvm::agent::{AgentClient, AgentManager};
+use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::time::Duration;
 
 /// Manage containers inside a microVM
@@ -111,7 +112,7 @@ impl ContainerCreateCmd {
 
         // Default command is sleep infinity for long-running containers
         let command = if self.command.is_empty() {
-            vec!["sleep".to_string(), "infinity".to_string()]
+            DEFAULT_IDLE_CMD.iter().map(|s| s.to_string()).collect()
         } else {
             self.command.clone()
         };
@@ -369,7 +370,7 @@ impl ContainerExecCmd {
 
         // Default command
         let command = if self.command.is_empty() {
-            vec!["/bin/sh".to_string()]
+            vec![DEFAULT_SHELL_CMD.to_string()]
         } else {
             self.command.clone()
         };

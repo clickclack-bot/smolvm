@@ -15,6 +15,7 @@ use crate::api::types::{
     StartResponse, StopContainerRequest, StopResponse,
 };
 use crate::api::validation::validate_command;
+use crate::DEFAULT_IDLE_CMD;
 
 /// Create a container in a sandbox.
 #[utoipa::path(
@@ -46,7 +47,7 @@ pub async fn create_container(
     // Prepare parameters
     let image = req.image.clone();
     let command = if req.command.is_empty() {
-        vec!["sleep".to_string(), "infinity".to_string()]
+        DEFAULT_IDLE_CMD.iter().map(|s| s.to_string()).collect()
     } else {
         req.command.clone()
     };
