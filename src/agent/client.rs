@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth, RegistryConfig};
 use smolvm_protocol::{
     encode_message, AgentRequest, AgentResponse, ContainerInfo, ImageInfo, OverlayInfo,
-    StorageStatus, MAX_FRAME_SIZE,
+    StorageStatus, MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -54,7 +54,7 @@ const STATUS_CHECK_TIMEOUT_SECS: u64 = 5;
 /// Ensures the timeout is always restored, even if the operation
 /// returns early due to an error. Uses a cloned UnixStream handle
 /// (shares the underlying fd) to avoid borrow conflicts.
-struct ReadTimeoutGuard {
+pub struct ReadTimeoutGuard {
     stream: UnixStream,
 }
 
@@ -359,12 +359,24 @@ impl AgentClient {
         self.receive()
     }
 
-    /// Ping the helper daemon.
+    /// Ping the helper daemon and validate the protocol version.
+    ///
+    /// Returns the agent's protocol version. Logs a warning if the version
+    /// doesn't match the host's expected version.
     pub fn ping(&mut self) -> Result<u32> {
         let resp = self.request(&AgentRequest::Ping)?;
 
         match resp {
-            AgentResponse::Pong { version } => Ok(version),
+            AgentResponse::Pong { version } => {
+                if version != PROTOCOL_VERSION {
+                    tracing::warn!(
+                        host_version = PROTOCOL_VERSION,
+                        agent_version = version,
+                        "protocol version mismatch — agent may be outdated or newer than host"
+                    );
+                }
+                Ok(version)
+            }
             AgentResponse::Error { message, .. } => Err(Error::agent("ping", message)),
             _ => Err(Error::agent("ping", "unexpected response type")),
         }
@@ -1205,6 +1217,15 @@ impl AgentClient {
     /// Low-level receive a single response (public).
     pub fn recv_raw(&mut self) -> Result<AgentResponse> {
         self.receive()
+    }
+
+    /// Set an extended read timeout and return a guard that resets it on drop.
+    ///
+    /// Used for long-running streaming operations (e.g., layer export) where
+    /// individual chunks may take longer than the default 30s timeout.
+    pub fn set_extended_read_timeout(&self, timeout: Duration) -> Result<Option<ReadTimeoutGuard>> {
+        self.set_read_timeout(timeout)?;
+        Ok(ReadTimeoutGuard::new(&self.stream))
     }
 
     /// Low-level send without waiting for response.

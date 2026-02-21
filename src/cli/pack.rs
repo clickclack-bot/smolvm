@@ -377,16 +377,36 @@ impl PackCmd {
         layer_index: usize,
     ) -> smolvm::Result<Vec<u8>> {
         use smolvm_protocol::AgentRequest;
+        use std::time::{Duration, Instant};
+
+        const LAYER_EXPORT_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes
 
         let request = AgentRequest::ExportLayer {
             image_digest: image_digest.to_string(),
             layer_index,
         };
 
+        // Extend socket read timeout for the duration of the export.
+        // The default 30s timeout would fire before our wall-clock guard
+        // if the agent stalls between chunks.
+        let _timeout_guard = client.set_extended_read_timeout(LAYER_EXPORT_TIMEOUT)?;
+
         client.send_raw(&request)?;
 
+        let start = Instant::now();
         let mut result = Vec::new();
         loop {
+            if start.elapsed() > LAYER_EXPORT_TIMEOUT {
+                return Err(Error::agent(
+                    "export layer",
+                    format!(
+                        "layer export timed out after {}s (received {} bytes so far)",
+                        LAYER_EXPORT_TIMEOUT.as_secs(),
+                        result.len()
+                    ),
+                ));
+            }
+
             let response = client.recv_raw()?;
             match response {
                 AgentResponse::LayerData { data, done } => {

@@ -98,6 +98,54 @@ pub fn vm_label(name: &Option<String>) -> String {
     name.as_deref().unwrap_or("default").to_string()
 }
 
+/// Ensure a VM is running and return a connected client.
+///
+/// This is the common pattern used by exec commands in both microvm and sandbox.
+/// It resolves the VM manager, checks connectivity, and establishes a client connection.
+pub fn ensure_running_and_connect(
+    name: &Option<String>,
+    kind: VmKind,
+) -> smolvm::Result<(AgentManager, smolvm::agent::AgentClient)> {
+    let manager = get_vm_manager(name)?;
+    let label = vm_label(name);
+
+    if manager.try_connect_existing().is_none() {
+        return Err(smolvm::Error::agent(
+            "connect",
+            format!(
+                "{} '{}' is not running. Use '{} start' first.",
+                kind.label(),
+                label,
+                kind.cli_prefix(),
+            ),
+        ));
+    }
+
+    let client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+    Ok((manager, client))
+}
+
+/// Print command output and exit with the given code.
+///
+/// Prints stdout to stdout, stderr to stderr, detaches the manager
+/// (keeping the VM running), and exits the process.
+pub fn print_output_and_exit(
+    manager: &AgentManager,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+) -> ! {
+    if !stdout.is_empty() {
+        print!("{}", stdout);
+    }
+    if !stderr.is_empty() {
+        eprint!("{}", stderr);
+    }
+    crate::cli::flush_output();
+    manager.detach();
+    std::process::exit(exit_code);
+}
+
 // ============================================================================
 // Create
 // ============================================================================

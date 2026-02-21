@@ -9,11 +9,10 @@
 //! - status: Show microvm status
 //! - ls: List all named VMs
 
-use crate::cli::flush_output;
 use crate::cli::parsers::{parse_duration, parse_env_list, parse_port};
 use crate::cli::vm_common::{self, DeleteVmOptions, VmKind};
 use clap::{Args, Subcommand};
-use smolvm::agent::{AgentClient, PortMapping};
+use smolvm::agent::PortMapping;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -111,56 +110,32 @@ pub struct ExecCmd {
 
 impl ExecCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = vm_common::get_vm_manager(&self.name)?;
-        let label = vm_common::vm_label(&self.name);
+        let (manager, mut client) =
+            vm_common::ensure_running_and_connect(&self.name, vm_common::VmKind::Microvm)?;
 
-        // Check if microvm is running - exec requires a running VM
-        if manager.try_connect_existing().is_none() {
-            return Err(smolvm::Error::agent(
-                "exec command",
-                format!(
-                    "microvm '{}' is not running. Use 'smolvm microvm start' first.",
-                    label
-                ),
-            ));
-        }
-
-        // Connect to agent
-        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
-
-        // Parse environment variables
         let env = parse_env_list(&self.env);
 
         // Run command directly in VM
-        let exit_code = if self.interactive || self.tty {
-            client.vm_exec_interactive(
+        if self.interactive || self.tty {
+            let exit_code = client.vm_exec_interactive(
                 self.command.clone(),
                 env,
                 self.workdir.clone(),
                 self.timeout,
                 self.tty,
-            )?
-        } else {
-            let (exit_code, stdout, stderr) = client.vm_exec(
-                self.command.clone(),
-                env,
-                self.workdir.clone(),
-                self.timeout,
             )?;
+            manager.detach();
+            std::process::exit(exit_code);
+        }
 
-            if !stdout.is_empty() {
-                print!("{}", stdout);
-            }
-            if !stderr.is_empty() {
-                eprint!("{}", stderr);
-            }
-            flush_output();
-            exit_code
-        };
+        let (exit_code, stdout, stderr) = client.vm_exec(
+            self.command.clone(),
+            env,
+            self.workdir.clone(),
+            self.timeout,
+        )?;
 
-        // Keep microvm running (persistent)
-        manager.detach();
-        std::process::exit(exit_code);
+        vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
     }
 }
 
