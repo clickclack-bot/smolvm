@@ -379,7 +379,9 @@ impl StorageDisk {
 
         // If disk doesn't exist, needs format (and delete stale marker)
         if !self.path.exists() {
-            let _ = std::fs::remove_file(&marker_path);
+            if let Err(e) = std::fs::remove_file(&marker_path) {
+                tracing::debug!(path = %marker_path.display(), error = %e, "cleanup: remove stale marker");
+            }
             return true;
         }
 
@@ -390,8 +392,12 @@ impl StorageDisk {
                 "storage disk appears corrupt, will recreate"
             );
             // Delete corrupt disk and marker so we start fresh
-            let _ = std::fs::remove_file(&self.path);
-            let _ = std::fs::remove_file(&marker_path);
+            if let Err(e) = std::fs::remove_file(&self.path) {
+                tracing::debug!(path = %self.path.display(), error = %e, "cleanup: remove corrupt disk");
+            }
+            if let Err(e) = std::fs::remove_file(&marker_path) {
+                tracing::debug!(path = %marker_path.display(), error = %e, "cleanup: remove marker");
+            }
             return true;
         }
 
@@ -682,7 +688,9 @@ impl OverlayDisk {
             return true;
         }
         if !self.path.exists() {
-            let _ = std::fs::remove_file(&marker_path);
+            if let Err(e) = std::fs::remove_file(&marker_path) {
+                tracing::debug!(path = %marker_path.display(), error = %e, "cleanup: remove stale overlay marker");
+            }
             return true;
         }
 
@@ -692,8 +700,12 @@ impl OverlayDisk {
                 path = %self.path.display(),
                 "overlay disk appears corrupt, will reformat"
             );
-            let _ = std::fs::remove_file(&self.path);
-            let _ = std::fs::remove_file(&marker_path);
+            if let Err(e) = std::fs::remove_file(&self.path) {
+                tracing::debug!(path = %self.path.display(), error = %e, "cleanup: remove corrupt overlay disk");
+            }
+            if let Err(e) = std::fs::remove_file(&marker_path) {
+                tracing::debug!(path = %marker_path.display(), error = %e, "cleanup: remove overlay marker");
+            }
             return true;
         }
 
