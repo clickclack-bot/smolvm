@@ -186,8 +186,71 @@ pub struct CreateVmParams {
     pub overlay_gb: Option<u64>,
 }
 
+/// Maximum length for VM/sandbox names.
+const MAX_NAME_LENGTH: usize = 40;
+
+/// Validate a VM/sandbox name for CLI commands.
+///
+/// Same rules as the API validation but returns `smolvm::Error` instead of `ApiError`.
+fn validate_name(name: &str, kind: VmKind) -> smolvm::Result<()> {
+    if name.is_empty() {
+        return Err(smolvm::Error::config(
+            format!("create {}", kind.label()),
+            format!("{} name cannot be empty", kind.label()),
+        ));
+    }
+    if name.len() > MAX_NAME_LENGTH {
+        return Err(smolvm::Error::config(
+            format!("create {}", kind.label()),
+            format!(
+                "{} name too long: {} characters (max {})",
+                kind.label(),
+                name.len(),
+                MAX_NAME_LENGTH
+            ),
+        ));
+    }
+    let first_char = name.chars().next().unwrap();
+    if !first_char.is_ascii_alphanumeric() {
+        return Err(smolvm::Error::config(
+            format!("create {}", kind.label()),
+            format!("{} name must start with a letter or digit", kind.label()),
+        ));
+    }
+    if name.ends_with('-') {
+        return Err(smolvm::Error::config(
+            format!("create {}", kind.label()),
+            format!("{} name cannot end with a hyphen", kind.label()),
+        ));
+    }
+    let mut prev_was_hyphen = false;
+    for c in name.chars() {
+        if c == '-' {
+            if prev_was_hyphen {
+                return Err(smolvm::Error::config(
+                    format!("create {}", kind.label()),
+                    format!("{} name cannot contain consecutive hyphens", kind.label()),
+                ));
+            }
+            prev_was_hyphen = true;
+        } else {
+            prev_was_hyphen = false;
+        }
+        if !c.is_ascii_alphanumeric() && c != '-' && c != '_' {
+            return Err(smolvm::Error::config(
+                format!("create {}", kind.label()),
+                format!("{} name contains invalid character: '{}'", kind.label(), c),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Create a named VM/sandbox configuration (does not start it).
 pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
+    // Validate name before touching the database
+    validate_name(&params.name, kind)?;
+
     let mut config = SmolvmConfig::load()?;
 
     // Check if already exists
