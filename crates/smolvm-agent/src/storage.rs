@@ -150,6 +150,11 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
         os: "linux".to_string(),
         layer_count: layer_dirs.len(),
         layers: layer_dirs,
+        // Packed mode: config is in the PackManifest, not the image
+        entrypoint: Vec::new(),
+        cmd: Vec::new(),
+        env: Vec::new(),
+        workdir: None,
     })
 }
 
@@ -621,6 +626,18 @@ pub fn status() -> Result<StorageStatus> {
     })
 }
 
+/// Extract a JSON array of strings from a JSON value.
+fn json_string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
+    value[key]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Pull an OCI image with progress callback and optional authentication.
 ///
 /// The callback is called for each layer being pulled with (current, total, layer_id).
@@ -885,6 +902,16 @@ where
     let os = config_json["os"].as_str().unwrap_or("linux").to_string();
     let created = config_json["created"].as_str().map(String::from);
 
+    // Extract OCI config fields (Entrypoint, Cmd, Env, WorkingDir)
+    let oci_config = &config_json["config"];
+    let entrypoint = json_string_array(oci_config, "Entrypoint");
+    let cmd = json_string_array(oci_config, "Cmd");
+    let env = json_string_array(oci_config, "Env");
+    let workdir = oci_config["WorkingDir"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
     Ok(ImageInfo {
         reference: image.to_string(),
         digest: config_digest.to_string(),
@@ -894,6 +921,10 @@ where
         os,
         layer_count: layers.len(),
         layers,
+        entrypoint,
+        cmd,
+        env,
+        workdir,
     })
 }
 
@@ -964,6 +995,16 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
         }
     }
 
+    // Extract OCI config fields
+    let oci_config = &config_json["config"];
+    let entrypoint = json_string_array(oci_config, "Entrypoint");
+    let cmd = json_string_array(oci_config, "Cmd");
+    let env = json_string_array(oci_config, "Env");
+    let workdir = oci_config["WorkingDir"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
     Ok(Some(ImageInfo {
         reference: image.to_string(),
         digest: config_digest.to_string(),
@@ -973,6 +1014,10 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
         os,
         layer_count: layers.len(),
         layers,
+        entrypoint,
+        cmd,
+        env,
+        workdir,
     }))
 }
 

@@ -181,7 +181,13 @@ impl PackCmd {
         manifest.cpus = self.cpus;
         manifest.mem = self.mem;
 
-        // Set entrypoint if provided
+        // Copy OCI config fields from image (CMD, ENTRYPOINT, ENV, WORKDIR)
+        manifest.entrypoint = image_info.entrypoint.clone();
+        manifest.cmd = image_info.cmd.clone();
+        manifest.env = image_info.env.clone();
+        manifest.workdir = image_info.workdir.clone();
+
+        // Override entrypoint if user provided one
         if let Some(ref ep) = self.entrypoint {
             manifest.entrypoint = vec![ep.clone()];
         }
