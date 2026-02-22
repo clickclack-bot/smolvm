@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth, RegistryConfig};
 use smolvm_protocol::{
     encode_message, AgentRequest, AgentResponse, ContainerInfo, ImageInfo, OverlayInfo,
-    StorageStatus, MAX_FRAME_SIZE,
+    StorageStatus, MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -49,12 +49,23 @@ const TIMEOUT_BUFFER_SECS: u64 = 5;
 /// Used when checking agent status where we want to fail fast.
 const STATUS_CHECK_TIMEOUT_SECS: u64 = 5;
 
+// ============================================================================
+// I/O Constants
+// ============================================================================
+
+/// Buffer size for reading stdin during interactive sessions.
+const STDIN_BUF_SIZE: usize = 4096;
+
+/// Poll timeout in milliseconds for interactive I/O loops.
+/// Short enough for responsive SIGWINCH handling, long enough to avoid busy-waiting.
+const POLL_TIMEOUT_MS: i32 = 100;
+
 /// RAII guard that resets the socket read timeout on drop.
 ///
 /// Ensures the timeout is always restored, even if the operation
 /// returns early due to an error. Uses a cloned UnixStream handle
 /// (shares the underlying fd) to avoid borrow conflicts.
-struct ReadTimeoutGuard {
+pub struct ReadTimeoutGuard {
     stream: UnixStream,
 }
 
@@ -359,12 +370,24 @@ impl AgentClient {
         self.receive()
     }
 
-    /// Ping the helper daemon.
+    /// Ping the helper daemon and validate the protocol version.
+    ///
+    /// Returns the agent's protocol version. Logs a warning if the version
+    /// doesn't match the host's expected version.
     pub fn ping(&mut self) -> Result<u32> {
         let resp = self.request(&AgentRequest::Ping)?;
 
         match resp {
-            AgentResponse::Pong { version } => Ok(version),
+            AgentResponse::Pong { version } => {
+                if version != PROTOCOL_VERSION {
+                    tracing::warn!(
+                        host_version = PROTOCOL_VERSION,
+                        agent_version = version,
+                        "protocol version mismatch — agent may be outdated or newer than host"
+                    );
+                }
+                Ok(version)
+            }
             AgentResponse::Error { message, .. } => Err(Error::agent("ping", message)),
             _ => Err(Error::agent("ping", "unexpected response type")),
         }
@@ -698,15 +721,7 @@ impl AgentClient {
         workdir: Option<String>,
         timeout: Option<Duration>,
     ) -> Result<(i32, String, String)> {
-        // Set socket read timeout based on command timeout (with buffer for response).
-        // The guard resets the timeout on drop (including error paths).
-        let socket_timeout = match timeout {
-            Some(t) => t + Duration::from_secs(TIMEOUT_BUFFER_SECS),
-            None => Duration::from_secs(INTERACTIVE_TIMEOUT_SECS),
-        };
-        self.set_read_timeout(socket_timeout)?;
-        let _timeout_guard = ReadTimeoutGuard::new(&self.stream);
-
+        let _timeout_guard = self.set_exec_timeout(timeout)?;
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
 
         let resp = self.request(&AgentRequest::VmExec {
@@ -779,12 +794,12 @@ impl AgentClient {
         let mut stdin_handle = stdin();
         let stdin_fd = stdin_handle.as_raw_fd();
         let socket_fd = self.stream.as_raw_fd();
-        let mut stdin_buf = [0u8; 4096];
+        let mut stdin_buf = [0u8; STDIN_BUF_SIZE];
         let mut stdin_eof = false;
 
         let exit_code = loop {
             let effective_stdin_fd = if stdin_eof { -1 } else { stdin_fd };
-            let poll_result = poll_io(effective_stdin_fd, socket_fd, 100)
+            let poll_result = poll_io(effective_stdin_fd, socket_fd, POLL_TIMEOUT_MS)
                 .map_err(|e| Error::agent("poll", e.to_string()))?;
 
             // Check for terminal resize (SIGWINCH)
@@ -952,16 +967,7 @@ impl AgentClient {
         mounts: Vec<(String, String, bool)>,
         timeout: Option<Duration>,
     ) -> Result<(i32, String, String)> {
-        // Set socket read timeout based on command timeout (with buffer for response).
-        // The guard resets the timeout on drop (including error paths).
-        let socket_timeout = match timeout {
-            Some(t) => t + Duration::from_secs(TIMEOUT_BUFFER_SECS),
-            None => Duration::from_secs(INTERACTIVE_TIMEOUT_SECS),
-        };
-        self.set_read_timeout(socket_timeout)?;
-        let _timeout_guard = ReadTimeoutGuard::new(&self.stream);
-
-        // Convert timeout to milliseconds for protocol
+        let _timeout_guard = self.set_exec_timeout(timeout)?;
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
 
         let resp = self.request(&AgentRequest::Run {
@@ -1131,15 +1137,7 @@ impl AgentClient {
         workdir: Option<String>,
         timeout: Option<Duration>,
     ) -> Result<(i32, String, String)> {
-        // Set socket read timeout based on command timeout (with buffer for response).
-        // The guard resets the timeout on drop (including error paths).
-        let socket_timeout = match timeout {
-            Some(t) => t + Duration::from_secs(TIMEOUT_BUFFER_SECS),
-            None => Duration::from_secs(INTERACTIVE_TIMEOUT_SECS),
-        };
-        self.set_read_timeout(socket_timeout)?;
-        let _timeout_guard = ReadTimeoutGuard::new(&self.stream);
-
+        let _timeout_guard = self.set_exec_timeout(timeout)?;
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
 
         let resp = self.request(&AgentRequest::Exec {
@@ -1205,6 +1203,28 @@ impl AgentClient {
     /// Low-level receive a single response (public).
     pub fn recv_raw(&mut self) -> Result<AgentResponse> {
         self.receive()
+    }
+
+    /// Set a command-execution timeout and return a guard that resets it on drop.
+    ///
+    /// If `timeout` is Some, the socket deadline is `timeout + TIMEOUT_BUFFER_SECS`.
+    /// If None, it uses `INTERACTIVE_TIMEOUT_SECS` (the long-running default).
+    fn set_exec_timeout(&self, timeout: Option<Duration>) -> Result<Option<ReadTimeoutGuard>> {
+        let socket_timeout = match timeout {
+            Some(t) => t + Duration::from_secs(TIMEOUT_BUFFER_SECS),
+            None => Duration::from_secs(INTERACTIVE_TIMEOUT_SECS),
+        };
+        self.set_read_timeout(socket_timeout)?;
+        Ok(ReadTimeoutGuard::new(&self.stream))
+    }
+
+    /// Set an extended read timeout and return a guard that resets it on drop.
+    ///
+    /// Used for long-running streaming operations (e.g., layer export) where
+    /// individual chunks may take longer than the default 30s timeout.
+    pub fn set_extended_read_timeout(&self, timeout: Duration) -> Result<Option<ReadTimeoutGuard>> {
+        self.set_read_timeout(timeout)?;
+        Ok(ReadTimeoutGuard::new(&self.stream))
     }
 
     /// Low-level send without waiting for response.

@@ -529,6 +529,18 @@ pub struct ImageInfo {
     pub layer_count: usize,
     /// Layer digests in order.
     pub layers: Vec<String>,
+    /// Image entrypoint (from OCI config).
+    #[serde(default)]
+    pub entrypoint: Vec<String>,
+    /// Image default command (from OCI config).
+    #[serde(default)]
+    pub cmd: Vec<String>,
+    /// Image environment variables (from OCI config).
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// Image working directory (from OCI config).
+    #[serde(default)]
+    pub workdir: Option<String>,
 }
 
 /// Overlay preparation result.

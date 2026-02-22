@@ -98,6 +98,75 @@ pub fn vm_label(name: &Option<String>) -> String {
     name.as_deref().unwrap_or("default").to_string()
 }
 
+/// Ensure a VM is running and return a connected client.
+///
+/// This is the common pattern used by exec commands in both microvm and sandbox.
+/// It resolves the VM manager, checks connectivity, and establishes a client connection.
+pub fn ensure_running_and_connect(
+    name: &Option<String>,
+    kind: VmKind,
+) -> smolvm::Result<(AgentManager, smolvm::agent::AgentClient)> {
+    let manager = get_vm_manager(name)?;
+    let label = vm_label(name);
+
+    if manager.try_connect_existing().is_none() {
+        return Err(smolvm::Error::agent(
+            "connect",
+            format!(
+                "{} '{}' is not running. Use '{} start' first.",
+                kind.label(),
+                label,
+                kind.cli_prefix(),
+            ),
+        ));
+    }
+
+    let client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+    Ok((manager, client))
+}
+
+/// Print command output and exit with the given code.
+///
+/// Prints stdout to stdout, stderr to stderr, detaches the manager
+/// (keeping the VM running), and exits the process.
+pub fn print_output_and_exit(
+    manager: &AgentManager,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+) -> ! {
+    if !stdout.is_empty() {
+        print!("{}", stdout);
+    }
+    if !stderr.is_empty() {
+        eprint!("{}", stderr);
+    }
+    crate::cli::flush_output();
+    manager.detach();
+    std::process::exit(exit_code);
+}
+
+/// Get the agent manager for a VM by name, auto-starting it if not running.
+///
+/// Unlike [`ensure_running_and_connect`] which errors if the VM isn't running,
+/// this calls `ensure_running()` to start the VM on demand. Used by container
+/// commands that need the VM to be available.
+pub fn get_or_start_vm(name: &str) -> smolvm::Result<AgentManager> {
+    let name_opt = if name == "default" {
+        None
+    } else {
+        Some(name.to_string())
+    };
+    let manager = get_vm_manager(&name_opt)?;
+
+    if manager.try_connect_existing().is_none() {
+        println!("Starting microvm '{}'...", name);
+        manager.ensure_running()?;
+    }
+
+    Ok(manager)
+}
+
 // ============================================================================
 // Create
 // ============================================================================
@@ -117,8 +186,71 @@ pub struct CreateVmParams {
     pub overlay_gb: Option<u64>,
 }
 
+/// Maximum length for VM/sandbox names.
+const MAX_NAME_LENGTH: usize = 40;
+
+/// Validate a VM/sandbox name for CLI commands.
+///
+/// Same rules as the API validation but returns `smolvm::Error` instead of `ApiError`.
+fn validate_name(name: &str, kind: VmKind) -> smolvm::Result<()> {
+    if name.is_empty() {
+        return Err(smolvm::Error::config(
+            format!("create {}", kind.label()),
+            format!("{} name cannot be empty", kind.label()),
+        ));
+    }
+    if name.len() > MAX_NAME_LENGTH {
+        return Err(smolvm::Error::config(
+            format!("create {}", kind.label()),
+            format!(
+                "{} name too long: {} characters (max {})",
+                kind.label(),
+                name.len(),
+                MAX_NAME_LENGTH
+            ),
+        ));
+    }
+    let first_char = name.chars().next().unwrap();
+    if !first_char.is_ascii_alphanumeric() {
+        return Err(smolvm::Error::config(
+            format!("create {}", kind.label()),
+            format!("{} name must start with a letter or digit", kind.label()),
+        ));
+    }
+    if name.ends_with('-') {
+        return Err(smolvm::Error::config(
+            format!("create {}", kind.label()),
+            format!("{} name cannot end with a hyphen", kind.label()),
+        ));
+    }
+    let mut prev_was_hyphen = false;
+    for c in name.chars() {
+        if c == '-' {
+            if prev_was_hyphen {
+                return Err(smolvm::Error::config(
+                    format!("create {}", kind.label()),
+                    format!("{} name cannot contain consecutive hyphens", kind.label()),
+                ));
+            }
+            prev_was_hyphen = true;
+        } else {
+            prev_was_hyphen = false;
+        }
+        if !c.is_ascii_alphanumeric() && c != '-' && c != '_' {
+            return Err(smolvm::Error::config(
+                format!("create {}", kind.label()),
+                format!("{} name contains invalid character: '{}'", kind.label(), c),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Create a named VM/sandbox configuration (does not start it).
 pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
+    // Validate name before touching the database
+    validate_name(&params.name, kind)?;
+
     let mut config = SmolvmConfig::load()?;
 
     // Check if already exists
@@ -526,10 +658,9 @@ pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
                 obj
             })
             .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json_vms).expect("JSON serialization failed")
-        );
+        let json = serde_json::to_string_pretty(&json_vms)
+            .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;
+        println!("{}", json);
     } else {
         println!(
             "{:<20} {:<10} {:<5} {:<8} {:<6} {:<6}",

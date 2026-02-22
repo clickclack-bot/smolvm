@@ -19,6 +19,7 @@ use clap::{Args, Subcommand};
 use smolvm::agent::{
     docker_config_mount, AgentClient, AgentManager, PortMapping, RunConfig, VmResources,
 };
+use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -117,50 +118,18 @@ impl ExecCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
 
-        let manager = vm_common::get_vm_manager(&self.name)?;
-        let label = vm_common::vm_label(&self.name);
+        let (manager, mut client) =
+            vm_common::ensure_running_and_connect(&self.name, vm_common::VmKind::Sandbox)?;
 
-        // Check if sandbox is running
-        if manager.try_connect_existing().is_none() {
-            return Err(Error::agent(
-                "connect",
-                format!(
-                    "sandbox '{}' is not running. Start one with: smolvm sandbox start {}",
-                    label,
-                    self.name.as_deref().unwrap_or("<name>")
-                ),
-            ));
-        }
-
-        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
-
-        // Find the container in the sandbox
+        // Find the running container in the sandbox
         let containers = client.list_containers()?;
-        let container = containers.iter().find(|c| c.state == "running");
-
-        let container_id = match container {
-            Some(c) => c.id.clone(),
-            None => {
-                return Err(Error::agent(
-                    "find container",
-                    "no running container in sandbox",
-                ));
-            }
-        };
-
-        // Parse environment variables
-        let env: Vec<(String, String)> = self
-            .env
+        let container_id = containers
             .iter()
-            .filter_map(|e| {
-                let (k, v) = e.split_once('=')?;
-                if k.is_empty() {
-                    None
-                } else {
-                    Some((k.to_string(), v.to_string()))
-                }
-            })
-            .collect();
+            .find(|c| c.state == "running")
+            .map(|c| c.id.clone())
+            .ok_or_else(|| Error::agent("find container", "no running container in sandbox"))?;
+
+        let env = parse_env_list(&self.env);
 
         // Execute in container
         let (exit_code, stdout, stderr) = client.exec(
@@ -171,17 +140,7 @@ impl ExecCmd {
             self.timeout,
         )?;
 
-        if !stdout.is_empty() {
-            print!("{}", stdout);
-        }
-        if !stderr.is_empty() {
-            eprint!("{}", stderr);
-        }
-        flush_output();
-
-        // Keep sandbox running
-        manager.detach();
-        std::process::exit(exit_code);
+        vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
     }
 }
 
@@ -421,9 +380,9 @@ impl RunCmd {
         // Build command - for detached mode, default to sleep infinity
         let command = if self.command.is_empty() {
             if self.detach {
-                vec!["sleep".to_string(), "infinity".to_string()]
+                DEFAULT_IDLE_CMD.iter().map(|s| s.to_string()).collect()
             } else {
-                vec!["/bin/sh".to_string()]
+                vec![DEFAULT_SHELL_CMD.to_string()]
             }
         } else {
             self.command.clone()
@@ -725,10 +684,9 @@ impl ImagesCmd {
                 },
                 "images": images,
             });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&output).expect("JSON serialization failed")
-            );
+            let json = serde_json::to_string_pretty(&output)
+                .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;
+            println!("{}", json);
         } else {
             // Print storage summary
             println!("Storage Usage:");
