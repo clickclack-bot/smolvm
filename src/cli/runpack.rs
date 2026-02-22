@@ -281,6 +281,7 @@ impl RunpackCmd {
         // 8. Fork child → launch VM with dynamically loaded libkrun
         smolvm::process::install_sigchld_handler();
 
+        let console_log_path = runtime_dir.path().join("console.log");
         let vsock_path_clone = vsock_path.clone();
         let child_pid = smolvm::process::fork_session_leader(move || {
             // Child process: load libkrun via dlopen and launch VM
@@ -301,6 +302,7 @@ impl RunpackCmd {
                 port_mappings: &port_mappings,
                 resources,
                 debug: self.debug,
+                console_log: console_log_path,
             };
 
             if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
@@ -877,6 +879,7 @@ fn run_from_cache(
 
     smolvm::process::install_sigchld_handler();
 
+    let console_log_path = runtime_dir.path().join("console.log");
     let debug = cli.debug;
     let vsock_path_clone = vsock_path.clone();
     let child_pid = smolvm::process::fork_session_leader(move || {
@@ -897,6 +900,7 @@ fn run_from_cache(
             port_mappings: &port_mappings,
             resources,
             debug,
+            console_log: console_log_path,
         };
 
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
@@ -1199,6 +1203,7 @@ fn daemon_start(mode: &PackedMode, cli: &PackedCli) -> smolvm::Result<()> {
     // Fork child → launch VM
     smolvm::process::install_sigchld_handler();
 
+    let console_log_path = daemon.join("console.log");
     let vsock_path_clone = vsock_path.clone();
     let child_pid = smolvm::process::fork_session_leader(move || {
         let krun = match unsafe { KrunFunctions::load(&lib_dir) } {
@@ -1218,6 +1223,7 @@ fn daemon_start(mode: &PackedMode, cli: &PackedCli) -> smolvm::Result<()> {
             port_mappings: &port_mappings,
             resources,
             debug,
+            console_log: console_log_path,
         };
 
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {

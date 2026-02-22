@@ -8,7 +8,7 @@
 
 use smolvm_protocol::ports;
 use std::ffi::{CStr, CString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::VmResources;
 
@@ -176,6 +176,9 @@ pub struct PackedLaunchConfig<'a> {
     pub resources: VmResources,
     /// Debug logging.
     pub debug: bool,
+    /// Path to redirect VM console output (prevents libkrun from putting
+    /// the inherited terminal into raw mode).
+    pub console_log: PathBuf,
 }
 
 /// Launch VM using dynamically loaded libkrun (for packed/sidecar mode).
@@ -319,6 +322,18 @@ pub fn launch_agent_vm_dynamic(
     if unsafe { (krun.add_vsock_port2)(ctx, ports::AGENT_CONTROL, socket_path.as_ptr(), true) } < 0
     {
         free_ctx_on_err!("krun_add_vsock_port2 failed");
+    }
+
+    // Redirect console output to a log file so libkrun doesn't put the
+    // inherited terminal into raw mode (which would break terminal echo
+    // if the child is killed before exit observers can restore it).
+    let console_path = try_or_free_ctx!(
+        path_to_cstring(&config.console_log),
+        "console log path contains null byte"
+    );
+    // SAFETY: ctx is valid, console_path is a valid null-terminated C string
+    if unsafe { (krun.set_console_output)(ctx, console_path.as_ptr()) } < 0 {
+        tracing::warn!("failed to set console output");
     }
 
     // Set working directory
