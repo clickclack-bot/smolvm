@@ -523,6 +523,7 @@ pub fn init() -> Result<()> {
         (paths::CONTAINERS_RUN_DIR, "container runtime state"),
         (paths::CONTAINERS_LOGS_DIR, "container logs"),
         (paths::CONTAINERS_EXIT_DIR, "container exit codes"),
+        (paths::CRUN_ROOT_DIR, "crun state root"),
     ];
 
     for (dir, description) in &container_dirs {
@@ -576,6 +577,7 @@ pub fn format() -> Result<()> {
         (PathBuf::from(paths::CONTAINERS_RUN_DIR), "container run"),
         (PathBuf::from(paths::CONTAINERS_LOGS_DIR), "container logs"),
         (PathBuf::from(paths::CONTAINERS_EXIT_DIR), "container exit"),
+        (PathBuf::from(paths::CRUN_ROOT_DIR), "crun state root"),
     ];
 
     for (path, name) in &all_dirs {
@@ -1111,8 +1113,11 @@ pub fn export_layer(image_digest: &str, layer_index: usize) -> Result<PathBuf> {
         )));
     }
 
-    // Create tar archive in /tmp
-    let tar_path = PathBuf::from(format!("/tmp/layer-{}.tar", &layer_id[..12]));
+    // Create tar archive on the storage disk (/tmp is on virtiofs which is
+    // read-only on Linux — ENOTSUP)
+    let tmp_dir = root.join("tmp");
+    std::fs::create_dir_all(&tmp_dir)?;
+    let tar_path = tmp_dir.join(format!("layer-{}.tar", &layer_id[..12]));
 
     info!(
         layer_id = %layer_id,
