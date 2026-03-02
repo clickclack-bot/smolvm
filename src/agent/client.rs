@@ -346,9 +346,11 @@ impl AgentClient {
     }
 
     /// Connect with a short timeout, for use during startup ping probes.
-    /// Uses 1-second read timeout instead of 30s to fail fast during boot.
+    /// Uses 100ms read timeout instead of 30s to fail fast during boot.
+    /// The agent completes init in ~130ms of guest uptime, so 100ms is enough
+    /// to detect a ready agent without wasting time on a full 1s timeout.
     pub fn connect_with_short_timeout(socket_path: impl AsRef<Path>) -> Result<Self> {
-        Self::connect_with_timeouts(socket_path.as_ref(), 1, 1)
+        Self::connect_with_timeouts_ms(socket_path.as_ref(), 100, 100)
     }
 
     /// Internal connect implementation (single attempt).
@@ -360,16 +362,25 @@ impl AgentClient {
         )
     }
 
-    /// Connect to the agent socket and configure read/write timeouts.
+    /// Connect to the agent socket and configure read/write timeouts (in seconds).
     fn connect_with_timeouts(socket_path: &Path, read_secs: u64, write_secs: u64) -> Result<Self> {
+        Self::connect_with_timeouts_ms(socket_path, read_secs * 1000, write_secs * 1000)
+    }
+
+    /// Connect to the agent socket and configure read/write timeouts (in milliseconds).
+    fn connect_with_timeouts_ms(
+        socket_path: &Path,
+        read_ms: u64,
+        write_ms: u64,
+    ) -> Result<Self> {
         let stream = UnixStream::connect(socket_path)
             .map_err(|e| Error::agent("connect to agent", e.to_string()))?;
 
         stream
-            .set_read_timeout(Some(Duration::from_secs(read_secs)))
+            .set_read_timeout(Some(Duration::from_millis(read_ms)))
             .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
         stream
-            .set_write_timeout(Some(Duration::from_secs(write_secs)))
+            .set_write_timeout(Some(Duration::from_millis(write_ms)))
             .map_err(|e| Error::agent("set write timeout", e.to_string()))?;
 
         Ok(Self { stream })

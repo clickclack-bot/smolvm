@@ -148,10 +148,50 @@ fn main() {
         "agent startup complete, entering accept loop"
     );
 
+    // Signal readiness to host via virtiofs marker file.
+    // The host watches for this file instead of the vsock socket (which appears
+    // before the agent is ready, causing wasted timeout on the first ping).
+    // After pivot_root: virtiofs root is at /oldroot, so write there.
+    // Without overlay: virtiofs root is /, so write there.
+    signal_ready_to_host();
+
     // Start accepting connections (listener already bound)
     if let Err(e) = run_server_with_listener(listener) {
         error!(error = %e, "server error");
         std::process::exit(1);
+    }
+}
+
+/// Well-known filename for the ready marker.
+/// The agent creates this file in the virtiofs rootfs to signal readiness.
+/// The host watches for it via inotify/kqueue instead of the vsock socket.
+const READY_MARKER_FILENAME: &str = ".smolvm-ready";
+
+/// Signal to the host that the agent is fully initialized and ready.
+///
+/// Creates a marker file in the virtiofs rootfs directory. Since virtiofs is
+/// shared between host and guest, the host can detect this file instantly
+/// via inotify/kqueue. This is more reliable than watching the vsock socket
+/// file (which is created by libkrun's muxer thread before the agent boots).
+///
+/// After pivot_root, the virtiofs root is mounted at /oldroot.
+/// Without overlay, the virtiofs root is /.
+fn signal_ready_to_host() {
+    use std::path::Path;
+
+    // Try /oldroot first (overlay mode: virtiofs is the lower layer)
+    let paths = [
+        format!("/oldroot/{}", READY_MARKER_FILENAME),
+        format!("/{}", READY_MARKER_FILENAME),
+    ];
+
+    for path in &paths {
+        if Path::new(path).parent().map_or(false, |p| p.exists()) {
+            if std::fs::write(path, uptime_ms().to_string().as_bytes()).is_ok() {
+                debug!(path = path, "ready marker written");
+                return;
+            }
+        }
     }
 }
 
@@ -317,10 +357,8 @@ fn setup_persistent_rootfs() {
     // On devtmpfs, the kernel creates /dev/vdb automatically when libkrun
     // attaches a second virtio-blk disk. No mknod needed.
     if !Path::new(OVERLAY_DEVICE).exists() {
-        tracing::debug!("no overlay device, skipping");
         return;
     }
-    tracing::debug!("overlay device found, setting up overlayfs");
 
     let _ = std::fs::create_dir_all(OVERLAY_MOUNT);
 
@@ -340,7 +378,6 @@ fn setup_persistent_rootfs() {
     };
 
     if !mounted {
-        tracing::debug!("formatting overlay disk on first boot");
         // First boot — format the disk
         let _ = std::process::Command::new("mkfs.ext4")
             .args(["-F", "-q", "-L", "smolvm-overlay", OVERLAY_DEVICE])
@@ -401,7 +438,6 @@ fn setup_persistent_rootfs() {
         eprintln!("smolvm-agent: failed to mount overlayfs: {}", err);
         return;
     }
-    tracing::debug!("overlayfs mounted, doing pivot_root");
 
     // Create mount point directories in new root and move special mounts
     for dir in &["proc", "sys", "dev"] {
@@ -439,7 +475,6 @@ fn setup_persistent_rootfs() {
         eprintln!("smolvm-agent: pivot_root failed: {}", err);
         return;
     }
-    tracing::debug!("pivot_root done");
 
     // Set working directory to new root
     let _ = std::env::set_current_dir("/");
