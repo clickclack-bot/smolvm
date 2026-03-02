@@ -93,9 +93,7 @@ pub fn init_packed_layers() -> Option<PathBuf> {
 
 /// Get the packed layers directory if available.
 pub fn get_packed_layers_dir() -> Option<&'static PathBuf> {
-    PACKED_LAYERS_DIR
-        .get_or_init(|| init_packed_layers())
-        .as_ref()
+    PACKED_LAYERS_DIR.get_or_init(init_packed_layers).as_ref()
 }
 
 /// Create a synthetic ImageInfo from packed layers.
@@ -689,7 +687,7 @@ where
         // Verify cached image architecture matches requested OCI platform
         let cached_arch = &info.architecture;
         let requested_arch = oci_platform
-            .map(|p| oci_platform_to_arch(p))
+            .map(oci_platform_to_arch)
             .unwrap_or_else(|| cached_arch.clone());
 
         if cached_arch == &requested_arch {

@@ -2074,10 +2074,10 @@ fn handle_vm_exec(
                 let mut stdout = String::new();
                 let mut stderr = String::new();
 
-                if let Some(mut out) = child.stdout.take() {
+                if let Some(out) = child.stdout.take() {
                     let _ = out.take(MAX_OUTPUT as u64).read_to_string(&mut stdout);
                 }
-                if let Some(mut err) = child.stderr.take() {
+                if let Some(err) = child.stderr.take() {
                     let _ = err.take(MAX_OUTPUT as u64).read_to_string(&mut stderr);
                 }
 

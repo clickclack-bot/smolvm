@@ -77,6 +77,7 @@ fn find_lib_dir() -> Option<PathBuf> {
     let candidates = [
         exe_dir.join("lib"),
         exe_dir.join("../lib"),
+        exe_dir.join("../../lib"),
         exe_dir.join(format!("../../lib/linux-{}", std::env::consts::ARCH)),
     ];
 
