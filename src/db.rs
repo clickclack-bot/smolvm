@@ -586,5 +586,4 @@ mod tests {
         let vms = db.list_vms().unwrap();
         assert_eq!(vms.len(), 1);
     }
-
 }

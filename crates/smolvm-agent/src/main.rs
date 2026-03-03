@@ -389,7 +389,15 @@ fn setup_persistent_rootfs() {
     if !mounted {
         // First boot — format the disk
         let _ = std::process::Command::new("mkfs.ext4")
-            .args(["-F", "-q", "-O", "^has_journal", "-L", "smolvm-overlay", OVERLAY_DEVICE])
+            .args([
+                "-F",
+                "-q",
+                "-O",
+                "^has_journal",
+                "-L",
+                "smolvm-overlay",
+                OVERLAY_DEVICE,
+            ])
             .status();
 
         let dev = cstr(OVERLAY_DEVICE);
@@ -479,7 +487,9 @@ fn setup_persistent_rootfs() {
             if handle.join().unwrap_or(false) {
                 let mnt = cstr(STORAGE_TEMP_MOUNT);
                 // SAFETY: umount the temp storage mount
-                unsafe { libc::umount(mnt.as_ptr()); }
+                unsafe {
+                    libc::umount(mnt.as_ptr());
+                }
             }
         }
         return;
@@ -630,7 +640,11 @@ fn mount_storage_disk() {
         let dev_path = cstr(STORAGE_DEVICE);
         // SAFETY: mknod with block device type, major 253 minor 0
         unsafe {
-            libc::mknod(dev_path.as_ptr(), libc::S_IFBLK | 0o660, libc::makedev(253, 0));
+            libc::mknod(
+                dev_path.as_ptr(),
+                libc::S_IFBLK | 0o660,
+                libc::makedev(253, 0),
+            );
         }
     }
 
@@ -693,7 +707,10 @@ fn mount_storage_disk() {
     // may have already mounted /dev/vda and moved it to /storage via
     // mount --move during pivot_root).
     if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
-        if mounts.lines().any(|line| line.split_whitespace().nth(1) == Some(STORAGE_MOUNT)) {
+        if mounts
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some(STORAGE_MOUNT))
+        {
             debug!("storage pre-mounted during rootfs setup");
             resize_fs();
             create_dirs();

@@ -120,8 +120,9 @@ impl ApiState {
         let db = SmolvmDb::open()
             .map_err(|e| ApiError::internal(format!("failed to open database: {}", e)))?;
         // Ensure tables exist at server startup (CLI paths handle this lazily).
-        db.init_tables()
-            .map_err(|e| ApiError::internal(format!("failed to initialize database tables: {}", e)))?;
+        db.init_tables().map_err(|e| {
+            ApiError::internal(format!("failed to initialize database tables: {}", e))
+        })?;
         Ok(Self {
             sandboxes: RwLock::new(HashMap::new()),
             reserved_names: RwLock::new(HashSet::new()),

@@ -1705,10 +1705,15 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
 
             // Mount virtiofs using direct syscall (avoids ~3-5ms fork+exec overhead).
             // Use sync option to ensure writes are persisted immediately.
-            let src = std::ffi::CString::new(tag.as_str())
-                .map_err(|e| StorageError::Internal { message: format!("invalid tag: {}", e) })?;
-            let dst = std::ffi::CString::new(virtiofs_mount.to_string_lossy().as_ref())
-                .map_err(|e| StorageError::Internal { message: format!("invalid mount point: {}", e) })?;
+            let src = std::ffi::CString::new(tag.as_str()).map_err(|e| StorageError::Internal {
+                message: format!("invalid tag: {}", e),
+            })?;
+            let dst =
+                std::ffi::CString::new(virtiofs_mount.to_string_lossy().as_ref()).map_err(|e| {
+                    StorageError::Internal {
+                        message: format!("invalid mount point: {}", e),
+                    }
+                })?;
             let fstype = std::ffi::CString::new("virtiofs").unwrap();
             let opts = std::ffi::CString::new("sync").unwrap();
             // SAFETY: mount virtiofs with valid CString arguments
@@ -1743,9 +1748,14 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
 
             // Bind mount using direct syscall
             let bind_src = std::ffi::CString::new(virtiofs_mount.to_string_lossy().as_ref())
-                .map_err(|e| StorageError::Internal { message: format!("invalid source: {}", e) })?;
-            let bind_dst = std::ffi::CString::new(target_path.as_str())
-                .map_err(|e| StorageError::Internal { message: format!("invalid target: {}", e) })?;
+                .map_err(|e| StorageError::Internal {
+                    message: format!("invalid source: {}", e),
+                })?;
+            let bind_dst = std::ffi::CString::new(target_path.as_str()).map_err(|e| {
+                StorageError::Internal {
+                    message: format!("invalid target: {}", e),
+                }
+            })?;
             // SAFETY: bind mount with MS_BIND flag
             let rc = unsafe {
                 libc::mount(
