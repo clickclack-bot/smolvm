@@ -37,28 +37,6 @@ const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Timeout when waiting for agent to stop.
 const WAIT_FOR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// RAII guard for raw file descriptors (kqueue, inotify).
-/// Automatically closes the fd on drop, eliminating manual `libc::close` calls.
-struct FdGuard(libc::c_int);
-
-impl FdGuard {
-    fn new(fd: libc::c_int) -> Self {
-        Self(fd)
-    }
-
-    fn raw(&self) -> libc::c_int {
-        self.0
-    }
-}
-
-impl Drop for FdGuard {
-    fn drop(&mut self) {
-        if self.0 >= 0 {
-            unsafe { libc::close(self.0) };
-        }
-    }
-}
-
 /// Running VM configuration persisted to disk so new CLI invocations
 /// can restore the actual config of a detached VM.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1125,52 +1103,28 @@ impl AgentManager {
 
     /// Wait for the agent to be ready.
     ///
-    /// Primary: watches for a ready marker file in the virtiofs rootfs.
-    /// The agent creates `.smolvm-ready` after completing all initialization.
-    /// This avoids the race where the vsock socket (created by libkrun's muxer)
-    /// appears before the agent is ready, causing wasted timeout on pings.
+    /// Polls for a ready marker file (`.smolvm-ready`) in the virtiofs rootfs.
+    /// The agent writes this after completing all initialization, including
+    /// starting the vsock listener. We trust the marker without a verification
+    /// ping since it's written after the listener is active.
     ///
-    /// Fallback: if no ready marker appears (old agent), falls back to
-    /// socket detection + ping with a short timeout.
+    /// Fallback: if no ready marker appears after a grace period, assumes an
+    /// old agent without marker support and falls back to socket + ping.
+    /// The grace period avoids flooding the agent's single-threaded accept
+    /// loop with probe connections during boot.
     fn wait_for_ready(&self) -> Result<()> {
         let timeout = AGENT_READY_TIMEOUT;
         let start = Instant::now();
 
+        // Grace period: only poll for the ready marker (no socket probing).
+        // Current agents always write the marker within ~200ms of boot.
+        // After this grace period, fall back to socket + ping for old agents.
+        let socket_probe_grace = Duration::from_secs(5);
+
         tracing::debug!("waiting for agent to be ready");
 
         let ready_marker = self.rootfs_path.join(READY_MARKER_FILENAME);
-
-        // Phase 1: Wait for ready marker OR socket file.
-        // Ready marker = agent is fully initialized (preferred).
-        // Socket file = VM started but agent may not be ready yet (fallback).
-        if !ready_marker.exists() && !self.vsock_socket.exists() {
-            match self.wait_for_ready_or_socket(&ready_marker, &start, timeout) {
-                Ok(()) => {}
-                Err(e) => {
-                    if !ready_marker.exists() && !self.vsock_socket.exists() {
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
-        // If ready marker appeared, agent is fully initialized.
-        // The marker is written after the vsock listener is active, so we can
-        // trust it without a verification ping.
-        if ready_marker.exists() {
-            let elapsed = start.elapsed();
-            tracing::info!(
-                elapsed_ms = elapsed.as_millis(),
-                "agent ready (via ready marker)"
-            );
-            let _ = std::fs::remove_file(&ready_marker);
-            return Ok(());
-        }
-
-        // Fallback: socket-based detection with short timeout ping loop.
-        // Used when agent is old (no ready marker) or ready marker ping failed.
-        let mut socket_appeared_at: Option<Duration> = None;
-        tracing::debug!("falling back to socket-based readiness detection");
+        let mut socket_probe_started = false;
 
         while start.elapsed() < timeout {
             // Check if child process is still alive
@@ -1186,49 +1140,41 @@ impl AgentManager {
                 }
             }
 
-            // Check ready marker again (might appear during fallback)
+            // Ready marker = agent fully initialized (preferred path)
             if ready_marker.exists() {
-                let total = start.elapsed();
-                tracing::info!(
-                    total_ms = total.as_millis(),
-                    "agent ready (late marker detection)"
-                );
+                let elapsed = start.elapsed();
+                tracing::info!(elapsed_ms = elapsed.as_millis(), "agent ready (marker)");
                 let _ = std::fs::remove_file(&ready_marker);
                 return Ok(());
             }
 
-            if self.vsock_socket.exists() {
-                if socket_appeared_at.is_none() {
-                    let elapsed = start.elapsed();
-                    socket_appeared_at = Some(elapsed);
-                    tracing::debug!(elapsed_ms = elapsed.as_millis(), "vsock socket appeared");
+            // After the grace period, fall back to socket + ping for old
+            // agents that don't write a ready marker. This avoids flooding
+            // the agent's single-threaded accept loop with abandoned probe
+            // connections during normal boot.
+            if start.elapsed() >= socket_probe_grace && self.vsock_socket.exists() {
+                if !socket_probe_started {
+                    socket_probe_started = true;
+                    tracing::debug!(
+                        elapsed_ms = start.elapsed().as_millis(),
+                        "starting socket probe fallback (no marker after grace period)"
+                    );
                 }
 
                 if let Ok(mut client) =
                     super::AgentClient::connect_with_boot_probe_timeout(&self.vsock_socket)
                 {
                     if client.ping().is_ok() {
-                        let total = start.elapsed();
+                        let elapsed = start.elapsed();
                         tracing::info!(
-                            total_ms = total.as_millis(),
-                            socket_wait_ms = socket_appeared_at.map(|d| d.as_millis()).unwrap_or(0),
+                            elapsed_ms = elapsed.as_millis(),
                             "agent ready (socket fallback)"
                         );
                         return Ok(());
                     }
                 }
-
-                // Check marker again after connect+ping (might have appeared
-                // during the 10ms timeout)
-                if ready_marker.exists() {
-                    let total = start.elapsed();
-                    tracing::info!(
-                        total_ms = total.as_millis(),
-                        "agent ready (late marker detection)"
-                    );
-                    let _ = std::fs::remove_file(&ready_marker);
-                    return Ok(());
-                }
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
             }
         }
 
@@ -1239,285 +1185,6 @@ impl AgentManager {
                 timeout.as_secs()
             ),
         ))
-    }
-
-    /// Wait for the ready marker file OR vsock socket to appear.
-    ///
-    /// Watches both the rootfs directory (for `.smolvm-ready`) and the socket
-    /// parent directory (for `agent.sock`) using inotify/kqueue.
-    /// Returns Ok(()) as soon as either file is detected.
-    fn wait_for_ready_or_socket(
-        &self,
-        ready_marker: &Path,
-        start: &Instant,
-        timeout: Duration,
-    ) -> Result<()> {
-        let rootfs_dir = &self.rootfs_path;
-        let socket_dir = self
-            .vsock_socket
-            .parent()
-            .ok_or_else(|| Error::agent("wait for ready", "socket path has no parent directory"))?;
-
-        #[cfg(target_os = "linux")]
-        {
-            self.wait_for_ready_or_socket_inotify(
-                ready_marker,
-                rootfs_dir,
-                socket_dir,
-                start,
-                timeout,
-            )
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            self.wait_for_ready_or_socket_kqueue(
-                ready_marker,
-                rootfs_dir,
-                socket_dir,
-                start,
-                timeout,
-            )
-        }
-    }
-
-    /// Linux: watch both rootfs dir and socket dir with inotify.
-    #[cfg(target_os = "linux")]
-    fn wait_for_ready_or_socket_inotify(
-        &self,
-        ready_marker: &Path,
-        rootfs_dir: &Path,
-        socket_dir: &Path,
-        start: &Instant,
-        timeout: Duration,
-    ) -> Result<()> {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-
-        let ifd =
-            FdGuard::new(unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) });
-        if ifd.raw() < 0 {
-            tracing::debug!("inotify: failed to create, falling back to poll");
-            return self.wait_for_ready_or_socket_poll(ready_marker, start, timeout);
-        }
-
-        // Watch rootfs directory for ready marker creation
-        if let Ok(path) = CString::new(rootfs_dir.as_os_str().as_bytes()) {
-            unsafe { libc::inotify_add_watch(ifd.raw(), path.as_ptr(), libc::IN_CREATE) };
-        }
-
-        // Watch socket parent directory for socket file creation
-        if let Ok(path) = CString::new(socket_dir.as_os_str().as_bytes()) {
-            unsafe { libc::inotify_add_watch(ifd.raw(), path.as_ptr(), libc::IN_CREATE) };
-        }
-
-        let mut pollfd = libc::pollfd {
-            fd: ifd.raw(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-
-        loop {
-            // Check if either file appeared
-            if ready_marker.exists() || self.vsock_socket.exists() {
-                return Ok(());
-            }
-
-            let remaining = timeout.checked_sub(start.elapsed()).unwrap_or_default();
-            if remaining.is_zero() {
-                return Err(Error::agent(
-                    "wait for ready",
-                    format!(
-                        "agent did not become ready within {} seconds",
-                        timeout.as_secs()
-                    ),
-                ));
-            }
-
-            // Check child is alive
-            {
-                let mut inner = self.inner.lock();
-                if let Some(ref mut child) = inner.child {
-                    if !child.is_running() {
-                        return Err(Error::agent(
-                            "monitor agent",
-                            "agent process exited during startup",
-                        ));
-                    }
-                }
-            }
-
-            let wait_ms = remaining.as_millis().min(100) as i32;
-            let ret = unsafe { libc::poll(&mut pollfd, 1, wait_ms) };
-
-            if ret > 0 {
-                // Drain inotify events
-                let mut buf = [0u8; 4096];
-                loop {
-                    let n = unsafe {
-                        libc::read(ifd.raw(), buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-                    };
-                    if n <= 0 {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    /// macOS: watch both rootfs dir and socket dir with kqueue.
-    #[cfg(target_os = "macos")]
-    fn wait_for_ready_or_socket_kqueue(
-        &self,
-        ready_marker: &Path,
-        rootfs_dir: &Path,
-        socket_dir: &Path,
-        start: &Instant,
-        timeout: Duration,
-    ) -> Result<()> {
-        use std::os::unix::io::AsRawFd;
-
-        let rootfs_fd = match std::fs::File::open(rootfs_dir) {
-            Ok(f) => f,
-            Err(_) => return self.wait_for_ready_or_socket_poll(ready_marker, start, timeout),
-        };
-        let socket_fd = match std::fs::File::open(socket_dir) {
-            Ok(f) => f,
-            Err(_) => return self.wait_for_ready_or_socket_poll(ready_marker, start, timeout),
-        };
-
-        let kq = FdGuard::new(unsafe { libc::kqueue() });
-        if kq.raw() < 0 {
-            return self.wait_for_ready_or_socket_poll(ready_marker, start, timeout);
-        }
-
-        // Watch both directories for file creation
-        let changes = [
-            libc::kevent {
-                ident: rootfs_fd.as_raw_fd() as usize,
-                filter: libc::EVFILT_VNODE,
-                flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
-                fflags: libc::NOTE_WRITE,
-                data: 0,
-                udata: std::ptr::null_mut(),
-            },
-            libc::kevent {
-                ident: socket_fd.as_raw_fd() as usize,
-                filter: libc::EVFILT_VNODE,
-                flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
-                fflags: libc::NOTE_WRITE,
-                data: 0,
-                udata: std::ptr::null_mut(),
-            },
-        ];
-
-        let ret = unsafe {
-            libc::kevent(
-                kq.raw(),
-                changes.as_ptr(),
-                2,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null(),
-            )
-        };
-        if ret < 0 {
-            return self.wait_for_ready_or_socket_poll(ready_marker, start, timeout);
-        }
-
-        let mut eventlist = [libc::kevent {
-            ident: 0,
-            filter: 0,
-            flags: 0,
-            fflags: 0,
-            data: 0,
-            udata: std::ptr::null_mut(),
-        }];
-
-        loop {
-            if ready_marker.exists() || self.vsock_socket.exists() {
-                return Ok(());
-            }
-
-            let remaining = timeout.checked_sub(start.elapsed()).unwrap_or_default();
-            if remaining.is_zero() {
-                return Err(Error::agent(
-                    "wait for ready",
-                    format!(
-                        "agent did not become ready within {} seconds",
-                        timeout.as_secs()
-                    ),
-                ));
-            }
-
-            {
-                let mut inner = self.inner.lock();
-                if let Some(ref mut child) = inner.child {
-                    if !child.is_running() {
-                        return Err(Error::agent(
-                            "monitor agent",
-                            "agent process exited during startup",
-                        ));
-                    }
-                }
-            }
-
-            let wait_ms = remaining.as_millis().min(100) as i64;
-            let timespec = libc::timespec {
-                tv_sec: wait_ms / 1000,
-                tv_nsec: (wait_ms % 1000) * 1_000_000,
-            };
-
-            unsafe {
-                libc::kevent(
-                    kq.raw(),
-                    std::ptr::null(),
-                    0,
-                    eventlist.as_mut_ptr(),
-                    1,
-                    &timespec,
-                )
-            };
-        }
-    }
-
-    /// Fallback: poll for ready marker or socket with short intervals.
-    fn wait_for_ready_or_socket_poll(
-        &self,
-        ready_marker: &Path,
-        start: &Instant,
-        timeout: Duration,
-    ) -> Result<()> {
-        loop {
-            if ready_marker.exists() || self.vsock_socket.exists() {
-                return Ok(());
-            }
-
-            let remaining = timeout.checked_sub(start.elapsed()).unwrap_or_default();
-            if remaining.is_zero() {
-                return Err(Error::agent(
-                    "wait for ready",
-                    format!(
-                        "agent did not become ready within {} seconds",
-                        timeout.as_secs()
-                    ),
-                ));
-            }
-
-            {
-                let mut inner = self.inner.lock();
-                if let Some(ref mut child) = inner.child {
-                    if !child.is_running() {
-                        return Err(Error::agent(
-                            "monitor agent",
-                            "agent process exited during startup",
-                        ));
-                    }
-                }
-            }
-
-            std::thread::sleep(Duration::from_millis(5));
-        }
     }
 
     /// Wait for the agent to stop.
