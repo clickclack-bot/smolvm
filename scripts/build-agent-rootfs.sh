@@ -96,6 +96,7 @@ if command -v docker &> /dev/null; then
         apk add --root /rootfs --initdb --no-cache \
             jq \
             e2fsprogs \
+            e2fsprogs-extra \
             crun \
             util-linux \
             libcap

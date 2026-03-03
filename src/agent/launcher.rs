@@ -406,7 +406,6 @@ pub fn launch_agent_vm(
         }
 
         // Start VM (this replaces the process on success)
-        tracing::info!("starting agent VM");
         let ret = krun_start_enter(ctx);
 
         // If we get here, something went wrong — free the context before returning

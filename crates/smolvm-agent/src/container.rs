@@ -564,6 +564,26 @@ impl Default for ContainerRegistry {
     }
 }
 
+impl ContainerRegistry {
+    /// Lazily load the registry from disk and reconcile with crun state.
+    ///
+    /// Called on first container operation that needs full registry state
+    /// (list, stop, delete, status). Deferred from boot to avoid ~30-50ms
+    /// of wasted work when no container operations are requested.
+    pub fn ensure_loaded(&self) {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            if let Err(e) = self.load() {
+                warn!(error = %e, "failed to load container registry");
+            }
+            if let Err(e) = self.reconcile() {
+                warn!(error = %e, "failed to reconcile container registry");
+            }
+        });
+    }
+}
+
 // Global registry instance
 lazy_static::lazy_static! {
     /// Global container registry.
@@ -1135,6 +1155,7 @@ pub fn spawn_interactive_exec(
 
 /// Stop a running container.
 pub fn stop_container(container_id: &str, timeout_secs: u64) -> Result<(), StorageError> {
+    REGISTRY.ensure_loaded();
     let info = REGISTRY
         .find_by_prefix(container_id)
         .ok_or_else(|| StorageError::new(format!("container not found: {}", container_id)))?;
@@ -1177,6 +1198,7 @@ pub fn stop_container(container_id: &str, timeout_secs: u64) -> Result<(), Stora
 
 /// Delete a container (must be stopped).
 pub fn delete_container(container_id: &str, force: bool) -> Result<(), StorageError> {
+    REGISTRY.ensure_loaded();
     let info = REGISTRY
         .find_by_prefix(container_id)
         .ok_or_else(|| StorageError::new(format!("container not found: {}", container_id)))?;
@@ -1230,6 +1252,7 @@ pub fn delete_container(container_id: &str, force: bool) -> Result<(), StorageEr
 
 /// List all containers with their current state.
 pub fn list_containers() -> Vec<ContainerInfo> {
+    REGISTRY.ensure_loaded();
     let mut containers = REGISTRY.list();
 
     // Update states from crun
