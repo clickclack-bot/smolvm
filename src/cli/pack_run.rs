@@ -1,8 +1,8 @@
-//! `runpack` subcommand: run a VM from a `.smolmachine` sidecar file.
+//! `pack run` subcommand: run a VM from a `.smolmachine` sidecar file.
 //!
 //! This module provides two entry points:
 //!
-//! 1. **`RunpackCmd`** — the explicit `smolvm runpack` subcommand
+//! 1. **`PackRunCmd`** — the explicit `smolvm pack run` subcommand
 //! 2. **`run_as_packed_binary()`** — auto-detected packed binary mode,
 //!    called from `main()` before clap parses the normal CLI
 //!
@@ -49,11 +49,11 @@ fn mounts_to_packed(mounts: &[smolvm::vm::config::HostMount]) -> Vec<PackedMount
 /// smolvm agent infrastructure.
 ///
 /// Examples:
-///   smolvm runpack -- echo hello
-///   smolvm runpack --sidecar my-app.smolmachine -it -- /bin/sh
-///   smolvm runpack -p 8080:80 --net
+///   smolvm pack run -- echo hello
+///   smolvm pack run --sidecar my-app.smolmachine -it -- /bin/sh
+///   smolvm pack run -p 8080:80 --net
 #[derive(Args, Debug)]
-pub struct RunpackCmd {
+pub struct PackRunCmd {
     /// Path to the `.smolmachine` sidecar file.
     ///
     /// If not specified, looks for `<exe_name>.smolmachine` next to the
@@ -147,8 +147,8 @@ pub struct RunpackCmd {
     pub debug: bool,
 }
 
-impl RunpackCmd {
-    /// Execute the runpack command.
+impl PackRunCmd {
+    /// Execute the pack run command.
     pub fn run(self) -> smolvm::Result<()> {
         // 1. Resolve sidecar path
         let sidecar_path = resolve_sidecar_path(self.sidecar.as_deref())?;
@@ -465,7 +465,7 @@ fn resolve_sidecar_path(explicit: Option<&Path>) -> smolvm::Result<PathBuf> {
     Err(Error::agent(
         "find sidecar",
         "no .smolmachine sidecar file found.\n\
-         Specify with: smolvm runpack --sidecar PATH",
+         Specify with: smolvm pack run --sidecar PATH",
     ))
 }
 
@@ -598,7 +598,7 @@ fn build_env(manifest: &smolvm_pack::PackManifest, cli_env: &[String]) -> Vec<(S
 fn execute_command(
     client: &mut AgentClient,
     manifest: &smolvm_pack::PackManifest,
-    args: &RunpackCmd,
+    args: &PackRunCmd,
     mounts: &[smolvm::vm::config::HostMount],
 ) -> smolvm::Result<i32> {
     let command = build_command(manifest, &args.command);
@@ -665,7 +665,7 @@ fn execute_command(
 
 /// CLI parser for when the binary is running as a packed executable.
 ///
-/// This is separate from `RunpackCmd` because:
+/// This is separate from `PackRunCmd` because:
 /// - No `--sidecar` flag (mode is auto-detected)
 /// - Binary name shows as the packed binary name, not "smolvm"
 /// - Supports daemon subcommands (start/exec/stop/status)
@@ -783,7 +783,7 @@ enum PackedDaemonCmd {
 pub fn run_as_packed_binary(mode: PackedMode) -> ! {
     let cli = PackedCli::parse();
 
-    let result = runpack_inner(mode, cli);
+    let result = pack_run_inner(mode, cli);
     match result {
         Ok(()) => std::process::exit(0),
         Err(e) => {
@@ -793,7 +793,7 @@ pub fn run_as_packed_binary(mode: PackedMode) -> ! {
     }
 }
 
-fn runpack_inner(mode: PackedMode, cli: PackedCli) -> smolvm::Result<()> {
+fn pack_run_inner(mode: PackedMode, cli: PackedCli) -> smolvm::Result<()> {
     // Handle daemon subcommands
     if let Some(ref daemon_cmd) = cli.daemon_command {
         let checksum = mode_checksum(&mode);
@@ -826,8 +826,8 @@ fn runpack_inner(mode: PackedMode, cli: PackedCli) -> smolvm::Result<()> {
             sidecar_path,
             footer: _,
         } => {
-            // Construct RunpackCmd from PackedCli and delegate to existing path
-            let cmd = RunpackCmd {
+            // Construct PackRunCmd from PackedCli and delegate to existing path
+            let cmd = PackRunCmd {
                 sidecar: Some(sidecar_path),
                 command: cli.command,
                 interactive: cli.interactive,
@@ -1034,8 +1034,8 @@ fn run_from_cache(
 
     let mut client = wait_for_agent(&vsock_path, debug)?;
 
-    // Build a minimal RunpackCmd-like struct for execute_command
-    let args = RunpackCmd {
+    // Build a minimal PackRunCmd-like struct for execute_command
+    let args = PackRunCmd {
         sidecar: None,
         command: cli.command,
         interactive: cli.interactive,

@@ -334,9 +334,7 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
 
     // Direct DB lookup — 1 read cycle instead of loading everything
     let db = SmolvmDb::open()?;
-    let record = db
-        .get_vm(name)?
-        .ok_or_else(|| Error::vm_not_found(name))?;
+    let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
 
     // Check state
     let actual_state = record.actual_state();
