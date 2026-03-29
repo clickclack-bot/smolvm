@@ -1,6 +1,6 @@
 use crate::data::error::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Default size for the rootfs overlay disk (10 GiB sparse).
 ///
@@ -32,6 +32,40 @@ pub struct HostMount {
 }
 
 impl HostMount {
+    /// Protected host paths that must never be mounted into the guest.
+    #[cfg(target_os = "macos")]
+    const ILLEGAL_SOURCE_MOUNT_PATH: &[(&str, bool)] = &[
+        ("/", false),
+        ("/private/var", false),
+        ("/private/var/run", true),
+        ("/private/var/log", true),
+        ("/private/etc", true),
+        ("/usr", true),
+        ("/bin", true),
+        ("/sbin", true),
+        ("/lib", true),
+        ("/System", true),
+        ("/Library", true),
+    ];
+
+    /// Protected host paths that must never be mounted into the guest.
+    #[cfg(target_os = "linux")]
+    const ILLEGAL_SOURCE_MOUNT_PATH: &[(&str, bool)] = &[
+        ("/", false),
+        ("/var", false),
+        ("/var/run", true),
+        ("/var/log", true),
+        ("/etc", true),
+        ("/usr", true),
+        ("/bin", true),
+        ("/sbin", true),
+        ("/lib", true),
+        ("/proc", true),
+        ("/sys", true),
+        ("/dev", true),
+        ("/run", true),
+    ];
+
     /// Create a host mount with an explicit read-only flag.
     pub fn new(
         source: impl Into<PathBuf>,
@@ -43,13 +77,30 @@ impl HostMount {
             target: target.into(),
             read_only,
         };
-        Self::validate(&mount)?;
+
+        if !mount.source.exists() {
+            return Err(Error::MountSourceNotFound {
+                path: mount.source.clone(),
+            });
+        }
+
+        if !mount.source.is_dir() {
+            return Err(Error::mount(
+                "validate host path",
+                format!(
+                    "source path on host must be a directory (virtiofs limitation): {}",
+                    mount.source.display()
+                ),
+            ));
+        }
+
         mount.source = mount.source.canonicalize().map_err(|e| {
             Error::mount(
                 "canonicalize host path",
                 format!("'{}': {}", mount.source.display(), e),
             )
         })?;
+        Self::validate(&mount)?;
         Ok(mount)
     }
 
@@ -77,23 +128,51 @@ impl HostMount {
     }
 
     fn validate(mount: &Self) -> Result<()> {
-        if !mount.source.exists() {
-            return Err(Error::MountSourceNotFound {
-                path: mount.source.clone(),
-            });
+        for (illegal_path, block_subtree) in Self::ILLEGAL_SOURCE_MOUNT_PATH {
+            let illegal_path = Path::new(illegal_path);
+            if mount.source == illegal_path
+                || (*block_subtree && mount.source.starts_with(illegal_path))
+            {
+                return Err(Error::mount(
+                    "validate host path",
+                    format!(
+                        "source path on host is a protected system path and cannot be mounted: {}",
+                        mount.source.display()
+                    ),
+                ));
+            }
         }
 
-        if !mount.source.is_dir() {
+        if !mount.target.is_absolute() {
             return Err(Error::mount(
-                "validate host path",
+                "validate guest path",
                 format!(
-                    "path must be a directory (virtiofs limitation): {}",
-                    mount.source.display()
+                    "target path on guest should be an absolute directory: {}",
+                    mount.target.display()
                 ),
             ));
         }
 
         Ok(())
+    }
+
+    /// Generate a virtiofs mount tag for a given index.
+    ///
+    /// Mount tags follow the format "smolvm0", "smolvm1", etc. and are used
+    /// consistently across the host launcher, API handlers, and guest agent.
+    pub fn mount_tag(index: usize) -> String {
+        format!("smolvm{}", index)
+    }
+
+    /// Create without validation (for loading from database).
+    ///
+    /// Use this only when loading persisted mounts that were previously validated.
+    pub fn from_storage_tuple(source: String, target: String, read_only: bool) -> Self {
+        Self {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            read_only,
+        }
     }
 
     /// Convert this mount to tuple format for persistence.
@@ -113,6 +192,42 @@ mod tests {
 
     fn parse_one(spec: &str) -> HostMount {
         HostMount::parse(&[spec.to_string()]).unwrap().remove(0)
+    }
+
+    #[test]
+    fn test_new_mount_rejects_illegal_source_mount_path() {
+        for path in ["/", "/etc", "/var", "/var/run", "/var/log"] {
+            let result = HostMount::new(path, "/guest/path", true);
+            assert!(result.is_err(), "{} should be rejected", path);
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("protected system path"),
+                "Error should explain why {} is blocked, got: {}",
+                path,
+                err_msg
+            );
+            assert!(
+                err_msg.contains("cannot be mounted"),
+                "Error should explain that {} cannot be mounted, got: {}",
+                path,
+                err_msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_new_mount_allows_safe_source_under_var() {
+        let temp_dir = std::env::temp_dir().join("smolvm-safe-var-path");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let result = HostMount::new(&temp_dir, "/guest/path", true);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        assert!(
+            result.is_ok(),
+            "safe paths under the OS temp directory should remain mountable"
+        );
     }
 
     #[test]
@@ -144,7 +259,10 @@ mod tests {
 
     #[test]
     fn test_parse_mount_spec_paths_with_spaces() {
-        let temp_dir = std::env::temp_dir().join("smolvm mount with spaces");
+        let temp_dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("smolvm mount with spaces");
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let spec = format!("{}:/guest/path", temp_dir.display());
@@ -175,9 +293,14 @@ mod tests {
     }
 
     #[test]
-    fn test_new_mount_allows_relative_target() {
+    fn test_new_mount_disallows_relative_target() {
         let result = HostMount::new("/tmp", "relative/path", true);
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("absolute"),
+            "Error should explain that guest target paths must be absolute"
+        );
     }
 
     #[test]
