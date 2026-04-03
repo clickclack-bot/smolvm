@@ -16,25 +16,35 @@ A local tool to build and run portable, lightweight, self-contained virtual mach
 Each workload runs in its own Linux microVM with a separate kernel. The host
 filesystem, network, and credentials are isolated unless explicitly shared.
 
+Install
+-------
+
+```bash
+curl -sSL https://smolmachines.com/install.sh | bash
+```
+
+Or download from [GitHub Releases](https://github.com/smol-machines/smolvm/releases).
+
 Quick Start
 -----------
 
-* Install: [GitHub Releases](https://github.com/smol-machines/smolvm/releases) or `curl -sSL https://smolmachines.com/install.sh | bash`
-* Documentation: https://smolmachines.com/sdk/
-* Report a bug: https://github.com/smol-machines/smolvm/issues
-* Join the community: https://discord.gg/qhQ7FHZ2zd
-
 ```bash
-# Create and run an isolated machine
+# Run a command in an ephemeral VM (cleaned up after exit)
+smolvm machine run --image alpine -- echo "hello from a microVM"
+
+# Interactive shell
+smolvm machine run -it --image alpine
+
+# Persistent machine (survives stop/start)
 smolvm machine create --net myvm
-smolvm machine start myvm
+smolvm machine start --name myvm
 smolvm machine exec --name myvm -- apk add sl
-smolvm machine exec --name myvm -it -- sl
-smolvm machine exec --name myvm -it -- /bin/sh   # interactive shell
-smolvm machine stop myvm
+smolvm machine exec --name myvm -it -- /bin/sh
+# try: sl, ls, uname -a — type 'exit' to leave
+smolvm machine stop --name myvm
 
 # Pack into a portable executable
-smolvm pack create python:3.12-alpine -o ./my-pythonvm
+smolvm pack create --image python:3.12-alpine -o ./my-pythonvm
 ./my-pythonvm python3 -c "print('hello from a packed VM')"
 ```
 
@@ -64,6 +74,8 @@ Comparison
 | macOS native        | Yes | Via Docker VM | Yes (krunkit) | Yes | No | No |
 | Embeddable SDK      | Yes | No | No | No | No | No |
 | Portable artifacts  | `.smolmachine` | Images (need daemon) | No | No | No | No |
+
+Sources: [container isolation](https://www.docker.com/blog/understanding-docker-container-escapes/) · [containerd benchmark](https://github.com/containerd/containerd/issues/4482) · [QEMU boot time](https://wiki.qemu.org/Features/TCG) · [Firecracker](https://firecracker-microvm.github.io/) · [Kata Containers](https://katacontainers.io/) · [Kata boot time](https://github.com/kata-containers/kata-containers/issues/4292) · [Firecracker requires KVM](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md) · [Kata macOS support](https://github.com/kata-containers/kata-containers/issues/243)
 
 Platform Support
 ----------------
