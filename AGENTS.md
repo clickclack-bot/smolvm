@@ -20,7 +20,7 @@ smolvm machine delete myvm
 
 # Pack into portable executable
 smolvm pack create --image python:3.12-alpine -o ./my-python
-./my-python python3 -c "print('hello')"
+./my-python run -- python3 -c "print('hello')"
 
 # Containers inside a machine
 smolvm container create --image nginx -- nginx -g "daemon off;"
@@ -52,6 +52,7 @@ smolvm machine stop [--name NAME]                 # stop
 smolvm machine delete NAME [-f]                   # delete
 smolvm machine status [--name NAME]               # check state
 smolvm machine ls [--json]                        # list all
+smolvm machine monitor [--name NAME]              # foreground health + restart
 
 smolvm container create --image IMAGE [-- CMD]    # --machine defaults to "default"
 smolvm container exec --container ID [-- CMD]
@@ -118,17 +119,13 @@ memory = 2048
 entrypoint = ["/app/run"]             # override entrypoint for packed binary
 oci_platform = "linux/amd64"          # target OCI platform
 
-# Service (parsed, not yet wired)
-[service]
-listen = 8080
-protocol = "http"
-
-# Health check (parsed, not yet wired)
+# Health check (used by `machine monitor`)
 [health]
 exec = ["curl", "-f", "http://127.0.0.1:8080/health"]
 interval = "10s"
 timeout = "2s"
 retries = 3
+startup_grace = "20s"
 ```
 
 ### Merge Precedence
@@ -162,10 +159,10 @@ cpus/mem:   CLI flag > Smolfile > defaults (1 CPU, 512 MiB)
 
 The packed binary runs as a normal executable:
 ```bash
-./my-app python3 -c "print('hello')"    # ephemeral, cleaned up after exit
-./my-app --daemon start                  # persistent daemon mode
-./my-app --daemon exec -- pip install x  # exec into daemon
-./my-app --daemon stop                   # stop daemon
+./my-app run -- python3 -c "print('hello')"  # ephemeral, cleaned up after exit
+./my-app start                               # persistent daemon mode
+./my-app exec -- pip install x               # exec into daemon
+./my-app stop                                # stop daemon
 ```
 
 ## HTTP API
